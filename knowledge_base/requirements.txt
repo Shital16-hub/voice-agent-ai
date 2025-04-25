@@ -1,0 +1,24 @@
+# Core dependencies
+aiohttp
+requests
+asyncio
+
+# LlamaIndex dependencies
+llama-index
+llama-index-embeddings-huggingface
+llama-index-vector-stores-chroma
+
+# Document processing
+python-docx
+pdfplumber
+PyMuPDF
+beautifulsoup4
+pandas
+openpyxl
+
+# Embedding models
+sentence-transformers
+
+# Optional dependencies
+spacy
+langdetect

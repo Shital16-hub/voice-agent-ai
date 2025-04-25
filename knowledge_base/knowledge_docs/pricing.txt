@@ -1,0 +1,21 @@
+VoiceAssist Pricing Plans:
+
+Basic Plan: $499/month
+- Up to 1,000 conversations/day
+- Email support
+- 3 language options
+- Basic analytics
+
+Professional Plan: $999/month
+- Up to 5,000 conversations/day
+- Priority email and phone support
+- All language options
+- Advanced analytics
+- Custom integrations
+
+Enterprise Plan: Custom pricing
+- Unlimited conversations
+- 24/7 dedicated support
+- All features included
+- On-premises deployment
+- Customized training
