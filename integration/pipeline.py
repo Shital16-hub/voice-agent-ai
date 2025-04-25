@@ -1,3 +1,4 @@
+
 """
 End-to-end pipeline orchestration for Voice AI Agent.
 
@@ -158,98 +159,89 @@ class VoiceAIAgentPipeline:
     
     async def process_audio_streaming(
         self,
-        audio_data: Union[np.ndarray, bytes],
+        audio_file_path: str,
         audio_callback: Callable[[bytes], Awaitable[None]]
     ) -> Dict[str, Any]:
         """
-        Process audio data through the pipeline with streaming output.
+        Process audio file with streaming response directly to speech.
         
         Args:
-            audio_data: Audio data as numpy array or bytes
-            audio_callback: Callback to handle output audio
+            audio_file_path: Path to the input audio file
+            audio_callback: Callback to handle audio data
             
         Returns:
-            Dictionary with processing results
+            Dictionary with stats about the process
         """
+        logger.info(f"Starting streaming pipeline with audio: {audio_file_path}")
+        
+        # Track timing
         start_time = time.time()
         
+        # Reset conversation state
+        if self.conversation_manager:
+            self.conversation_manager.reset()
+        
+        # Load and transcribe audio
+        from speech_to_text.utils.audio_utils import load_audio_file
+        
         try:
-            # Convert audio data to numpy array if needed
-            if isinstance(audio_data, bytes):
-                audio_array = np.frombuffer(audio_data, dtype=np.float32)
-            else:
-                audio_array = audio_data
+            audio, sample_rate = load_audio_file(audio_file_path, target_sr=16000)
+            transcription, duration = await self._transcribe_audio(audio)
             
-            # Start speech recognition
-            logger.info("Starting speech recognition...")
-            self.speech_recognizer.start_streaming()
-            
-            # Process audio chunk
-            result = await self.speech_recognizer.process_audio_chunk(audio_array)
-            
-            # Get final transcription
-            transcription = ""
-            if result and result.text:
-                transcription = result.text
-            else:
-                # Try to get from stop_streaming
-                final_text, duration = await self.speech_recognizer.stop_streaming()
-                transcription = final_text
-            
-            if not transcription or transcription.strip() == "":
-                logger.warning("No transcription detected")
-                return {
-                    "error": "No speech detected",
-                    "transcription": "",
-                    "response": ""
-                }
-            
+            if not transcription.strip():
+                return {"error": "No transcription detected"}
+                
             logger.info(f"Transcription: {transcription}")
+            transcription_time = time.time() - start_time
+        except Exception as e:
+            logger.error(f"Error in transcription: {e}")
+            return {"error": f"Transcription error: {str(e)}"}
+        
+        # Stream the response with TTS
+        try:
+            # Stream the response directly to TTS
+            total_chunks = 0
+            total_audio_bytes = 0
+            response_start_time = time.time()
+            full_response = ""
             
-            # Process through conversation manager and query engine
-            logger.info("Querying knowledge base...")
+            # Use the query engine's streaming method
+            async for chunk in self.query_engine.query_with_streaming(transcription):
+                chunk_text = chunk.get("chunk", "")
+                
+                if chunk_text:
+                    # Add to full response
+                    full_response += chunk_text
+                    
+                    # Convert to speech and send to callback
+                    audio_data = await self.tts_integration.text_to_speech(chunk_text)
+                    await audio_callback(audio_data)
+                    
+                    # Update stats
+                    total_chunks += 1
+                    total_audio_bytes += len(audio_data)
             
-            # Use the conversation manager to process the query
-            response_data = await self.conversation_manager.handle_user_input(transcription)
-            response = response_data.get("response", "")
-            
-            if not response:
-                logger.warning("No response from knowledge base")
-                return {
-                    "error": "No response generated",
-                    "transcription": transcription,
-                    "response": ""
-                }
-            
-            logger.info(f"Response: {response}")
-            
-            # Convert to speech and send via callback
-            logger.info("Converting response to speech...")
-            speech_audio = await self.tts_integration.text_to_speech(response)
-            
-            if speech_audio:
-                await audio_callback(speech_audio)
-                logger.info("Speech audio sent")
+            # Calculate stats
+            response_time = time.time() - response_start_time
+            total_time = time.time() - start_time
             
             return {
                 "transcription": transcription,
-                "response": response,
-                "total_time": time.time() - start_time
+                "transcription_time": transcription_time,
+                "response_time": response_time,
+                "total_time": total_time,
+                "total_chunks": total_chunks,
+                "total_audio_bytes": total_audio_bytes,
+                "full_response": full_response
             }
             
         except Exception as e:
-            logger.error(f"Error in pipeline processing: {e}", exc_info=True)
+            logger.error(f"Error in streaming response: {e}")
             return {
-                "error": str(e),
-                "total_time": time.time() - start_time
+                "error": f"Streaming error: {str(e)}",
+                "transcription": transcription,
+                "transcription_time": transcription_time
             }
-        finally:
-            # Make sure to stop streaming
-            try:
-                if self.speech_recognizer.is_streaming:
-                    await self.speech_recognizer.stop_streaming()
-            except:
-                pass
     
     async def _transcribe_audio(self, audio: np.ndarray) -> tuple[str, float]:
         """

@@ -90,19 +90,14 @@ class WebSocketHandler:
         # Add to input buffer
         self.input_buffer.extend(audio_data)
         
+        # Log for debugging
+        if len(self.input_buffer) % 1000 == 0:  # Log every 1000 bytes
+            logger.debug(f"Input buffer size: {len(self.input_buffer)} bytes")
+        
         # Process when buffer is full enough
         if len(self.input_buffer) >= AUDIO_BUFFER_SIZE and not self.is_processing:
+            logger.info(f"Processing buffer of size: {len(self.input_buffer)}")
             await self._process_audio(ws)
-        
-        # Also check if we have a significant amount of audio and it's been quiet
-        elif len(self.input_buffer) >= CHUNK_SIZE and not self.is_processing:
-            # Process smaller chunks if we detect silence
-            try:
-                pcm_preview = self.audio_processor.mulaw_to_pcm(self.input_buffer[-CHUNK_SIZE:])
-                if not self.audio_processor.detect_silence(pcm_preview, SILENCE_THRESHOLD):
-                    await self._process_audio(ws)
-            except Exception as e:
-                logger.error(f"Error in preview processing: {e}")
     
     async def _handle_stop(self, data: Dict[str, Any]) -> None:
         """Handle stream stop event."""
@@ -135,6 +130,7 @@ class WebSocketHandler:
             if self.audio_processor.detect_silence(pcm_audio, SILENCE_THRESHOLD):
                 if not self.silence_start_time:
                     self.silence_start_time = asyncio.get_event_loop().time()
+                    logger.debug("Silence detected - starting timer")
                 elif asyncio.get_event_loop().time() - self.silence_start_time > SILENCE_DURATION:
                     # Detected end of utterance
                     if self.is_speaking:
@@ -149,6 +145,7 @@ class WebSocketHandler:
             
             # Process through pipeline if speaking
             if self.is_speaking:
+                logger.info("Processing speech through pipeline")
                 await self._pipeline_process(pcm_audio, ws)
         
         finally:
@@ -162,6 +159,8 @@ class WebSocketHandler:
     async def _pipeline_process(self, audio_data: np.ndarray, ws) -> None:
         """Process audio through the Voice AI pipeline."""
         try:
+            logger.info(f"Processing audio data of length: {len(audio_data)}")
+            
             # Create audio callback for TTS output
             async def audio_callback(tts_audio: bytes):
                 # Convert TTS output to mulaw
@@ -169,7 +168,7 @@ class WebSocketHandler:
                 
                 # Send to Twilio
                 await self._send_audio(mulaw_audio, ws)
-                logger.debug("Sent audio response to Twilio")
+                logger.info(f"Sent {len(mulaw_audio)} bytes of audio response to Twilio")
             
             # Check if we have the correct pipeline method
             if hasattr(self.pipeline, 'process_audio_streaming'):
@@ -178,6 +177,7 @@ class WebSocketHandler:
                     audio_data,
                     audio_callback=audio_callback
                 )
+                logger.info(f"Pipeline streaming result: {result}")
             else:
                 # Fallback to regular processing
                 logger.warning("Using fallback audio processing")
@@ -186,13 +186,14 @@ class WebSocketHandler:
                     speech_output_path=None
                 )
                 
+                logger.info(f"Pipeline result: {result}")
+                
                 # If we got a response, send it back
                 if result and result.get('speech_audio'):
                     mulaw_audio = self.audio_processor.pcm_to_mulaw(result['speech_audio'])
                     await self._send_audio(mulaw_audio, ws)
-            
-            logger.info(f"Pipeline result: {result}")
-            
+                    logger.info(f"Sent {len(mulaw_audio)} bytes of audio response")
+        
         except Exception as e:
             logger.error(f"Error in pipeline processing: {e}", exc_info=True)
     
