@@ -1,4 +1,3 @@
-
 """
 WebSocket handler for Twilio media streams.
 """
@@ -42,6 +41,8 @@ class WebSocketHandler:
         self.is_processing = False
         self.conversation_active = True
         self.sequence_number = 0  # For Twilio media sequence tracking
+        
+        logger.info(f"WebSocketHandler initialized for call {call_sid}")
     
     async def handle_message(self, message: str, ws) -> None:
         """
@@ -59,16 +60,17 @@ class WebSocketHandler:
             
             if event_type == 'connected':
                 logger.info(f"WebSocket connected for call {self.call_sid}")
+                logger.info(f"Connected data: {data}")
             elif event_type == 'start':
                 await self._handle_start(data)
-                # Send a test tone to verify audio is working
-                await self.send_test_tone(ws)
             elif event_type == 'media':
                 await self._handle_media(data, ws)
             elif event_type == 'stop':
                 await self._handle_stop(data)
             elif event_type == 'mark':
                 await self._handle_mark(data)
+            else:
+                logger.warning(f"Unknown event type: {event_type}")
             
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON message: {e}")
@@ -79,6 +81,7 @@ class WebSocketHandler:
         """Handle stream start event."""
         self.stream_sid = data.get('streamSid')
         logger.info(f"Stream started - SID: {self.stream_sid}, Call: {self.call_sid}")
+        logger.info(f"Start data: {data}")
     
     async def _handle_media(self, data: Dict[str, Any], ws) -> None:
         """Handle media event with audio data."""
@@ -86,22 +89,26 @@ class WebSocketHandler:
         payload = media.get('payload')
         
         if not payload:
+            logger.warning("Received media event with no payload")
             return
         
-        # Decode audio data
-        audio_data = base64.b64decode(payload)
-        
-        # Add to input buffer
-        self.input_buffer.extend(audio_data)
-        
-        # Log for debugging
-        if len(self.input_buffer) % 1000 == 0:  # Log every 1000 bytes
-            logger.debug(f"Input buffer size: {len(self.input_buffer)} bytes")
-        
-        # Process when buffer is full enough
-        if len(self.input_buffer) >= AUDIO_BUFFER_SIZE and not self.is_processing:
-            logger.info(f"Processing buffer of size: {len(self.input_buffer)}")
-            await self._process_audio(ws)
+        try:
+            # Decode audio data
+            audio_data = base64.b64decode(payload)
+            
+            # Add to input buffer
+            self.input_buffer.extend(audio_data)
+            
+            # Log for debugging
+            if len(self.input_buffer) % 1000 == 0:  # Log every 1000 bytes
+                logger.debug(f"Input buffer size: {len(self.input_buffer)} bytes")
+            
+            # Process when buffer is full enough
+            if len(self.input_buffer) >= AUDIO_BUFFER_SIZE and not self.is_processing:
+                logger.info(f"Processing buffer of size: {len(self.input_buffer)}")
+                await self._process_audio(ws)
+        except Exception as e:
+            logger.error(f"Error processing media payload: {e}", exc_info=True)
     
     async def _handle_stop(self, data: Dict[str, Any]) -> None:
         """Handle stream stop event."""
@@ -131,178 +138,52 @@ class WebSocketHandler:
             
             logger.debug(f"Processing audio chunk of size: {len(pcm_audio)}")
             
-            # Check for silence
-            if self.audio_processor.detect_silence(pcm_audio, SILENCE_THRESHOLD):
-                if not self.silence_start_time:
-                    self.silence_start_time = asyncio.get_event_loop().time()
-                    logger.debug("Silence detected - starting timer")
-                elif asyncio.get_event_loop().time() - self.silence_start_time > SILENCE_DURATION:
-                    # Detected end of utterance
-                    if self.is_speaking:
-                        logger.info("Detected end of utterance")
-                        await self._handle_end_of_utterance(ws)
-                        self.is_speaking = False
-            else:
-                if not self.is_speaking:
-                    logger.info("Detected speech start")
-                self.is_speaking = True
-                self.silence_start_time = None
+            # For now, just send a test response
+            await self.send_test_response(ws, "I received your audio.")
             
-            # Process through pipeline if speaking
-            if self.is_speaking:
-                logger.info("Processing speech through pipeline")
-                await self._pipeline_process(pcm_audio, ws)
-        
+        except Exception as e:
+            logger.error(f"Error processing audio: {e}", exc_info=True)
         finally:
             self.is_processing = False
     
-    async def _handle_end_of_utterance(self, ws) -> None:
-        """Handle end of user utterance."""
-        logger.info("End of utterance detected")
-        # Add any processing needed for end of utterance
-    
-    async def _pipeline_process(self, audio_data: np.ndarray, ws) -> None:
-        """Process audio through the Voice AI pipeline."""
+    async def send_test_response(self, ws, text: str) -> None:
+        """Send a test text response."""
         try:
-            logger.info(f"Processing audio data of length: {len(audio_data)}")
+            # Convert text to speech using pipeline
+            audio_data = await self.pipeline.tts_integration.text_to_speech(text)
             
-            # Create audio callback for TTS output
-            async def audio_callback(tts_audio: bytes):
-                # Skip extremely short audio chunks
-                if len(tts_audio) < 100:
-                    logger.debug(f"Skipping short audio chunk of {len(tts_audio)} bytes")
-                    return
-                
-                logger.debug(f"Received TTS audio of length: {len(tts_audio)} bytes")
-                
-                # Convert TTS output to mulaw
-                mulaw_audio = self.audio_processor.pcm_to_mulaw(tts_audio)
-                
-                logger.debug(f"Converted to mulaw of length: {len(mulaw_audio)} bytes")
-                
-                # Send to Twilio
-                await self._send_audio(mulaw_audio, ws)
-                logger.info(f"Sent {len(mulaw_audio)} bytes of audio response to Twilio")
+            # Convert to mulaw
+            mulaw_audio = self.audio_processor.pcm_to_mulaw(audio_data)
             
-            # Check if we have the correct pipeline method
-            if hasattr(self.pipeline, 'process_audio_streaming'):
-                # Process through pipeline
-                result = await self.pipeline.process_audio_streaming(
-                    audio_data,
-                    audio_callback=audio_callback
-                )
-                logger.info(f"Pipeline streaming result: {result}")
-            else:
-                # Fallback to regular processing
-                logger.warning("Using fallback audio processing")
-                result = await self.pipeline.process_audio_data(
-                    audio_data,
-                    speech_output_path=None
-                )
-                
-                logger.info(f"Pipeline result: {result}")
-                
-                # If we got a response, send it back
-                if result and result.get('speech_audio'):
-                    mulaw_audio = self.audio_processor.pcm_to_mulaw(result['speech_audio'])
-                    await self._send_audio(mulaw_audio, ws)
-                    logger.info(f"Sent {len(mulaw_audio)} bytes of audio response")
-        
+            # Send the audio
+            await self._send_audio(mulaw_audio, ws)
+            
         except Exception as e:
-            logger.error(f"Error in pipeline processing: {e}", exc_info=True)
+            logger.error(f"Error sending test response: {e}", exc_info=True)
     
     async def _send_audio(self, audio_data: bytes, ws) -> None:
-        """Send audio data to Twilio using the correct format."""
+        """Send audio data to Twilio."""
         try:
             # Ensure the audio data is valid
             if not audio_data or len(audio_data) == 0:
                 logger.warning("Attempted to send empty audio data")
                 return
             
-            # Skip very short audio chunks (likely padding)
-            if len(audio_data) < 100:
-                logger.debug(f"Skipping short audio data: {len(audio_data)} bytes")
-                return
+            # Encode audio to base64
+            audio_base64 = base64.b64encode(audio_data).decode('utf-8')
             
-            # Split large audio data into smaller chunks for better streaming
-            chunk_size = 1024  # Twilio recommended chunk size
-            for i in range(0, len(audio_data), chunk_size):
-                chunk = audio_data[i:i + chunk_size]
-                
-                # Encode audio to base64
-                audio_base64 = base64.b64encode(chunk).decode('utf-8')
-                
-                # Create media message
-                message = {
-                    "event": "media",
-                    "streamSid": self.stream_sid,
-                    "media": {
-                        "payload": audio_base64
-                    }
-                }
-                
-                # Add sequence number for better tracking
-                message["sequenceNumber"] = str(self.sequence_number)
-                self.sequence_number += 1
-                
-                # Send message without await (simple-websocket is synchronous)
-                ws.send(json.dumps(message))
-                
-                # Small delay between chunks to prevent overwhelming the stream
-                await asyncio.sleep(0.01)
-            
-            logger.debug(f"Sent audio in chunks with total length: {len(audio_data)}")
-            
-        except Exception as e:
-            logger.error(f"Error sending audio: {e}")
-    
-    async def send_test_tone(self, ws) -> None:
-        """Send a test tone to verify audio output."""
-        try:
-            import numpy as np
-            import audioop
-            
-            # Generate a 1-second 440Hz tone at 8kHz
-            duration = 1.0
-            sample_rate = 8000
-            frequency = 440
-            t = np.linspace(0, duration, int(sample_rate * duration), False)
-            tone = np.sin(frequency * 2 * np.pi * t) * 0.5
-            
-            # Convert to 16-bit PCM
-            pcm_data = (tone * 32767).astype(np.int16).tobytes()
-            
-            # Convert to mulaw
-            mulaw_data = audioop.lin2ulaw(pcm_data, 2)
-            
-            # Send the test tone
-            await self._send_audio(mulaw_data, ws)
-            logger.info("Sent test tone to Twilio")
-            
-        except Exception as e:
-            logger.error(f"Error sending test tone: {e}")
-    
-    async def send_clear_message(self, ws) -> None:
-        """Send clear message to stop any ongoing audio playback."""
-        try:
+            # Create media message
             message = {
-                "event": "clear",
-                "streamSid": self.stream_sid
-            }
-            ws.send(json.dumps(message))
-        except Exception as e:
-            logger.error(f"Error sending clear message: {e}")
-    
-    async def send_mark(self, ws, name: str) -> None:
-        """Send mark message for tracking audio playback."""
-        try:
-            message = {
-                "event": "mark",
+                "event": "media",
                 "streamSid": self.stream_sid,
-                "mark": {
-                    "name": name
+                "media": {
+                    "payload": audio_base64
                 }
             }
+            
+            # Send message
             ws.send(json.dumps(message))
+            logger.debug(f"Sent audio data: {len(audio_data)} bytes")
+            
         except Exception as e:
-            logger.error(f"Error sending mark: {e}")
+            logger.error(f"Error sending audio: {e}", exc_info=True)

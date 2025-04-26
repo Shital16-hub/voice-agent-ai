@@ -1,4 +1,3 @@
-
 """
 Main Twilio handler for voice calls.
 """
@@ -67,34 +66,43 @@ class TwilioHandler:
         response = VoiceResponse()
         
         # Add initial greeting
-        response.say("Welcome to the Voice AI Agent. I'm here to help. Please speak after the beep.", 
-                    voice='alice')
+        response.say("Welcome to the Voice AI Agent. I'm here to help. Please speak after the beep.", voice='alice')
         response.pause(length=1)
         
-        # Add a beep sound
-        response.play('https://www.soundjay.com/button/beep-07.wav')
-        response.pause(length=1)
-        
-        # Start media stream with correct parameters
-        start = Start()
-        
-        # Configure the stream with explicit parameters
-        stream = Stream(
-            url=f'wss://{self.base_url.replace("https://", "").replace("http://", "")}/ws/stream/{call_sid}',
-            track='inbound_track'  # Explicitly specify inbound track
+        # Try the record approach as a fallback
+        response.record(
+            action=f'{self.base_url}/voice/record',
+            method='POST',
+            timeout=10,
+            transcribe=False
         )
         
-        # Add parameter for audio format
-        stream.parameter(name='audioFormat', value='audio/x-mulaw;rate=8000')
+        return str(response)
+    
+    def handle_incoming_call_with_stream(self, from_number: str, to_number: str, call_sid: str) -> str:
+        """
+        Handle incoming voice call with WebSocket stream.
+        This is the original method with streaming.
+        """
+        logger.info(f"Incoming call from {from_number} to {to_number} (SID: {call_sid})")
         
-        start.append(stream)
-        response.append(start)
+        # Add call to manager
+        self.call_manager.add_call(call_sid, from_number, to_number)
         
-        # Add the Connect verb to bridge the call to the stream
+        # Create TwiML response
+        response = VoiceResponse()
+        
+        # Add initial greeting
+        response.say("Welcome to the Voice AI Agent. I'm here to help.", voice='alice')
+        response.pause(length=1)
+        
+        # Try a direct stream connection
+        ws_url = f'wss://0ulckcn58gni70-5000.proxy.runpod.net/ws/stream/{call_sid}'
+        
+        # Use the connect.stream() approach
         connect = Connect()
-        connect.stream(
-            url=f'wss://{self.base_url.replace("https://", "").replace("http://", "")}/ws/stream/{call_sid}'
-        )
+        stream = Stream(url=ws_url)
+        connect.append(stream)
         response.append(connect)
         
         return str(response)
@@ -115,97 +123,3 @@ class TwilioHandler:
         # Remove call if completed or failed
         if call_status in ['completed', 'failed', 'busy', 'no-answer']:
             self.call_manager.remove_call(call_sid)
-    
-    async def handle_websocket_connection(self, call_sid: str, ws) -> None:
-        """
-        Handle WebSocket connection for media stream.
-        
-        Args:
-            call_sid: Twilio call SID
-            ws: WebSocket connection
-        """
-        try:
-            # Create WebSocket handler
-            ws_handler = WebSocketHandler(call_sid, self.pipeline)
-            
-            # Process messages
-            async for message in ws:
-                if message is None:
-                    break
-                await ws_handler.handle_message(message, ws)
-                
-        except Exception as e:
-            logger.error(f"WebSocket error for call {call_sid}: {e}")
-        finally:
-            logger.info(f"WebSocket closed for call {call_sid}")
-    
-    def make_call(self, to_number: str, from_number: Optional[str] = None) -> str:
-        """
-        Make an outbound call.
-        
-        Args:
-            to_number: Phone number to call
-            from_number: Phone number to call from (defaults to Twilio number)
-            
-        Returns:
-            Call SID
-        """
-        from_number = from_number or TWILIO_PHONE_NUMBER
-        
-        try:
-            call = self.client.calls.create(
-                url=f'{self.base_url}/voice/outgoing',
-                to=to_number,
-                from_=from_number,
-                status_callback=f'{self.base_url}/voice/status',
-                status_callback_event=['initiated', 'ringing', 'answered', 'completed'],
-                status_callback_method='POST'
-            )
-            
-            logger.info(f"Initiated call to {to_number} (SID: {call.sid})")
-            return call.sid
-            
-        except Exception as e:
-            logger.error(f"Error making call to {to_number}: {e}")
-            raise
-    
-    def handle_outgoing_call(self) -> str:
-        """
-        Handle outgoing call TwiML.
-        
-        Returns:
-            TwiML response as string
-        """
-        response = VoiceResponse()
-        
-        # Add greeting for outgoing calls
-        response.say("Hello, this is the Voice AI Agent calling. How can I help you today?", 
-                    voice='alice')
-        response.pause(length=1)
-        
-        # Start media stream (same as incoming)
-        start = Start()
-        stream = Stream(
-            url=f'wss://{self.base_url.replace("https://", "").replace("http://", "")}/ws/stream',
-            track='inbound_track'
-        )
-        stream.parameter(name='audioFormat', value='audio/x-mulaw;rate=8000')
-        start.append(stream)
-        response.append(start)
-        
-        # Add Connect verb
-        connect = Connect()
-        connect.stream(
-            url=f'wss://{self.base_url.replace("https://", "").replace("http://", "")}/ws/stream'
-        )
-        response.append(connect)
-        
-        return str(response)
-    
-    def get_call_stats(self) -> Dict[str, Any]:
-        """Get call statistics."""
-        return self.call_manager.get_call_stats()
-    
-    def get_call_info(self, call_sid: str) -> Optional[Dict[str, Any]]:
-        """Get information about a specific call."""
-        return self.call_manager.get_call(call_sid)

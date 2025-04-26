@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 Alternative Twilio application using simple-websocket.
@@ -9,9 +8,13 @@ import asyncio
 import logging
 import json
 import base64
+import requests
+import time
 from flask import Flask, request, Response
 from simple_websocket import Server, ConnectionClosed
 from dotenv import load_dotenv
+from twilio.twiml.voice_response import VoiceResponse
+from twilio.rest import Client
 
 # Load environment variables
 load_dotenv()
@@ -26,6 +29,10 @@ from voice_ai_agent import VoiceAIAgent
 from integration.tts_integration import TTSIntegration
 from integration.pipeline import VoiceAIAgentPipeline
 
+# Get Twilio credentials from environment
+TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
+TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
+
 # Configure logging with more debug info
 logging.basicConfig(level=logging.DEBUG, format=LOG_FORMAT)
 logger = logging.getLogger(__name__)
@@ -36,10 +43,11 @@ app = Flask(__name__)
 # Global instances
 twilio_handler = None
 voice_ai_pipeline = None
+base_url = None
 
 async def initialize_system():
     """Initialize all system components."""
-    global twilio_handler, voice_ai_pipeline
+    global twilio_handler, voice_ai_pipeline, base_url
     
     logger.info("Initializing Voice AI Agent...")
     
@@ -47,7 +55,7 @@ async def initialize_system():
     agent = VoiceAIAgent(
         storage_dir='./storage',
         model_name='mistral:7b-instruct-v0.2-q4_0',
-        whisper_model_path='tiny.en',
+        whisper_model_path='models/base.en',
         llm_temperature=0.7
     )
     await agent.init()
@@ -78,10 +86,17 @@ async def initialize_system():
     
     logger.info("System initialized successfully")
 
+@app.route('/', methods=['GET'])
+def index():
+    """Simple test endpoint."""
+    return "Voice AI Agent is running!"
+
 @app.route('/voice/incoming', methods=['POST'])
 def handle_incoming_call():
     """Handle incoming voice calls."""
     logger.info("Received incoming call request")
+    logger.info(f"Request headers: {request.headers}")
+    logger.info(f"Request form data: {request.form}")
     
     if not twilio_handler:
         logger.error("System not initialized")
@@ -112,6 +127,126 @@ def handle_incoming_call():
 </Response>'''
         return Response(fallback_twiml, mimetype='text/xml')
 
+@app.route('/voice/record', methods=['POST'])
+def handle_recording():
+    """Handle voice recording and process it through the AI pipeline."""
+    logger.info("Received recording")
+    logger.info(f"Recording data: {request.form}")
+    
+    # Get the recording data
+    recording_sid = request.form.get('RecordingSid')
+    call_sid = request.form.get('CallSid')
+    
+    # Create TwiML response
+    response = VoiceResponse()
+    
+    try:
+        # Download and process the recording
+        if recording_sid and voice_ai_pipeline:
+            # Wait a moment for the recording to be available
+            time.sleep(2)
+            
+            # Use Twilio client to fetch the recording
+            try:
+                client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+                
+                # Fetch the recording
+                recording = client.recordings(recording_sid).fetch()
+                logger.info(f"Recording fetched. Media URL: {recording.media_url}")
+                
+                # Download the recording
+                media_url = f'https://api.twilio.com{recording.media_url}'
+                auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+                recording_response = requests.get(media_url, auth=auth)
+                
+                if recording_response.status_code == 200:
+                    # Save temporarily
+                    temp_path = f'/tmp/{call_sid}.wav'
+                    with open(temp_path, 'wb') as f:
+                        f.write(recording_response.content)
+                    
+                    logger.info(f"Downloaded recording to {temp_path}")
+                    
+                    # Process through pipeline
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    result = loop.run_until_complete(
+                        voice_ai_pipeline.process_audio_file(temp_path)
+                    )
+                    loop.close()
+                    
+                    logger.info(f"Pipeline result: {result}")
+                    
+                    # Get the AI response
+                    if result and 'response' in result:
+                        response.say(result['response'], voice='alice')
+                    else:
+                        response.say("I'm sorry, I couldn't process that. Could you try again?", voice='alice')
+                    
+                    # Clean up
+                    os.remove(temp_path)
+                    logger.info(f"Removed temporary file {temp_path}")
+                else:
+                    logger.error(f"Failed to download recording. Status: {recording_response.status_code}")
+                    response.say("I couldn't access your recording. Let me try again.", voice='alice')
+                    response.say("Please speak after the beep.", voice='alice')
+                    response.record(
+                        action=f'{base_url}/voice/record',
+                        method='POST',
+                        timeout=10,
+                        transcribe=False
+                    )
+                    return Response(str(response), mimetype='text/xml')
+            except Exception as e:
+                logger.error(f"Error using Twilio client: {e}", exc_info=True)
+                response.say("I'm having trouble accessing your recording. Please try again.", voice='alice')
+                response.say("Please speak after the beep.", voice='alice')
+                response.record(
+                    action=f'{base_url}/voice/record',
+                    method='POST',
+                    timeout=10,
+                    transcribe=False
+                )
+                return Response(str(response), mimetype='text/xml')
+        else:
+            logger.error("No recording SID or pipeline not initialized")
+            response.say("I'm having trouble processing your request. Please try again.", voice='alice')
+        
+        # Ask if they want to continue or end the call
+        response.pause(length=1)
+        response.say("Would you like to ask another question? Press 1 to continue or hang up to end the call.", voice='alice')
+        
+        # Gather digit input
+        gather = response.gather(num_digits=1, action=f'{base_url}/voice/continue', method='POST')
+        
+    except Exception as e:
+        logger.error(f"Error processing recording: {e}", exc_info=True)
+        response.say("I encountered an error. Please try again.", voice='alice')
+    
+    return Response(str(response), mimetype='text/xml')
+
+@app.route('/voice/continue', methods=['POST'])
+def handle_continue():
+    """Handle the continuation choice."""
+    digits = request.form.get('Digits')
+    response = VoiceResponse()
+    
+    if digits == '1':
+        # Continue the conversation
+        response.say("Please speak after the beep.", voice='alice')
+        response.record(
+            action=f'{base_url}/voice/record',
+            method='POST',
+            timeout=10,
+            transcribe=False
+        )
+    else:
+        # End the call
+        response.say("Thank you for using Voice AI Agent. Goodbye!", voice='alice')
+        response.hangup()
+    
+    return Response(str(response), mimetype='text/xml')
+
 @app.route('/voice/status', methods=['POST'])
 def handle_status_callback():
     """Handle call status callbacks."""
@@ -139,46 +274,50 @@ def handle_status_callback():
 @app.route('/ws/stream/<call_sid>', websocket=True)
 def handle_media_stream(call_sid):
     """Handle WebSocket media stream."""
+    logger.info(f"WebSocket connection attempt for call {call_sid}")
+    logger.info(f"WebSocket environment: {request.environ}")
+    
     if not twilio_handler or not voice_ai_pipeline:
         logger.error("System not initialized")
         return
     
-    ws = Server.accept(request.environ)
-    logger.info(f"WebSocket connection established for call {call_sid}")
-    
-    # Create WebSocket handler
-    ws_handler = WebSocketHandler(call_sid, voice_ai_pipeline)
-    
     try:
+        ws = Server.accept(request.environ)
+        logger.info(f"WebSocket connection established for call {call_sid}")
+        
+        # Send a ping message to test connection
+        ws.send(json.dumps({"event": "connected", "protocol": "Call", "version": "1.0.0"}))
+        
+        # Create WebSocket handler
+        ws_handler = WebSocketHandler(call_sid, voice_ai_pipeline)
+        
         while True:
             try:
-                message = ws.receive()
+                message = ws.receive(timeout=30)  # Add timeout
                 if message is None:
+                    logger.warning(f"Received None message for call {call_sid}")
                     break
                 
-                # Log the type of message received
-                try:
-                    msg_data = json.loads(message)
-                    msg_type = msg_data.get('event', 'unknown')
-                    logger.debug(f"Received WebSocket message type: {msg_type}")
-                except:
-                    logger.debug("Received non-JSON WebSocket message")
+                logger.debug(f"Received message: {message[:100]}...")  # Log first 100 chars
                 
-                # Run async handler in event loop
+                # Run async handler
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 loop.run_until_complete(ws_handler.handle_message(message, ws))
                 loop.close()
                 
             except ConnectionClosed:
+                logger.info(f"WebSocket connection closed for call {call_sid}")
                 break
             except Exception as e:
                 logger.error(f"Error processing WebSocket message: {e}", exc_info=True)
-    
+    except Exception as e:
+        logger.error(f"Error establishing WebSocket connection: {e}", exc_info=True)
     finally:
-        logger.info(f"WebSocket closed for call {call_sid}")
+        logger.info(f"WebSocket cleanup for call {call_sid}")
         try:
-            ws.close()
+            if 'ws' in locals():
+                ws.close()
         except:
             pass
 
