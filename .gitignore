@@ -175,3 +175,4 @@ cython_debug/
 
 # PyPI configuration file
 .pypircmodels/base.en
+models/base.en
