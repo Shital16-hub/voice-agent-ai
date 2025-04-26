@@ -10,6 +10,10 @@ import json
 import base64
 from flask import Flask, request, Response
 from simple_websocket import Server, ConnectionClosed
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -59,8 +63,13 @@ async def initialize_system():
         tts_integration=tts
     )
     
-    # Get base URL from environment or use default
-    base_url = os.getenv('BASE_URL', f'http://{HOST}:{PORT}')
+    # Get base URL from environment
+    base_url = os.getenv('BASE_URL')
+    if not base_url:
+        logger.error("BASE_URL not set in environment")
+        raise ValueError("BASE_URL must be set")
+    
+    logger.info(f"Using BASE_URL: {base_url}")
     
     # Initialize Twilio handler
     twilio_handler = TwilioHandler(voice_ai_pipeline, base_url)
@@ -75,7 +84,11 @@ def handle_incoming_call():
     
     if not twilio_handler:
         logger.error("System not initialized")
-        return Response("System not initialized", status=503)
+        fallback_twiml = '''<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say>System is not initialized. Please try again later.</Say>
+</Response>'''
+        return Response(fallback_twiml, mimetype='text/xml')
     
     # Get call parameters
     from_number = request.form.get('From')
@@ -85,14 +98,18 @@ def handle_incoming_call():
     logger.info(f"Incoming call - From: {from_number}, To: {to_number}, CallSid: {call_sid}")
     
     try:
-        # Generate TwiML response
+        # Generate TwiML response from twilio_handler
         twiml = twilio_handler.handle_incoming_call(from_number, to_number, call_sid)
         logger.info(f"Generated TwiML: {twiml}")
         
         return Response(twiml, mimetype='text/xml')
     except Exception as e:
         logger.error(f"Error handling incoming call: {e}", exc_info=True)
-        return Response(str(e), status=500)
+        fallback_twiml = '''<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say>An error occurred. Please try again later.</Say>
+</Response>'''
+        return Response(fallback_twiml, mimetype='text/xml')
 
 @app.route('/voice/status', methods=['POST'])
 def handle_status_callback():
@@ -102,7 +119,7 @@ def handle_status_callback():
     
     if not twilio_handler:
         logger.error("System not initialized")
-        return Response("System not initialized", status=503)
+        return Response('', status=204)
     
     # Get status parameters
     call_sid = request.form.get('CallSid')
@@ -113,10 +130,10 @@ def handle_status_callback():
     try:
         # Handle status update
         twilio_handler.handle_status_callback(call_sid, call_status)
-        return Response('', status=200)
+        return Response('', status=204)
     except Exception as e:
         logger.error(f"Error handling status callback: {e}", exc_info=True)
-        return Response(str(e), status=500)
+        return Response('', status=204)
 
 @app.route('/ws/stream/<call_sid>', websocket=True)
 def handle_media_stream(call_sid):
@@ -139,14 +156,10 @@ def handle_media_stream(call_sid):
                     break
                 
                 # Run async handler in event loop
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # Create a new loop if one is already running
-                    new_loop = asyncio.new_event_loop()
-                    new_loop.run_until_complete(ws_handler.handle_message(message, ws))
-                    new_loop.close()
-                else:
-                    loop.run_until_complete(ws_handler.handle_message(message, ws))
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(ws_handler.handle_message(message, ws))
+                loop.close()
                 
             except ConnectionClosed:
                 break
@@ -175,4 +188,5 @@ if __name__ == '__main__':
     
     # Run the server
     logger.info(f"Server starting on {HOST}:{PORT}")
+    logger.info(f"BASE_URL: {os.getenv('BASE_URL')}")
     app.run(host=HOST, port=PORT, debug=DEBUG)
