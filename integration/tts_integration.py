@@ -1,3 +1,4 @@
+
 """
 TTS Integration module for Voice AI Agent.
 
@@ -44,14 +45,19 @@ class TTSIntegration:
             return
             
         try:
-            # Initialize the DeepgramTTS client
-            self.tts_client = DeepgramTTS(voice=self.voice, enable_caching=self.enable_caching)
+            # Initialize the DeepgramTTS client with linear16 format
+            self.tts_client = DeepgramTTS(
+                voice=self.voice, 
+                enable_caching=self.enable_caching,
+                container_format="linear16",  # Use linear16 for PCM WAV
+                sample_rate=16000  # Set sample rate for telephony
+            )
             
             # Initialize the RealTimeResponseHandler
             self.tts_handler = RealTimeResponseHandler(tts_streamer=None, tts_client=self.tts_client)
             
             self.initialized = True
-            logger.info(f"Initialized TTS with voice: {self.voice or 'default'}")
+            logger.info(f"Initialized TTS with voice: {self.voice or 'default'}, format: linear16")
         except Exception as e:
             logger.error(f"Error initializing TTS: {e}")
             raise
@@ -70,7 +76,14 @@ class TTSIntegration:
             await self.init()
         
         try:
+            # Get audio data from TTS client
             audio_data = await self.tts_client.synthesize(text)
+            
+            # Ensure the audio data has an even number of bytes
+            if len(audio_data) % 2 != 0:
+                audio_data = audio_data + b'\x00'
+                logger.debug("Padded audio data to make even length")
+            
             return audio_data
         except Exception as e:
             logger.error(f"Error in text to speech conversion: {e}")
@@ -94,6 +107,9 @@ class TTSIntegration:
         
         try:
             async for audio_chunk in self.tts_client.synthesize_streaming(text_generator):
+                # Ensure each chunk has an even number of bytes
+                if len(audio_chunk) % 2 != 0:
+                    audio_chunk = audio_chunk + b'\x00'
                 yield audio_chunk
         except Exception as e:
             logger.error(f"Error in streaming text to speech: {e}")
@@ -182,6 +198,9 @@ class TTSIntegration:
         
         try:
             audio_data = await self.tts_client.synthesize_with_ssml(ssml)
+            # Ensure even number of bytes
+            if len(audio_data) % 2 != 0:
+                audio_data = audio_data + b'\x00'
             return audio_data
         except Exception as e:
             logger.error(f"Error in SSML processing: {e}")

@@ -1,3 +1,4 @@
+
 """
 Audio processing utilities for telephony integration.
 
@@ -64,6 +65,12 @@ class AudioProcessor:
             Audio data in mulaw format
         """
         try:
+            # Check if the data length is a multiple of 2 (for 16-bit samples)
+            if len(pcm_data) % 2 != 0:
+                # Pad with a zero byte to make it even
+                pcm_data = pcm_data + b'\x00'
+                logger.debug("Padded audio data to make even length")
+            
             # Resample from 16kHz to 8kHz
             pcm_data_8k, _ = audioop.ratecv(
                 pcm_data, 2, 1, 
@@ -74,6 +81,8 @@ class AudioProcessor:
             
             # Convert to mulaw
             mulaw_data = audioop.lin2ulaw(pcm_data_8k, 2)
+            
+            logger.debug(f"Converted {len(pcm_data)} bytes of PCM to {len(mulaw_data)} bytes of mulaw")
             
             return mulaw_data
             

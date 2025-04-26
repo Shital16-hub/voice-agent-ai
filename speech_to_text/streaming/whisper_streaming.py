@@ -1,3 +1,4 @@
+
 """
 Streaming wrapper for Whisper.cpp using pywhispercpp.
 """
@@ -236,6 +237,15 @@ class StreamingWhisperASR:
         if not self.is_streaming:
             self.start_streaming()
         
+        # Ensure audio chunk is float32
+        if audio_chunk.dtype != np.float32:
+            audio_chunk = audio_chunk.astype(np.float32)
+        
+        # Ensure audio is in range [-1.0, 1.0]
+        max_val = np.max(np.abs(audio_chunk))
+        if max_val > 1.0:
+            audio_chunk = audio_chunk / max_val
+        
         # Add the audio to the chunker
         has_chunk = self.chunker.add_audio(audio_chunk)
         
@@ -323,7 +333,11 @@ class StreamingWhisperASR:
                 return None
             
             # Combine results from all segments
-            combined_text = " ".join(segment.text for segment in segments)
+            combined_text = " ".join(segment.text for segment in segments if segment.text.strip() and segment.text != "[BLANK_AUDIO]")
+            
+            # If we still don't have any meaningful text, return None
+            if not combined_text.strip():
+                return None
             
             # Create streaming result
             result = StreamingTranscriptionResult(
@@ -360,6 +374,15 @@ class StreamingWhisperASR:
         Returns:
             List of transcription segments
         """
+        # Ensure audio is in the right format
+        if audio_data.dtype != np.float32:
+            audio_data = audio_data.astype(np.float32)
+        
+        # Ensure audio length is sufficient
+        if len(audio_data) < self.sample_rate * 0.1:  # Less than 0.1 second
+            logger.debug("Audio chunk too short for transcription")
+            return []
+        
         # Set parameters safely using only what's supported
         self.model.temperature = self.temperature
         
@@ -394,7 +417,7 @@ class StreamingWhisperASR:
                 logger.error(f"Second transcription attempt failed: {e2}")
                 return []
     
-    def _detect_speech(self, audio: np.ndarray, threshold: float = 0.3) -> bool:
+    def _detect_speech(self, audio: np.ndarray, threshold: float = 0.01) -> bool:
         """
         Simple voice activity detection.
         
@@ -434,11 +457,15 @@ class StreamingWhisperASR:
         
         if chunk is not None and len(chunk) > 0:
             result = await self._process_chunk(chunk)
-            if result:
+            if result and result.text not in ["[BLANK_AUDIO]", ""]:
                 final_text += " " + result.text
         
         self.stream_duration = time.time() - self.streaming_start_time
         self.is_streaming = False
+        
+        # Return empty string if only blank audio detected
+        if final_text.strip() == "[BLANK_AUDIO]":
+            final_text = ""
         
         logger.info(f"Stopped streaming session after {self.stream_duration:.2f}s")
         return final_text.strip(), self.stream_duration

@@ -1,4 +1,3 @@
-
 """
 End-to-end pipeline orchestration for Voice AI Agent.
 
@@ -159,20 +158,20 @@ class VoiceAIAgentPipeline:
     
     async def process_audio_streaming(
         self,
-        audio_file_path: str,
+        audio_data: Union[bytes, np.ndarray],
         audio_callback: Callable[[bytes], Awaitable[None]]
     ) -> Dict[str, Any]:
         """
-        Process audio file with streaming response directly to speech.
+        Process audio data with streaming response directly to speech.
         
         Args:
-            audio_file_path: Path to the input audio file
+            audio_data: Audio data as bytes or numpy array
             audio_callback: Callback to handle audio data
             
         Returns:
             Dictionary with stats about the process
         """
-        logger.info(f"Starting streaming pipeline with audio: {audio_file_path}")
+        logger.info(f"Starting streaming pipeline with audio: {type(audio_data)}")
         
         # Track timing
         start_time = time.time()
@@ -181,11 +180,15 @@ class VoiceAIAgentPipeline:
         if self.conversation_manager:
             self.conversation_manager.reset()
         
-        # Load and transcribe audio
-        from speech_to_text.utils.audio_utils import load_audio_file
-        
         try:
-            audio, sample_rate = load_audio_file(audio_file_path, target_sr=16000)
+            # Ensure audio is in the right format
+            if isinstance(audio_data, bytes):
+                # Convert bytes to numpy array if needed
+                audio = np.frombuffer(audio_data, dtype=np.float32)
+            else:
+                audio = audio_data
+            
+            # Transcribe audio
             transcription, duration = await self._transcribe_audio(audio)
             
             if not transcription.strip():
@@ -243,6 +246,108 @@ class VoiceAIAgentPipeline:
                 "transcription_time": transcription_time
             }
     
+    async def process_audio_data(
+        self,
+        audio_data: Union[bytes, np.ndarray],
+        speech_output_path: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Process audio data through the complete pipeline.
+        
+        Args:
+            audio_data: Audio data as bytes or numpy array
+            speech_output_path: Path to save speech output
+            
+        Returns:
+            Results dictionary
+        """
+        logger.info(f"Starting pipeline with audio data: {type(audio_data)}")
+        
+        # Track timing
+        start_time = time.time()
+        
+        # Reset conversation state
+        if self.conversation_manager:
+            self.conversation_manager.reset()
+        
+        # Convert audio data to numpy array if needed
+        if isinstance(audio_data, bytes):
+            audio = np.frombuffer(audio_data, dtype=np.float32)
+        else:
+            audio = audio_data
+        
+        # STAGE 1: Speech-to-Text
+        logger.info("STAGE 1: Speech-to-Text")
+        stt_start = time.time()
+        
+        # Process for transcription
+        transcription, duration = await self._transcribe_audio(audio)
+        
+        if not transcription.strip():
+            return {"error": "No transcription detected"}
+            
+        timings = {"stt": time.time() - stt_start}
+        logger.info(f"Transcription completed in {timings['stt']:.2f}s: {transcription}")
+        
+        # STAGE 2: Knowledge Base Query
+        logger.info("STAGE 2: Knowledge Base Query")
+        kb_start = time.time()
+        
+        try:
+            # Retrieve context and generate response
+            retrieval_results = await self.query_engine.retrieve_with_sources(transcription)
+            query_result = await self.query_engine.query(transcription)
+            response = query_result.get("response", "")
+            
+            if not response:
+                return {"error": "No response generated from knowledge base"}
+                
+            timings["kb"] = time.time() - kb_start
+            logger.info(f"Response generated: {response[:50]}...")
+            
+        except Exception as e:
+            logger.error(f"Error in KB stage: {e}")
+            return {"error": f"Knowledge base error: {str(e)}"}
+        
+        # STAGE 3: Text-to-Speech
+        logger.info("STAGE 3: Text-to-Speech")
+        tts_start = time.time()
+        
+        try:
+            # Convert response to speech
+            speech_audio = await self.tts_integration.text_to_speech(response)
+            
+            # Save speech audio if output file specified
+            if speech_output_path:
+                os.makedirs(os.path.dirname(os.path.abspath(speech_output_path)), exist_ok=True)
+                with open(speech_output_path, "wb") as f:
+                    f.write(speech_audio)
+                logger.info(f"Saved speech audio to {speech_output_path}")
+            
+            timings["tts"] = time.time() - tts_start
+            logger.info(f"TTS completed in {timings['tts']:.2f}s, generated {len(speech_audio)} bytes")
+            
+            # Calculate total time
+            total_time = time.time() - start_time
+            
+            # Compile results
+            return {
+                "transcription": transcription,
+                "response": response,
+                "speech_audio_size": len(speech_audio),
+                "speech_audio": speech_audio,
+                "timings": timings,
+                "total_time": total_time
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in TTS stage: {e}")
+            return {
+                "error": f"TTS error: {str(e)}",
+                "transcription": transcription,
+                "response": response
+            }
+    
     async def _transcribe_audio(self, audio: np.ndarray) -> tuple[str, float]:
         """
         Transcribe audio data.
@@ -266,18 +371,16 @@ class VoiceAIAgentPipeline:
         # Disable VAD for short audio
         self.speech_recognizer.vad_enabled = False
         
-        # First attempt
         try:
             self.speech_recognizer.start_streaming()
+            # Pass the numpy array directly to process_audio_chunk
             await self.speech_recognizer.process_audio_chunk(audio)
             transcription, duration = await self.speech_recognizer.stop_streaming()
         except Exception as e:
-            logger.warning(f"First transcription attempt failed: {e}")
-        
-        # If first attempt failed, try again
-        if not transcription or transcription.strip() == "":
+            logger.warning(f"Transcription attempt failed: {e}")
+            # Try again with a different approach if needed
             try:
-                logger.info("First attempt yielded no transcription, trying again")
+                logger.info("First attempt failed, trying again")
                 self.speech_recognizer.start_streaming()
                 await self.speech_recognizer.process_audio_chunk(audio)
                 transcription, duration = await self.speech_recognizer.stop_streaming()

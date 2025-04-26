@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 Alternative Twilio application using simple-websocket.
@@ -25,8 +26,8 @@ from voice_ai_agent import VoiceAIAgent
 from integration.tts_integration import TTSIntegration
 from integration.pipeline import VoiceAIAgentPipeline
 
-# Configure logging
-logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT)
+# Configure logging with more debug info
+logging.basicConfig(level=logging.DEBUG, format=LOG_FORMAT)
 logger = logging.getLogger(__name__)
 
 # Flask app setup
@@ -155,6 +156,14 @@ def handle_media_stream(call_sid):
                 if message is None:
                     break
                 
+                # Log the type of message received
+                try:
+                    msg_data = json.loads(message)
+                    msg_type = msg_data.get('event', 'unknown')
+                    logger.debug(f"Received WebSocket message type: {msg_type}")
+                except:
+                    logger.debug("Received non-JSON WebSocket message")
+                
                 # Run async handler in event loop
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
@@ -168,7 +177,10 @@ def handle_media_stream(call_sid):
     
     finally:
         logger.info(f"WebSocket closed for call {call_sid}")
-        ws.close()
+        try:
+            ws.close()
+        except:
+            pass
 
 @app.route('/health', methods=['GET'])
 def health_check():

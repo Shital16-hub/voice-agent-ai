@@ -1,3 +1,4 @@
+
 """
 WebSocket handler for Twilio media streams.
 """
@@ -40,6 +41,7 @@ class WebSocketHandler:
         self.silence_start_time = None
         self.is_processing = False
         self.conversation_active = True
+        self.sequence_number = 0  # For Twilio media sequence tracking
     
     async def handle_message(self, message: str, ws) -> None:
         """
@@ -59,6 +61,8 @@ class WebSocketHandler:
                 logger.info(f"WebSocket connected for call {self.call_sid}")
             elif event_type == 'start':
                 await self._handle_start(data)
+                # Send a test tone to verify audio is working
+                await self.send_test_tone(ws)
             elif event_type == 'media':
                 await self._handle_media(data, ws)
             elif event_type == 'stop':
@@ -119,7 +123,8 @@ class WebSocketHandler:
         
         try:
             # Convert buffer to PCM
-            pcm_audio = self.audio_processor.mulaw_to_pcm(self.input_buffer)
+            mulaw_bytes = bytes(self.input_buffer)
+            pcm_audio = self.audio_processor.mulaw_to_pcm(mulaw_bytes)
             
             # Clear input buffer
             self.input_buffer.clear()
@@ -163,8 +168,17 @@ class WebSocketHandler:
             
             # Create audio callback for TTS output
             async def audio_callback(tts_audio: bytes):
+                # Skip extremely short audio chunks
+                if len(tts_audio) < 100:
+                    logger.debug(f"Skipping short audio chunk of {len(tts_audio)} bytes")
+                    return
+                
+                logger.debug(f"Received TTS audio of length: {len(tts_audio)} bytes")
+                
                 # Convert TTS output to mulaw
                 mulaw_audio = self.audio_processor.pcm_to_mulaw(tts_audio)
+                
+                logger.debug(f"Converted to mulaw of length: {len(mulaw_audio)} bytes")
                 
                 # Send to Twilio
                 await self._send_audio(mulaw_audio, ws)
@@ -198,25 +212,75 @@ class WebSocketHandler:
             logger.error(f"Error in pipeline processing: {e}", exc_info=True)
     
     async def _send_audio(self, audio_data: bytes, ws) -> None:
-        """Send audio data to Twilio."""
+        """Send audio data to Twilio using the correct format."""
         try:
-            # Encode audio to base64
-            audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+            # Ensure the audio data is valid
+            if not audio_data or len(audio_data) == 0:
+                logger.warning("Attempted to send empty audio data")
+                return
             
-            # Create media message
-            message = {
-                "event": "media",
-                "streamSid": self.stream_sid,
-                "media": {
-                    "payload": audio_base64
+            # Skip very short audio chunks (likely padding)
+            if len(audio_data) < 100:
+                logger.debug(f"Skipping short audio data: {len(audio_data)} bytes")
+                return
+            
+            # Split large audio data into smaller chunks for better streaming
+            chunk_size = 1024  # Twilio recommended chunk size
+            for i in range(0, len(audio_data), chunk_size):
+                chunk = audio_data[i:i + chunk_size]
+                
+                # Encode audio to base64
+                audio_base64 = base64.b64encode(chunk).decode('utf-8')
+                
+                # Create media message
+                message = {
+                    "event": "media",
+                    "streamSid": self.stream_sid,
+                    "media": {
+                        "payload": audio_base64
+                    }
                 }
-            }
+                
+                # Add sequence number for better tracking
+                message["sequenceNumber"] = str(self.sequence_number)
+                self.sequence_number += 1
+                
+                # Send message without await (simple-websocket is synchronous)
+                ws.send(json.dumps(message))
+                
+                # Small delay between chunks to prevent overwhelming the stream
+                await asyncio.sleep(0.01)
             
-            # Send message
-            ws.send(json.dumps(message))
+            logger.debug(f"Sent audio in chunks with total length: {len(audio_data)}")
             
         except Exception as e:
             logger.error(f"Error sending audio: {e}")
+    
+    async def send_test_tone(self, ws) -> None:
+        """Send a test tone to verify audio output."""
+        try:
+            import numpy as np
+            import audioop
+            
+            # Generate a 1-second 440Hz tone at 8kHz
+            duration = 1.0
+            sample_rate = 8000
+            frequency = 440
+            t = np.linspace(0, duration, int(sample_rate * duration), False)
+            tone = np.sin(frequency * 2 * np.pi * t) * 0.5
+            
+            # Convert to 16-bit PCM
+            pcm_data = (tone * 32767).astype(np.int16).tobytes()
+            
+            # Convert to mulaw
+            mulaw_data = audioop.lin2ulaw(pcm_data, 2)
+            
+            # Send the test tone
+            await self._send_audio(mulaw_data, ws)
+            logger.info("Sent test tone to Twilio")
+            
+        except Exception as e:
+            logger.error(f"Error sending test tone: {e}")
     
     async def send_clear_message(self, ws) -> None:
         """Send clear message to stop any ongoing audio playback."""

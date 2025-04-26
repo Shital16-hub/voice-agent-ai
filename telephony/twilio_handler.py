@@ -1,3 +1,4 @@
+
 """
 Main Twilio handler for voice calls.
 """
@@ -70,14 +71,31 @@ class TwilioHandler:
                     voice='alice')
         response.pause(length=1)
         
-        # Start media stream
+        # Add a beep sound
+        response.play('https://www.soundjay.com/button/beep-07.wav')
+        response.pause(length=1)
+        
+        # Start media stream with correct parameters
         start = Start()
-        stream = Stream(url=f'wss://{self.base_url.replace("https://", "").replace("http://", "")}/ws/stream/{call_sid}')
+        
+        # Configure the stream with explicit parameters
+        stream = Stream(
+            url=f'wss://{self.base_url.replace("https://", "").replace("http://", "")}/ws/stream/{call_sid}',
+            track='inbound_track'  # Explicitly specify inbound track
+        )
+        
+        # Add parameter for audio format
+        stream.parameter(name='audioFormat', value='audio/x-mulaw;rate=8000')
+        
         start.append(stream)
         response.append(start)
         
-        # Keep the call alive
-        response.pause(length=MAX_CALL_DURATION)
+        # Add the Connect verb to bridge the call to the stream
+        connect = Connect()
+        connect.stream(
+            url=f'wss://{self.base_url.replace("https://", "").replace("http://", "")}/ws/stream/{call_sid}'
+        )
+        response.append(connect)
         
         return str(response)
     
@@ -167,12 +185,20 @@ class TwilioHandler:
         
         # Start media stream (same as incoming)
         start = Start()
-        stream = Stream(url=f'wss://{self.base_url.replace("https://", "").replace("http://", "")}/ws/stream')
+        stream = Stream(
+            url=f'wss://{self.base_url.replace("https://", "").replace("http://", "")}/ws/stream',
+            track='inbound_track'
+        )
+        stream.parameter(name='audioFormat', value='audio/x-mulaw;rate=8000')
         start.append(stream)
         response.append(start)
         
-        # Keep the call alive
-        response.pause(length=MAX_CALL_DURATION)
+        # Add Connect verb
+        connect = Connect()
+        connect.stream(
+            url=f'wss://{self.base_url.replace("https://", "").replace("http://", "")}/ws/stream'
+        )
+        response.append(connect)
         
         return str(response)
     

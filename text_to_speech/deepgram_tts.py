@@ -1,3 +1,4 @@
+
 """
 Deepgram Text-to-Speech client for the Voice AI Agent.
 """
@@ -71,16 +72,26 @@ class DeepgramTTS:
         """Get the parameters for a TTS request, with overrides from kwargs."""
         params = {
             "model": self.model,
-            "voice": self.voice,
         }
         
-        # Only add sample_rate if not using MP3 encoding
-        if self.container_format != "mp3":
+        # Add sample_rate only if specified and not using MP3
+        if self.sample_rate and self.container_format != "mp3":
             params["sample_rate"] = self.sample_rate
         
         # Add encoding/container format
         if self.container_format:
-            params["encoding"] = self.container_format
+            # Map container format to Deepgram's expected encoding values
+            encoding_map = {
+                "wav": "linear16",  # Use linear16 for WAV
+                "mp3": "mp3",
+                "opus": "opus",
+                "flac": "flac",
+                "aac": "aac",
+                "linear16": "linear16",
+                "mulaw": "mulaw",
+                "alaw": "alaw"
+            }
+            params["encoding"] = encoding_map.get(self.container_format, self.container_format)
         
         # Add optional parameters if provided
         for key, value in kwargs.items():
@@ -102,7 +113,10 @@ class DeepgramTTS:
         """
         # Create a unique hash based on text and params
         cache_key = hashlib.md5(f"{text}:{json.dumps(params, sort_keys=True)}".encode()).hexdigest()
-        return self.cache_dir / f"{cache_key}.{self.container_format}"
+        
+        # Determine file extension based on format
+        ext = "wav" if params.get("encoding") == "linear16" else params.get("encoding", "mp3")
+        return self.cache_dir / f"{cache_key}.{ext}"
     
     async def synthesize(
         self, 
@@ -133,12 +147,6 @@ class DeepgramTTS:
             "text": text
         }
         
-        # Add optional parameters as query parameters
-        query_params = {}
-        for key, value in params.items():
-            if key != "text" and value is not None:
-                query_params[key] = value
-        
         # Make API request
         try:
             async with aiohttp.ClientSession() as session:
@@ -146,7 +154,7 @@ class DeepgramTTS:
                     self.BASE_URL,
                     headers=self._get_headers(),
                     json=payload,
-                    params=query_params
+                    params=params
                 ) as response:
                     if response.status != 200:
                         error_msg = await response.text()
@@ -240,12 +248,6 @@ class DeepgramTTS:
         # Get parameters
         params = self._get_params(**kwargs)
         
-        # Create query parameters
-        query_params = {}
-        for key, value in params.items():
-            if key != "text" and value is not None:
-                query_params[key] = value
-        
         # Make API request
         try:
             async with aiohttp.ClientSession() as session:
@@ -253,7 +255,7 @@ class DeepgramTTS:
                     self.BASE_URL,
                     headers=self._get_headers(),
                     json=payload,
-                    params=query_params
+                    params=params
                 ) as response:
                     if response.status != 200:
                         error_msg = await response.text()
