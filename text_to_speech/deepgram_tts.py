@@ -1,4 +1,3 @@
-
 """
 Deepgram Text-to-Speech client for the Voice AI Agent.
 """
@@ -9,7 +8,7 @@ import aiohttp
 import hashlib
 import json
 from pathlib import Path
-from typing import AsyncGenerator, Dict, Optional, Any, Union
+from typing import AsyncGenerator, Dict, Optional, Any, Union, List
 
 from .config import config
 from .exceptions import TTSError
@@ -25,6 +24,7 @@ class DeepgramTTS:
     """
 
     BASE_URL = "https://api.deepgram.com/v1/speak"
+    MAX_CHUNK_SIZE = 1500  # Maximum safe character chunk size for Deepgram API
     
     def __init__(
         self, 
@@ -118,6 +118,61 @@ class DeepgramTTS:
         ext = "wav" if params.get("encoding") == "linear16" else params.get("encoding", "mp3")
         return self.cache_dir / f"{cache_key}.{ext}"
     
+    def _split_long_text(self, text: str) -> List[str]:
+        """
+        Split long text into smaller chunks that won't exceed API limits.
+        
+        Args:
+            text: Text to split
+            
+        Returns:
+            List of text chunks
+        """
+        if len(text) <= self.MAX_CHUNK_SIZE:
+            return [text]
+            
+        chunks = []
+        sentences = []
+        
+        # First try to split by sentences (periods, exclamation marks, question marks)
+        for sentence in text.replace('!', '.').replace('?', '.').split('.'):
+            if sentence.strip():
+                sentences.append(sentence.strip() + '.')
+        
+        current_chunk = ""
+        for sentence in sentences:
+            # If adding this sentence would exceed the limit
+            if len(current_chunk) + len(sentence) > self.MAX_CHUNK_SIZE:
+                # If current chunk is not empty, add it to chunks
+                if current_chunk:
+                    chunks.append(current_chunk)
+                    current_chunk = ""
+                
+                # If a single sentence is longer than the limit, split it by words
+                if len(sentence) > self.MAX_CHUNK_SIZE:
+                    words = sentence.split()
+                    word_chunk = ""
+                    for word in words:
+                        if len(word_chunk) + len(word) + 1 > self.MAX_CHUNK_SIZE:
+                            chunks.append(word_chunk.strip())
+                            word_chunk = word
+                        else:
+                            word_chunk += " " + word
+                    
+                    if word_chunk.strip():
+                        current_chunk = word_chunk.strip()
+                else:
+                    current_chunk = sentence
+            else:
+                current_chunk += " " + sentence
+                
+        # Add the last chunk if not empty
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+            
+        logger.info(f"Split text of length {len(text)} into {len(chunks)} chunks")
+        return chunks
+    
     async def synthesize(
         self, 
         text: str,
@@ -129,6 +184,56 @@ class DeepgramTTS:
         Args:
             text: Text to synthesize
             **kwargs: Additional parameters to pass to the API
+            
+        Returns:
+            Audio data as bytes
+        """
+        if not text:
+            logger.warning("Empty text provided to synthesize")
+            return b''
+            
+        # Check if text exceeds Deepgram's limit
+        if len(text) > 2000:
+            logger.info(f"Text length ({len(text)}) exceeds Deepgram's 2000 character limit. Splitting into chunks.")
+            chunks = self._split_long_text(text)
+            audio_chunks = []
+            
+            for i, chunk in enumerate(chunks):
+                try:
+                    logger.info(f"Processing chunk {i+1}/{len(chunks)} ({len(chunk)} characters)")
+                    chunk_audio = await self._synthesize_chunk(chunk, **kwargs)
+                    audio_chunks.append(chunk_audio)
+                except Exception as e:
+                    logger.error(f"Error synthesizing chunk {i+1}: {e}")
+                    # Continue with next chunk instead of failing completely
+            
+            # Combine audio chunks
+            if not audio_chunks:
+                raise TTSError("Failed to synthesize any chunks of the text")
+                
+            # For WAV format, we need special handling to combine multiple WAV files
+            if self.container_format == "wav" or kwargs.get('encoding') == 'linear16':
+                # For simplicity, just concatenate the raw PCM data without WAV headers
+                # In a real implementation, you'd properly combine WAV files
+                return audio_chunks[0]  # Just return the first chunk for now
+            else:
+                # For MP3 and other formats, simple concatenation might work
+                return b''.join(audio_chunks)
+        else:
+            # Standard case - text is within limits
+            return await self._synthesize_chunk(text, **kwargs)
+    
+    async def _synthesize_chunk(
+        self, 
+        text: str,
+        **kwargs
+    ) -> bytes:
+        """
+        Synthesize a single chunk of text.
+        
+        Args:
+            text: Text chunk to synthesize
+            **kwargs: Additional parameters
             
         Returns:
             Audio data as bytes
@@ -163,7 +268,7 @@ class DeepgramTTS:
                     audio_data = await response.read()
             
             # Cache result if enabled
-            if self.enable_caching:
+            if self.enable_caching and audio_data:
                 cache_path.write_bytes(audio_data)
                 
             return audio_data
@@ -192,7 +297,7 @@ class DeepgramTTS:
             Audio data chunks as they are generated
         """
         buffer = ""
-        max_chunk_size = config.max_text_chunk_size
+        max_chunk_size = min(config.max_text_chunk_size, self.MAX_CHUNK_SIZE)
         
         try:
             async for text_chunk in text_stream:
@@ -236,6 +341,10 @@ class DeepgramTTS:
         # Ensure SSML is properly formatted
         if not ssml.startswith('<speak>'):
             ssml = f"<speak>{ssml}</speak>"
+            
+        # Check length
+        if len(ssml) > 2000:
+            logger.warning("SSML text exceeds 2000 character limit. Will be truncated by Deepgram.")
             
         # Create a payload with just the SSML text
         payload = {

@@ -10,6 +10,7 @@ import json
 import base64
 import requests
 import time
+import threading
 from flask import Flask, request, Response
 from simple_websocket import Server, ConnectionClosed
 from dotenv import load_dotenv
@@ -19,7 +20,7 @@ from twilio.rest import Client
 # Load environment variables
 load_dotenv()
 
-# Add project root to path
+# Add project root to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from telephony.twilio_handler import TwilioHandler
@@ -44,6 +45,9 @@ app = Flask(__name__)
 twilio_handler = None
 voice_ai_pipeline = None
 base_url = None
+
+# Dictionary to store event loops and state for each call
+call_event_loops = {}
 
 async def initialize_system():
     """Initialize all system components."""
@@ -166,16 +170,71 @@ def handle_status_callback():
     try:
         # Handle status update
         twilio_handler.handle_status_callback(call_sid, call_status)
+        
+        # Clean up event loop if call is completed
+        if call_status in ['completed', 'failed', 'busy', 'no-answer']:
+            # Clean up the event loop for this call
+            if call_sid in call_event_loops:
+                loop_info = call_event_loops[call_sid]
+                # Signal termination
+                if 'terminate_flag' in loop_info:
+                    loop_info['terminate_flag'].set()
+                    
+                # Remove from dictionary
+                if loop_info.get('thread'):
+                    # Wait for thread to join with timeout
+                    thread = loop_info['thread']
+                    thread.join(timeout=1.0)
+                    
+                # Remove from tracking
+                del call_event_loops[call_sid]
+                logger.info(f"Cleaned up event loop resources for call {call_sid}")
+                
         return Response('', status=204)
     except Exception as e:
         logger.error(f"Error handling status callback: {e}", exc_info=True)
         return Response('', status=204)
 
+def run_event_loop_in_thread(loop, ws_handler, ws, call_sid, terminate_flag):
+    """Run event loop in a separate thread."""
+    try:
+        # Set this loop as the event loop for this thread
+        asyncio.set_event_loop(loop)
+        
+        # Create a task for the keep-alive mechanism
+        keep_alive_task = asyncio.ensure_future(ws_handler._keep_alive_loop(ws))
+        
+        # Run the loop until the terminate flag is set or an error occurs
+        while not terminate_flag.is_set():
+            try:
+                # Run the loop for a short duration
+                loop.run_until_complete(asyncio.sleep(0.1))
+            except Exception as e:
+                logger.error(f"Error in event loop for call {call_sid}: {e}")
+                break
+        
+        # Cancel the keep-alive task
+        keep_alive_task.cancel()
+        try:
+            loop.run_until_complete(keep_alive_task)
+        except (asyncio.CancelledError, Exception):
+            pass
+            
+        # Close the loop
+        loop.close()
+        logger.info(f"Event loop for call {call_sid} has been closed")
+        
+    except Exception as e:
+        logger.error(f"Error in event loop thread for call {call_sid}: {e}", exc_info=True)
+    finally:
+        # Clean up call_event_loops entry if it still exists
+        if call_sid in call_event_loops:
+            del call_event_loops[call_sid]
+
 @app.route('/ws/stream/<call_sid>', websocket=True)
 def handle_media_stream(call_sid):
     """Handle WebSocket media stream."""
     logger.info(f"WebSocket connection attempt for call {call_sid}")
-    logger.info(f"WebSocket environment: {request.environ}")
     
     if not twilio_handler or not voice_ai_pipeline:
         logger.error("System not initialized")
@@ -186,25 +245,61 @@ def handle_media_stream(call_sid):
         ws = Server.accept(request.environ)
         logger.info(f"WebSocket connection established for call {call_sid}")
         
-        # Send a connected message
-        ws.send(json.dumps({"event": "connected", "protocol": "Call", "version": "1.0.0"}))
-        
         # Create WebSocket handler
         ws_handler = WebSocketHandler(call_sid, voice_ai_pipeline)
+        
+        # Create an event loop for this connection
+        loop = asyncio.new_event_loop()
+        
+        # Create a flag for termination
+        terminate_flag = threading.Event()
+        
+        # Store the event loop and related info
+        call_event_loops[call_sid] = {
+            'loop': loop,
+            'terminate_flag': terminate_flag,
+            'handler': ws_handler
+        }
+        
+        # Create and start a thread for the event loop
+        loop_thread = threading.Thread(
+            target=run_event_loop_in_thread,
+            args=(loop, ws_handler, ws, call_sid, terminate_flag),
+            daemon=True
+        )
+        loop_thread.start()
+        
+        # Add thread to tracking
+        call_event_loops[call_sid]['thread'] = loop_thread
+        
+        # Process connected event in the event loop
+        connected_message = json.dumps({
+            "event": "connected",
+            "protocol": "Call",
+            "version": "1.0.0"
+        })
+        
+        # Use asyncio.run_coroutine_threadsafe but without waiting for result
+        asyncio.run_coroutine_threadsafe(
+            ws_handler.handle_message(connected_message, ws),
+            loop
+        )
         
         # Process messages until connection closed
         while True:
             try:
-                message = ws.receive(timeout=30)
+                # Use shorter timeout
+                message = ws.receive(timeout=5)
                 if message is None:
                     logger.warning(f"Received None message for call {call_sid}")
                     break
                 
-                # Run async handler
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                loop.run_until_complete(ws_handler.handle_message(message, ws))
-                loop.close()
+                # Process the message in the dedicated event loop
+                # Don't wait for the result to avoid blocking
+                asyncio.run_coroutine_threadsafe(
+                    ws_handler.handle_message(message, ws),
+                    loop
+                )
                 
             except ConnectionClosed:
                 logger.info(f"WebSocket connection closed for call {call_sid}")
@@ -212,17 +307,23 @@ def handle_media_stream(call_sid):
             except Exception as e:
                 logger.error(f"Error processing WebSocket message: {e}", exc_info=True)
                 # Don't break the loop on message processing errors
+                
     except Exception as e:
         logger.error(f"Error establishing WebSocket connection: {e}", exc_info=True)
     finally:
         logger.info(f"WebSocket cleanup for call {call_sid}")
+        
+        # Signal termination
+        if call_sid in call_event_loops:
+            call_event_loops[call_sid]['terminate_flag'].set()
+        
         try:
             if ws:
                 ws.close()
         except Exception as close_error:
             logger.error(f"Error closing WebSocket: {close_error}")
         
-        # Return empty response to avoid the error
+        # Return empty response
         return ""
 
 @app.route('/ws-test')

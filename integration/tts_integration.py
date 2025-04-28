@@ -1,8 +1,7 @@
-
 """
 TTS Integration module for Voice AI Agent.
 
-This module provides classes and functions for integrating text-to-speech
+This module provides functions for integrating text-to-speech
 capabilities with the Voice AI Agent system.
 """
 import logging
@@ -38,6 +37,10 @@ class TTSIntegration:
         self.tts_client = None
         self.tts_handler = None
         self.initialized = False
+        
+        # Parameters for better conversation flow
+        self.add_pause_after_speech = True
+        self.pause_duration_ms = 500  # 500ms pause after speech
     
     async def init(self) -> None:
         """Initialize the TTS components."""
@@ -84,6 +87,16 @@ class TTSIntegration:
                 audio_data = audio_data + b'\x00'
                 logger.debug("Padded audio data to make even length")
             
+            # Add a short pause after speech for better conversation flow
+            if self.add_pause_after_speech:
+                # Generate silence based on pause_duration_ms
+                silence_size = int(16000 * (self.pause_duration_ms / 1000) * 2)  # 16-bit samples
+                silence_data = b'\x00' * silence_size
+                
+                # Append silence to audio data
+                audio_data = audio_data + silence_data
+                logger.debug(f"Added {self.pause_duration_ms}ms pause after speech")
+            
             return audio_data
         except Exception as e:
             logger.error(f"Error in text to speech conversion: {e}")
@@ -106,11 +119,26 @@ class TTSIntegration:
             await self.init()
         
         try:
+            # Track if we need to add the final pause
+            needs_final_pause = False
+            
             async for audio_chunk in self.tts_client.synthesize_streaming(text_generator):
                 # Ensure each chunk has an even number of bytes
                 if len(audio_chunk) % 2 != 0:
                     audio_chunk = audio_chunk + b'\x00'
+                
+                # Only the last chunk should get the pause
+                needs_final_pause = True
                 yield audio_chunk
+            
+            # Add a pause at the end of the complete audio stream
+            if needs_final_pause and self.add_pause_after_speech:
+                # Generate silence based on pause_duration_ms
+                silence_size = int(16000 * (self.pause_duration_ms / 1000) * 2)  # 16-bit samples
+                silence_data = b'\x00' * silence_size
+                yield silence_data
+                logger.debug(f"Added {self.pause_duration_ms}ms pause at end of streaming audio")
+                
         except Exception as e:
             logger.error(f"Error in streaming text to speech: {e}")
             raise
@@ -201,6 +229,14 @@ class TTSIntegration:
             # Ensure even number of bytes
             if len(audio_data) % 2 != 0:
                 audio_data = audio_data + b'\x00'
+            
+            # Add a pause at the end if needed
+            if self.add_pause_after_speech:
+                silence_size = int(16000 * (self.pause_duration_ms / 1000) * 2)
+                silence_data = b'\x00' * silence_size
+                audio_data = audio_data + silence_data
+                logger.debug(f"Added {self.pause_duration_ms}ms pause after SSML speech")
+                
             return audio_data
         except Exception as e:
             logger.error(f"Error in SSML processing: {e}")

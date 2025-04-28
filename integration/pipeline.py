@@ -17,6 +17,10 @@ from knowledge_base.conversation_manager import ConversationManager
 from knowledge_base.llama_index.query_engine import QueryEngine
 
 from integration.tts_integration import TTSIntegration
+from speech_to_text.streaming.whisper_streaming import StreamingTranscriptionResult
+
+# Minimum word count for a valid user query
+MIN_VALID_WORDS = 2
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +52,34 @@ class VoiceAIAgentPipeline:
         self.conversation_manager = conversation_manager
         self.query_engine = query_engine
         self.tts_integration = tts_integration
+        
+        # Create a helper for filtering out non-speech transcriptions
+        from speech_to_text.stt_integration import STTIntegration
+        self.stt_helper = STTIntegration(speech_recognizer)
+    
+    async def _is_valid_transcription(self, transcription: str) -> bool:
+        """
+        Check if a transcription is valid and should be processed.
+        
+        Args:
+            transcription: The transcription text
+            
+        Returns:
+            True if the transcription is valid
+        """
+        # First clean up the transcription
+        cleaned_text = self.stt_helper.cleanup_transcription(transcription)
+        
+        # If it's empty after cleaning, it's not valid
+        if not cleaned_text:
+            return False
+            
+        # Check if it has enough words
+        words = cleaned_text.split()
+        if len(words) < MIN_VALID_WORDS:
+            return False
+            
+        return True
     
     async def process_audio_file(
         self,
@@ -96,9 +128,11 @@ class VoiceAIAgentPipeline:
         logger.info("Transcribing audio...")
         transcription, duration = await self._transcribe_audio(audio)
         
-        if not transcription.strip():
-            logger.error("Transcription returned empty result")
-            return {"error": "No transcription detected"}
+        # Validate transcription
+        is_valid = await self._is_valid_transcription(transcription)
+        if not is_valid:
+            logger.warning(f"Transcription not valid for processing: '{transcription}'")
+            return {"error": "No valid transcription detected", "transcription": transcription}
             
         timings["stt"] = time.time() - stt_start
         logger.info(f"Transcription completed in {timings['stt']:.2f}s: {transcription}")
@@ -198,8 +232,11 @@ class VoiceAIAgentPipeline:
             # Transcribe audio
             transcription, duration = await self._transcribe_audio(audio)
             
-            if not transcription.strip():
-                return {"error": "No transcription detected"}
+            # Validate transcription
+            is_valid = await self._is_valid_transcription(transcription)
+            if not is_valid:
+                logger.warning(f"Transcription not valid for processing: '{transcription}'")
+                return {"error": "No valid transcription detected", "transcription": transcription}
                 
             logger.info(f"Transcription: {transcription}")
             transcription_time = time.time() - start_time
@@ -290,8 +327,11 @@ class VoiceAIAgentPipeline:
         # Process for transcription
         transcription, duration = await self._transcribe_audio(audio)
         
-        if not transcription.strip():
-            return {"error": "No transcription detected"}
+        # Validate transcription
+        is_valid = await self._is_valid_transcription(transcription)
+        if not is_valid:
+            logger.warning(f"Transcription not valid for processing: '{transcription}'")
+            return {"error": "No valid transcription detected", "transcription": transcription}
             
         timings = {"stt": time.time() - stt_start}
         logger.info(f"Transcription completed in {timings['stt']:.2f}s: {transcription}")
@@ -404,6 +444,9 @@ class VoiceAIAgentPipeline:
             # Get final transcription
             transcription, duration = await self.speech_recognizer.stop_streaming()
             
+            # Clean up transcription
+            transcription = self.stt_helper.cleanup_transcription(transcription)
+            
             # Check if we got a valid transcription
             if not transcription or transcription.strip() == "" or transcription == "[BLANK_AUDIO]":
                 logger.warning("First transcription attempt returned empty result, trying again with higher temperature")
@@ -412,7 +455,8 @@ class VoiceAIAgentPipeline:
                 self.speech_recognizer.start_streaming()
                 self.speech_recognizer.update_parameters(temperature=0.2)  # Try with higher temperature
                 await self.speech_recognizer.process_audio_chunk(audio)
-                transcription, duration = await self.speech_recognizer.stop_streaming()
+                raw_transcription, duration = await self.speech_recognizer.stop_streaming()
+                transcription = self.stt_helper.cleanup_transcription(raw_transcription)
                 self.speech_recognizer.update_parameters(temperature=0.0)  # Reset temperature
                 
                 # If still no result, try one more time with more padding
@@ -426,7 +470,8 @@ class VoiceAIAgentPipeline:
                     self.speech_recognizer.start_streaming()
                     self.speech_recognizer.update_parameters(temperature=0.4)  # Even higher temperature
                     await self.speech_recognizer.process_audio_chunk(padded_audio)
-                    transcription, duration = await self.speech_recognizer.stop_streaming()
+                    raw_transcription, duration = await self.speech_recognizer.stop_streaming()
+                    transcription = self.stt_helper.cleanup_transcription(raw_transcription)
                     self.speech_recognizer.update_parameters(temperature=0.0)  # Reset temperature
         except Exception as e:
             logger.error(f"Error in transcription: {e}", exc_info=True)
@@ -435,7 +480,8 @@ class VoiceAIAgentPipeline:
                 logger.info("Trying transcription one more time after error")
                 self.speech_recognizer.start_streaming()
                 await self.speech_recognizer.process_audio_chunk(audio)
-                transcription, duration = await self.speech_recognizer.stop_streaming()
+                raw_transcription, duration = await self.speech_recognizer.stop_streaming()
+                transcription = self.stt_helper.cleanup_transcription(raw_transcription)
             except Exception as e2:
                 logger.error(f"Second transcription attempt also failed: {e2}", exc_info=True)
         finally:
@@ -489,6 +535,16 @@ class VoiceAIAgentPipeline:
             # Initialize speech recognizer
             self.speech_recognizer.start_streaming()
             
+            # Create a custom callback to filter and process interim results
+            async def transcription_callback(result: StreamingTranscriptionResult):
+                if result and result.text:
+                    # Clean up the text using our helper
+                    cleaned_text = self.stt_helper.cleanup_transcription(result.text)
+                    if cleaned_text and len(cleaned_text.split()) >= MIN_VALID_WORDS:
+                        # Replace the text with cleaned version
+                        result.text = cleaned_text
+                        logger.info(f"Interim transcription: {cleaned_text}")
+            
             # Process incoming audio chunks
             async for audio_chunk in audio_chunk_generator:
                 # Add to accumulated audio
@@ -503,17 +559,23 @@ class VoiceAIAgentPipeline:
                 else:
                     silence_frames = 0
                 
-                # Process the audio chunk through STT
-                result = await self.speech_recognizer.process_audio_chunk(audio_chunk)
+                # Process the audio chunk through STT with our custom callback
+                result = await self.speech_recognizer.process_audio_chunk(
+                    audio_chunk=audio_chunk,
+                    callback=transcription_callback
+                )
                 
                 # If we have a result and enough silence or a lot of audio, process it
                 if (result and result.text) or silence_frames >= max_silence_frames:
                     # Get current transcription
-                    transcription, _ = await self.speech_recognizer.stop_streaming()
+                    raw_transcription, _ = await self.speech_recognizer.stop_streaming()
                     
-                    # Only process if we have meaningful new content
+                    # Clean up the transcription
+                    transcription = self.stt_helper.cleanup_transcription(raw_transcription)
+                    
+                    # Only process if we have a valid transcription
                     if (transcription and 
-                        transcription.strip() and 
+                        len(transcription.split()) >= MIN_VALID_WORDS and
                         transcription != last_transcription):
                         
                         # Yield status update
@@ -557,7 +619,12 @@ class VoiceAIAgentPipeline:
             # Process any final audio
             final_transcription, _ = await self.speech_recognizer.stop_streaming()
             
-            if final_transcription and final_transcription != last_transcription:
+            # Clean up the final transcription
+            final_transcription = self.stt_helper.cleanup_transcription(final_transcription) 
+            
+            if (final_transcription and 
+                len(final_transcription.split()) >= MIN_VALID_WORDS and 
+                final_transcription != last_transcription):
                 # Generate final response
                 query_result = await self.query_engine.query(final_transcription)
                 final_response = query_result.get("response", "")

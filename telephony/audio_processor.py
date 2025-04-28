@@ -54,7 +54,7 @@ class AudioProcessor:
             audio_level = np.mean(np.abs(audio_array)) * 100
             logger.debug(f"Converted {len(mulaw_data)} bytes to {len(audio_array)} samples. Audio level: {audio_level:.1f}%")
             
-            # Apply a gain if audio is very quiet (optional)
+            # Apply a gain if audio is very quiet
             if audio_level < 1.0:  # Very quiet audio
                 audio_array = audio_array * min(5.0, 5.0/audio_level)
                 logger.debug(f"Applied gain to quiet audio. New level: {np.mean(np.abs(audio_array)) * 100:.1f}%")
@@ -63,7 +63,8 @@ class AudioProcessor:
             
         except Exception as e:
             logger.error(f"Error converting mulaw to PCM: {e}")
-            raise
+            # Return an empty array rather than raising an exception
+            return np.array([], dtype=np.float32)
     
     @staticmethod
     def pcm_to_mulaw(pcm_data: bytes) -> bytes:
@@ -100,7 +101,8 @@ class AudioProcessor:
             
         except Exception as e:
             logger.error(f"Error converting PCM to mulaw: {e}")
-            raise
+            # Return empty data rather than raising an exception
+            return b''
     
     @staticmethod
     def normalize_audio(audio_data: np.ndarray) -> np.ndarray:
@@ -193,8 +195,12 @@ class AudioProcessor:
         Returns:
             Audio data as numpy array (float32)
         """
-        # Convert to numpy array
-        audio_int16 = np.frombuffer(audio_data, dtype=np.int16)
-        
-        # Convert to float32
-        return audio_int16.astype(np.float32) / 32768.0
+        try:
+            # Convert to numpy array
+            audio_int16 = np.frombuffer(audio_data, dtype=np.int16)
+            
+            # Convert to float32
+            return audio_int16.astype(np.float32) / 32768.0
+        except Exception as e:
+            logger.error(f"Error converting PCM16 to float32: {e}")
+            return np.array([], dtype=np.float32)
