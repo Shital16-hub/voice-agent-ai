@@ -78,19 +78,26 @@ class VoiceAIAgentPipeline:
         logger.info("STAGE 1: Speech-to-Text")
         stt_start = time.time()
         
+        # Log audio file info
+        import os
+        logger.info(f"Audio file size: {os.path.getsize(audio_file_path)} bytes")
+        
         from speech_to_text.utils.audio_utils import load_audio_file
         
         # Load audio file
         try:
             audio, sample_rate = load_audio_file(audio_file_path, target_sr=16000)
+            logger.info(f"Loaded audio: {len(audio)} samples, {sample_rate}Hz")
         except Exception as e:
-            logger.error(f"Error loading audio file: {e}")
+            logger.error(f"Error loading audio file: {e}", exc_info=True)
             return {"error": f"Error loading audio file: {e}"}
         
         # Process for transcription
+        logger.info("Transcribing audio...")
         transcription, duration = await self._transcribe_audio(audio)
         
         if not transcription.strip():
+            logger.error("Transcription returned empty result")
             return {"error": "No transcription detected"}
             
         timings["stt"] = time.time() - stt_start
@@ -173,7 +180,7 @@ class VoiceAIAgentPipeline:
         """
         logger.info(f"Starting streaming pipeline with audio: {type(audio_data)}")
         
-        # Track timing
+        # Record start time for tracking
         start_time = time.time()
         
         # Reset conversation state
@@ -350,7 +357,7 @@ class VoiceAIAgentPipeline:
     
     async def _transcribe_audio(self, audio: np.ndarray) -> tuple[str, float]:
         """
-        Transcribe audio data.
+        Transcribe audio data with improved error handling and retry logic.
         
         This method handles both short and longer audio files,
         with appropriate parameter adjustments.
@@ -361,33 +368,232 @@ class VoiceAIAgentPipeline:
         Returns:
             Tuple of (transcription, duration)
         """
-        # Try multiple approaches to get transcription
-        transcription = ""
-        duration = 0
+        logger.info(f"Transcribing audio: {len(audio)} samples")
         
         # Save original VAD setting
         original_vad = self.speech_recognizer.vad_enabled
         
-        # Disable VAD for short audio
-        self.speech_recognizer.vad_enabled = False
+        # Set VAD based on audio length
+        is_short_audio = len(audio) < self.speech_recognizer.sample_rate * 1.0  # Less than 1 second
+        self.speech_recognizer.vad_enabled = not is_short_audio  # Disable VAD for short audio
+        
+        transcription = ""
+        duration = 0
         
         try:
+            # Reset any existing streaming session
+            if hasattr(self.speech_recognizer, 'is_streaming') and self.speech_recognizer.is_streaming:
+                await self.speech_recognizer.stop_streaming()
+            
+            # Handle short audio
+            min_audio_length = self.speech_recognizer.sample_rate * 1.0  # 1 second
+            if len(audio) < min_audio_length:
+                # Pad with silence if too short
+                logger.info(f"Audio too short ({len(audio)/self.speech_recognizer.sample_rate:.2f}s), padding to {min_audio_length/self.speech_recognizer.sample_rate:.2f}s")
+                padding = np.zeros(min_audio_length - len(audio), dtype=np.float32)
+                audio = np.concatenate([audio, padding])
+            
+            # Start a new streaming session
             self.speech_recognizer.start_streaming()
-            # Pass the numpy array directly to process_audio_chunk
+            logger.info("Started streaming session for transcription")
+            
+            # Process audio data
             await self.speech_recognizer.process_audio_chunk(audio)
+            logger.info("Processed audio chunk, getting final transcription")
+            
+            # Get final transcription
             transcription, duration = await self.speech_recognizer.stop_streaming()
+            
+            # Check if we got a valid transcription
+            if not transcription or transcription.strip() == "" or transcription == "[BLANK_AUDIO]":
+                logger.warning("First transcription attempt returned empty result, trying again with higher temperature")
+                
+                # Try again with different parameters
+                self.speech_recognizer.start_streaming()
+                self.speech_recognizer.update_parameters(temperature=0.2)  # Try with higher temperature
+                await self.speech_recognizer.process_audio_chunk(audio)
+                transcription, duration = await self.speech_recognizer.stop_streaming()
+                self.speech_recognizer.update_parameters(temperature=0.0)  # Reset temperature
+                
+                # If still no result, try one more time with more padding
+                if not transcription or transcription.strip() == "" or transcription == "[BLANK_AUDIO]":
+                    logger.warning("Second transcription attempt returned empty result, trying with more padding")
+                    
+                    # Add more padding (2 seconds total)
+                    more_padding = np.zeros(self.speech_recognizer.sample_rate * 1.0, dtype=np.float32)
+                    padded_audio = np.concatenate([audio, more_padding])
+                    
+                    self.speech_recognizer.start_streaming()
+                    self.speech_recognizer.update_parameters(temperature=0.4)  # Even higher temperature
+                    await self.speech_recognizer.process_audio_chunk(padded_audio)
+                    transcription, duration = await self.speech_recognizer.stop_streaming()
+                    self.speech_recognizer.update_parameters(temperature=0.0)  # Reset temperature
         except Exception as e:
-            logger.warning(f"Transcription attempt failed: {e}")
-            # Try again with a different approach if needed
+            logger.error(f"Error in transcription: {e}", exc_info=True)
+            # Try one more time with basic parameters
             try:
-                logger.info("First attempt failed, trying again")
+                logger.info("Trying transcription one more time after error")
                 self.speech_recognizer.start_streaming()
                 await self.speech_recognizer.process_audio_chunk(audio)
                 transcription, duration = await self.speech_recognizer.stop_streaming()
-            except Exception as e:
-                logger.warning(f"Second transcription attempt failed: {e}")
+            except Exception as e2:
+                logger.error(f"Second transcription attempt also failed: {e2}", exc_info=True)
+        finally:
+            # Restore original VAD setting
+            self.speech_recognizer.vad_enabled = original_vad
         
-        # Restore original VAD setting
-        self.speech_recognizer.vad_enabled = original_vad
+        # Log the result
+        if transcription:
+            logger.info(f"Transcription result: '{transcription}'")
+        else:
+            logger.warning("No transcription generated")
         
         return transcription, duration
+    
+    async def process_realtime_stream(
+        self,
+        audio_chunk_generator: AsyncIterator[np.ndarray],
+        audio_output_callback: Callable[[bytes], Awaitable[None]]
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """
+        Process a real-time audio stream with immediate response.
+        
+        This method is designed for WebSocket-based streaming where audio chunks
+        are continuously arriving and responses should be sent back as soon as possible.
+        
+        Args:
+            audio_chunk_generator: Async generator producing audio chunks
+            audio_output_callback: Callback to handle output audio data
+            
+        Yields:
+            Status updates and results
+        """
+        logger.info("Starting real-time audio stream processing")
+        
+        # Reset conversation state
+        if self.conversation_manager:
+            self.conversation_manager.reset()
+        
+        # Track state
+        accumulated_audio = bytearray()
+        processing = False
+        last_transcription = ""
+        silence_frames = 0
+        max_silence_frames = 5  # Number of silent chunks before processing
+        silence_threshold = 0.01
+        
+        # Timing stats
+        start_time = time.time()
+        
+        try:
+            # Initialize speech recognizer
+            self.speech_recognizer.start_streaming()
+            
+            # Process incoming audio chunks
+            async for audio_chunk in audio_chunk_generator:
+                # Add to accumulated audio
+                if isinstance(audio_chunk, bytes):
+                    audio_chunk = np.frombuffer(audio_chunk, dtype=np.float32)
+                
+                # Check for speech activity
+                is_silence = np.mean(np.abs(audio_chunk)) < silence_threshold
+                
+                if is_silence:
+                    silence_frames += 1
+                else:
+                    silence_frames = 0
+                
+                # Process the audio chunk through STT
+                result = await self.speech_recognizer.process_audio_chunk(audio_chunk)
+                
+                # If we have a result and enough silence or a lot of audio, process it
+                if (result and result.text) or silence_frames >= max_silence_frames:
+                    # Get current transcription
+                    transcription, _ = await self.speech_recognizer.stop_streaming()
+                    
+                    # Only process if we have meaningful new content
+                    if (transcription and 
+                        transcription.strip() and 
+                        transcription != last_transcription):
+                        
+                        # Yield status update
+                        yield {
+                            "status": "transcribed",
+                            "transcription": transcription
+                        }
+                        
+                        # Generate response if not already processing
+                        if not processing:
+                            processing = True
+                            try:
+                                # Query knowledge base
+                                query_result = await self.query_engine.query(transcription)
+                                response = query_result.get("response", "")
+                                
+                                if response:
+                                    # Convert to speech
+                                    speech_audio = await self.tts_integration.text_to_speech(response)
+                                    
+                                    # Send through callback
+                                    await audio_output_callback(speech_audio)
+                                    
+                                    # Yield response
+                                    yield {
+                                        "status": "response",
+                                        "transcription": transcription,
+                                        "response": response,
+                                        "audio_size": len(speech_audio)
+                                    }
+                                    
+                                    # Update last transcription
+                                    last_transcription = transcription
+                            finally:
+                                processing = False
+                    
+                    # Reset for next utterance
+                    self.speech_recognizer.start_streaming()
+                    silence_frames = 0
+            
+            # Process any final audio
+            final_transcription, _ = await self.speech_recognizer.stop_streaming()
+            
+            if final_transcription and final_transcription != last_transcription:
+                # Generate final response
+                query_result = await self.query_engine.query(final_transcription)
+                final_response = query_result.get("response", "")
+                
+                if final_response:
+                    # Convert to speech
+                    final_speech = await self.tts_integration.text_to_speech(final_response)
+                    
+                    # Send through callback
+                    await audio_output_callback(final_speech)
+                    
+                    # Yield final response
+                    yield {
+                        "status": "final",
+                        "transcription": final_transcription,
+                        "response": final_response,
+                        "audio_size": len(final_speech),
+                        "total_time": time.time() - start_time
+                    }
+            
+            # Yield completion
+            yield {
+                "status": "complete",
+                "total_time": time.time() - start_time
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in real-time stream processing: {e}", exc_info=True)
+            yield {
+                "status": "error",
+                "error": str(e),
+                "total_time": time.time() - start_time
+            }
+        finally:
+            # Ensure speech recognizer is properly closed
+            try:
+                await self.speech_recognizer.stop_streaming()
+            except:
+                pass

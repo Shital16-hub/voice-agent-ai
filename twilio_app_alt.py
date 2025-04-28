@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Alternative Twilio application using simple-websocket.
+Alternative Twilio application using WebSocket streaming.
 """
 import os
 import sys
@@ -13,7 +13,7 @@ import time
 from flask import Flask, request, Response
 from simple_websocket import Server, ConnectionClosed
 from dotenv import load_dotenv
-from twilio.twiml.voice_response import VoiceResponse
+from twilio.twiml.voice_response import VoiceResponse, Connect, Stream
 from twilio.rest import Client
 
 # Load environment variables
@@ -93,7 +93,7 @@ def index():
 
 @app.route('/voice/incoming', methods=['POST'])
 def handle_incoming_call():
-    """Handle incoming voice calls."""
+    """Handle incoming voice calls using WebSocket stream."""
     logger.info("Received incoming call request")
     logger.info(f"Request headers: {request.headers}")
     logger.info(f"Request form data: {request.form}")
@@ -114,11 +114,31 @@ def handle_incoming_call():
     logger.info(f"Incoming call - From: {from_number}, To: {to_number}, CallSid: {call_sid}")
     
     try:
-        # Generate TwiML response from twilio_handler
-        twiml = twilio_handler.handle_incoming_call(from_number, to_number, call_sid)
-        logger.info(f"Generated TwiML: {twiml}")
+        # Add call to manager
+        twilio_handler.call_manager.add_call(call_sid, from_number, to_number)
         
-        return Response(twiml, mimetype='text/xml')
+        # Create TwiML response
+        response = VoiceResponse()
+        
+        # Add initial greeting
+        response.say("Welcome to the Voice AI Agent. I'm here to help you.", voice='alice')
+        response.pause(length=1)
+        
+        # Use WebSocket streaming for real-time conversation
+        ws_url = f'{base_url.replace("https://", "wss://")}/ws/stream/{call_sid}'
+        logger.info(f"Setting up WebSocket stream at: {ws_url}")
+        
+        # Create the streaming connection
+        connect = Connect()
+        stream = Stream(url=ws_url)
+        connect.append(stream)
+        response.append(connect)
+        
+        # Add TwiML to keep connection alive if needed
+        response.say("The AI assistant is now listening. Please start speaking.", voice='alice')
+        
+        logger.info(f"Generated TwiML for WebSocket streaming: {response}")
+        return Response(str(response), mimetype='text/xml')
     except Exception as e:
         logger.error(f"Error handling incoming call: {e}", exc_info=True)
         fallback_twiml = '''<?xml version="1.0" encoding="UTF-8"?>
@@ -126,126 +146,6 @@ def handle_incoming_call():
     <Say>An error occurred. Please try again later.</Say>
 </Response>'''
         return Response(fallback_twiml, mimetype='text/xml')
-
-@app.route('/voice/record', methods=['POST'])
-def handle_recording():
-    """Handle voice recording and process it through the AI pipeline."""
-    logger.info("Received recording")
-    logger.info(f"Recording data: {request.form}")
-    
-    # Get the recording data
-    recording_sid = request.form.get('RecordingSid')
-    call_sid = request.form.get('CallSid')
-    
-    # Create TwiML response
-    response = VoiceResponse()
-    
-    try:
-        # Download and process the recording
-        if recording_sid and voice_ai_pipeline:
-            # Wait a moment for the recording to be available
-            time.sleep(2)
-            
-            # Use Twilio client to fetch the recording
-            try:
-                client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-                
-                # Fetch the recording
-                recording = client.recordings(recording_sid).fetch()
-                logger.info(f"Recording fetched. Media URL: {recording.media_url}")
-                
-                # Download the recording
-                media_url = f'https://api.twilio.com{recording.media_url}'
-                auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-                recording_response = requests.get(media_url, auth=auth)
-                
-                if recording_response.status_code == 200:
-                    # Save temporarily
-                    temp_path = f'/tmp/{call_sid}.wav'
-                    with open(temp_path, 'wb') as f:
-                        f.write(recording_response.content)
-                    
-                    logger.info(f"Downloaded recording to {temp_path}")
-                    
-                    # Process through pipeline
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    result = loop.run_until_complete(
-                        voice_ai_pipeline.process_audio_file(temp_path)
-                    )
-                    loop.close()
-                    
-                    logger.info(f"Pipeline result: {result}")
-                    
-                    # Get the AI response
-                    if result and 'response' in result:
-                        response.say(result['response'], voice='alice')
-                    else:
-                        response.say("I'm sorry, I couldn't process that. Could you try again?", voice='alice')
-                    
-                    # Clean up
-                    os.remove(temp_path)
-                    logger.info(f"Removed temporary file {temp_path}")
-                else:
-                    logger.error(f"Failed to download recording. Status: {recording_response.status_code}")
-                    response.say("I couldn't access your recording. Let me try again.", voice='alice')
-                    response.say("Please speak after the beep.", voice='alice')
-                    response.record(
-                        action=f'{base_url}/voice/record',
-                        method='POST',
-                        timeout=10,
-                        transcribe=False
-                    )
-                    return Response(str(response), mimetype='text/xml')
-            except Exception as e:
-                logger.error(f"Error using Twilio client: {e}", exc_info=True)
-                response.say("I'm having trouble accessing your recording. Please try again.", voice='alice')
-                response.say("Please speak after the beep.", voice='alice')
-                response.record(
-                    action=f'{base_url}/voice/record',
-                    method='POST',
-                    timeout=10,
-                    transcribe=False
-                )
-                return Response(str(response), mimetype='text/xml')
-        else:
-            logger.error("No recording SID or pipeline not initialized")
-            response.say("I'm having trouble processing your request. Please try again.", voice='alice')
-        
-        # Ask if they want to continue or end the call
-        response.pause(length=1)
-        response.say("Would you like to ask another question? Press 1 to continue or hang up to end the call.", voice='alice')
-        
-        # Gather digit input
-        gather = response.gather(num_digits=1, action=f'{base_url}/voice/continue', method='POST')
-        
-    except Exception as e:
-        logger.error(f"Error processing recording: {e}", exc_info=True)
-        response.say("I encountered an error. Please try again.", voice='alice')
-    
-    return Response(str(response), mimetype='text/xml')
-
-@app.route('/voice/continue', methods=['POST'])
-def handle_continue():
-    """Handle the continuation choice."""
-    digits = request.form.get('Digits')
-    response = VoiceResponse()
-    
-    if digits == '1':
-        # Continue the conversation
-        response.say("Please speak after the beep.", voice='alice')
-        response.record(
-            action=f'{base_url}/voice/record',
-            method='POST',
-            timeout=10,
-            transcribe=False
-        )
-    else:
-        # End the call
-        response.say("Thank you for using Voice AI Agent. Goodbye!", voice='alice')
-        response.hangup()
-    
-    return Response(str(response), mimetype='text/xml')
 
 @app.route('/voice/status', methods=['POST'])
 def handle_status_callback():
@@ -279,26 +179,26 @@ def handle_media_stream(call_sid):
     
     if not twilio_handler or not voice_ai_pipeline:
         logger.error("System not initialized")
-        return
+        return ""
     
+    ws = None
     try:
         ws = Server.accept(request.environ)
         logger.info(f"WebSocket connection established for call {call_sid}")
         
-        # Send a ping message to test connection
+        # Send a connected message
         ws.send(json.dumps({"event": "connected", "protocol": "Call", "version": "1.0.0"}))
         
         # Create WebSocket handler
         ws_handler = WebSocketHandler(call_sid, voice_ai_pipeline)
         
+        # Process messages until connection closed
         while True:
             try:
-                message = ws.receive(timeout=30)  # Add timeout
+                message = ws.receive(timeout=30)
                 if message is None:
                     logger.warning(f"Received None message for call {call_sid}")
                     break
-                
-                logger.debug(f"Received message: {message[:100]}...")  # Log first 100 chars
                 
                 # Run async handler
                 loop = asyncio.new_event_loop()
@@ -311,15 +211,89 @@ def handle_media_stream(call_sid):
                 break
             except Exception as e:
                 logger.error(f"Error processing WebSocket message: {e}", exc_info=True)
+                # Don't break the loop on message processing errors
     except Exception as e:
         logger.error(f"Error establishing WebSocket connection: {e}", exc_info=True)
     finally:
         logger.info(f"WebSocket cleanup for call {call_sid}")
         try:
-            if 'ws' in locals():
+            if ws:
                 ws.close()
-        except:
-            pass
+        except Exception as close_error:
+            logger.error(f"Error closing WebSocket: {close_error}")
+        
+        # Return empty response to avoid the error
+        return ""
+
+@app.route('/ws-test')
+def ws_test():
+    """WebSocket connection test page."""
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>WebSocket Test</title>
+        <script>
+            function startTest() {
+                const wsUrl = document.getElementById('wsUrl').value;
+                const output = document.getElementById('output');
+                
+                output.innerHTML += `<p>Connecting to ${wsUrl}...</p>`;
+                
+                const ws = new WebSocket(wsUrl);
+                
+                ws.onopen = () => {
+                    output.innerHTML += '<p style="color:green">Connection opened!</p>';
+                    ws.send(JSON.stringify({event: 'test', message: 'Hello WebSocket'}));
+                };
+                
+                ws.onmessage = (event) => {
+                    output.innerHTML += `<p>Received: ${event.data}</p>`;
+                };
+                
+                ws.onerror = (error) => {
+                    output.innerHTML += `<p style="color:red">Error: ${error}</p>`;
+                };
+                
+                ws.onclose = () => {
+                    output.innerHTML += '<p>Connection closed</p>';
+                };
+            }
+        </script>
+    </head>
+    <body>
+        <h1>WebSocket Connection Test</h1>
+        <input id="wsUrl" type="text" value="wss://your-runpod-url.proxy.runpod.net/ws/test" style="width:400px" />
+        <button onclick="startTest()">Test Connection</button>
+        <div id="output"></div>
+    </body>
+    </html>
+    """
+
+@app.route('/ws/test', websocket=True)
+def ws_test_endpoint():
+    """WebSocket test endpoint."""
+    try:
+        ws = Server.accept(request.environ)
+        logger.info("WebSocket test connection established")
+        
+        ws.send(json.dumps({"status": "connected", "message": "WebSocket test successful!"}))
+        
+        try:
+            while True:
+                message = ws.receive(timeout=10)
+                if message is None:
+                    break
+                logger.info(f"Received WebSocket test message: {message}")
+                ws.send(json.dumps({"status": "echo", "message": message}))
+        except Exception as e:
+            logger.error(f"Error in WebSocket test: {e}")
+        finally:
+            ws.close()
+    except Exception as e:
+        logger.error(f"Error establishing WebSocket test connection: {e}")
+    
+    return ""
 
 @app.route('/health', methods=['GET'])
 def health_check():
