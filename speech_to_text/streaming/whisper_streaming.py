@@ -374,6 +374,71 @@ class StreamingWhisperASR:
 
         logger.info(f"Initialized StreamingWhisperASR with model {model_path}")
 
+    def update_parameters(self, temperature=None, initial_prompt=None, no_context=None, single_segment=None, beam_size=None):
+        """
+        Update parameters for the Whisper model.
+        
+        Args:
+            temperature: Temperature for sampling
+            initial_prompt: Initial prompt to guide transcription
+            no_context: Whether to disable using context from previous segments
+            single_segment: Whether to force single segment output
+            beam_size: Beam size for beam search
+        """
+        # Update parameters on the model if available
+        if hasattr(self, 'model'):
+            if temperature is not None and hasattr(self.model, 'temperature'):
+                try:
+                    self.model.temperature = temperature
+                    logger.info(f"Updated temperature to {temperature}")
+                    if hasattr(self, 'temperature'):
+                        self.temperature = temperature
+                except Exception as e:
+                    logger.warning(f"Failed to update temperature: {e}")
+            
+            if initial_prompt is not None and hasattr(self.model, 'initial_prompt'):
+                try:
+                    self.model.initial_prompt = initial_prompt
+                    logger.info(f"Updated initial_prompt")
+                    if hasattr(self, 'initial_prompt'):
+                        self.initial_prompt = initial_prompt
+                except Exception as e:
+                    logger.warning(f"Failed to update initial_prompt: {e}")
+            
+            if no_context is not None and hasattr(self.model, 'no_context'):
+                try:
+                    self.model.no_context = no_context
+                    logger.info(f"Updated no_context to {no_context}")
+                    if hasattr(self, 'no_context'):
+                        self.no_context = no_context
+                except Exception as e:
+                    logger.warning(f"Failed to update no_context: {e}")
+            
+            if single_segment is not None and hasattr(self.model, 'single_segment'):
+                try:
+                    self.model.single_segment = single_segment
+                    logger.info(f"Updated single_segment to {single_segment}")
+                    if hasattr(self, 'single_segment'):
+                        self.single_segment = single_segment
+                except Exception as e:
+                    logger.warning(f"Failed to update single_segment: {e}")
+                
+            if beam_size is not None and hasattr(self.model, 'beam_size'):
+                try:
+                    self.model.beam_size = beam_size
+                    logger.info(f"Updated beam_size to {beam_size}")
+                except Exception as e:
+                    logger.warning(f"Failed to update beam_size: {e}")
+        
+        # Also update transcription parameters dict
+        if hasattr(self, 'transcribe_params'):
+            if temperature is not None:
+                self.transcribe_params['temperature'] = temperature
+            if initial_prompt is not None:
+                self.transcribe_params['initial_prompt'] = initial_prompt
+            if max_tokens is not None and 'max_tokens' in self.transcribe_params:
+                self.transcribe_params['max_tokens'] = max_tokens
+
     def set_parameter_preset(self, preset: str):
         """
         Set parameters according to a predefined preset.
@@ -535,7 +600,7 @@ class StreamingWhisperASR:
         # Apply audio preprocessing for noise reduction
         audio_chunk = self._preprocess_audio(audio_chunk)
 
-        # Add the audio to the chunker
+        # Add to input buffer
         has_chunk = self.chunker.add_audio(audio_chunk)
 
         if not has_chunk:
@@ -694,7 +759,7 @@ class StreamingWhisperASR:
         if len(audio_data) < min_audio_length_samples:
             # Pad with silence if too short
             required_padding = min_audio_length_samples - len(audio_data)
-            logger.info(f"Audio too short ({len(audio_data)/self.sample_rate:.3f}s), padding with {required_padding/self.sample_rate:.3f}s silence")
+            logger.info(f"Audio too short ({len(audio_data)/self.sample_rate:.3f}s), padding to {min_audio_length_samples/self.sample_rate:.3f}s")
             padding = np.zeros(required_padding, dtype=np.float32)
             audio_data = np.concatenate([audio_data, padding])
 

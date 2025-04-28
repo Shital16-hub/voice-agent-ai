@@ -455,16 +455,38 @@ class WebSocketHandler:
     
     async def _process_audio(self, ws) -> None:
         """
-        Process accumulated audio data through the pipeline.
+        Process accumulated audio data through the pipeline with enhanced processing.
+        Knowledge-base agnostic version.
         
         Args:
             ws: WebSocket connection
         """
         try:
-            # Convert buffer to PCM with better error handling
+            # Convert buffer to PCM with enhanced processing
             try:
                 mulaw_bytes = bytes(self.input_buffer)
+                
+                # Convert using the enhanced audio processing
+                from scipy import signal
+                import numpy as np
+                import time
+                
+                # First use the standard converter
                 pcm_audio = self.audio_processor.mulaw_to_pcm(mulaw_bytes)
+                
+                # Additional processing to improve recognition
+                # 1. Apply pre-emphasis filter (boost high frequencies)
+                pcm_audio = np.append(pcm_audio[0], pcm_audio[1:] - 0.97 * pcm_audio[:-1])
+                
+                # 2. Apply stronger noise gate
+                noise_threshold = 0.02  # Stronger than default
+                pcm_audio = np.where(np.abs(pcm_audio) < noise_threshold, 0, pcm_audio)
+                
+                # 3. Re-normalize audio
+                max_val = np.max(np.abs(pcm_audio))
+                if max_val > 0:
+                    pcm_audio = pcm_audio * (0.9 / max_val)
+                
             except Exception as e:
                 logger.error(f"Error converting audio: {e}")
                 # Clear part of buffer and try again next time
@@ -476,30 +498,6 @@ class WebSocketHandler:
             if len(pcm_audio) < 1000:  # Very small audio chunk
                 logger.warning(f"Audio chunk too small: {len(pcm_audio)} samples")
                 return
-            
-            # Check audio volume and update ambient noise level
-            self._update_ambient_noise_level(pcm_audio)
-            
-            # Apply preprocessing to clean the audio
-            pcm_audio = self._preprocess_audio(pcm_audio)
-                
-            # Check if audio contains speech before processing
-            if not self._contains_speech(pcm_audio):
-                logger.debug("Audio doesn't contain speech, skipping processing")
-                # Still clear some of the buffer to avoid accumulating silence
-                half_size = len(self.input_buffer) // 2
-                self.input_buffer = self.input_buffer[half_size:]
-                return
-                
-            # Only process if we have enough audio (at least 1.5 seconds worth)
-            sr = getattr(self.pipeline.speech_recognizer, 'sample_rate', 16000)
-            min_samples = int(sr * 1.5)  # 1.5 seconds of audio
-            
-            if len(pcm_audio) < min_samples:
-                logger.debug(f"Audio chunk too short ({len(pcm_audio)} samples), accumulating more audio")
-                return
-            
-            logger.debug(f"Processing audio chunk of size: {len(pcm_audio)} samples")
             
             # Set up transcription callback for streaming results
             async def transcription_callback(result):
@@ -518,6 +516,17 @@ class WebSocketHandler:
                 # Start a new streaming session
                 self.pipeline.speech_recognizer.start_streaming()
                 
+                # Set generic telephony-specific prompt
+                if hasattr(self.pipeline.speech_recognizer, 'initial_prompt'):
+                    self.pipeline.speech_recognizer.initial_prompt = (
+                        "This is a telephone conversation with a customer. "
+                        "The customer may ask questions about products, services, pricing, or features. "
+                        "Transcribe exactly what is spoken, filtering out noise, static, and line interference."
+                    )
+                    # Also set on model if possible
+                    if hasattr(self.pipeline.speech_recognizer, 'model') and hasattr(self.pipeline.speech_recognizer.model, 'initial_prompt'):
+                        self.pipeline.speech_recognizer.model.initial_prompt = self.pipeline.speech_recognizer.initial_prompt
+                
                 # Process audio chunk
                 await self.pipeline.speech_recognizer.process_audio_chunk(
                     audio_chunk=pcm_audio,
@@ -527,17 +536,15 @@ class WebSocketHandler:
                 # Check for complete transcription
                 transcription, duration = await self.pipeline.speech_recognizer.stop_streaming()
                 
+                # Log before cleanup for debugging
+                logger.info(f"RAW TRANSCRIPTION: '{transcription}'")
+                
                 # Clean up transcription
                 transcription = self.cleanup_transcription(transcription)
+                logger.info(f"CLEANED TRANSCRIPTION: '{transcription}'")
                 
-                # Estimate confidence
-                confidence_estimate = 1.0
-                if "?" in transcription or "[" in transcription or "(" in transcription:
-                    confidence_estimate = 0.6  # Lower confidence if it contains uncertainty markers
-                    logger.info(f"Reduced confidence due to uncertainty markers: {transcription}")
-                
-                # Only process if it's a valid transcription and has good confidence
-                if transcription and self.is_valid_transcription(transcription) and confidence_estimate > 0.7:
+                # Only process if it's a valid transcription
+                if transcription and self.is_valid_transcription(transcription):
                     logger.info(f"Complete transcription: {transcription}")
                     
                     # Now clear the input buffer since we have a valid transcription

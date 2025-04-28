@@ -51,8 +51,23 @@ class AudioProcessor:
             audio_array = np.frombuffer(pcm_data_16k, dtype=np.int16)
             audio_array = audio_array.astype(np.float32) / 32768.0
             
-            # Apply audio filtering and enhancement
-            audio_array = AudioProcessor.enhance_audio(audio_array)
+            # Apply enhanced audio filtering
+            # Apply high-pass filter to remove low-frequency noise
+            b, a = signal.butter(6, 100/(SAMPLE_RATE_AI/2), 'highpass')
+            audio_array = signal.filtfilt(b, a, audio_array)
+            
+            # Apply band-pass filter for telephony freq range (300-3400 Hz)
+            b, a = signal.butter(4, [300/(SAMPLE_RATE_AI/2), 3400/(SAMPLE_RATE_AI/2)], 'band')
+            audio_array = signal.filtfilt(b, a, audio_array)
+            
+            # Apply a simple noise gate
+            noise_threshold = 0.015  # Adjusted threshold
+            audio_array = np.where(np.abs(audio_array) < noise_threshold, 0, audio_array)
+            
+            # Normalize for consistent volume
+            max_val = np.max(np.abs(audio_array))
+            if max_val > 0:
+                audio_array = audio_array * (0.9 / max_val)
             
             # Check audio levels
             audio_level = np.mean(np.abs(audio_array)) * 100

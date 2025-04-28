@@ -51,22 +51,31 @@ base_url = None
 call_event_loops = {}
 
 async def initialize_system():
-    """Initialize all system components with noise handling optimizations."""
+    """Initialize all system components with knowledge-base agnostic speech enhancements."""
     global twilio_handler, voice_ai_pipeline, base_url
     
-    logger.info("Initializing Voice AI Agent with noise handling optimizations...")
+    logger.info("Initializing Voice AI Agent with telephony speech enhancements...")
     
-    # Initialize Voice AI Agent with optimized parameters for noise handling
+    # Define a generic telephony-optimized prompt that works with any knowledge base
+    telephony_prompt = (
+        "This is a telephone conversation with a customer. "
+        "The customer may ask questions about products, services, pricing, or features. "
+        "Transcribe exactly what is spoken, filtering out noise, static, and line interference. "
+        "Common terms in business conversations include: pricing, plan, cost, features, "
+        "monthly, subscription, support, upgrade, details, information."
+    )
+    
+    # Initialize Voice AI Agent with enhanced parameters that are knowledge-base agnostic
     agent = VoiceAIAgent(
         storage_dir='./storage',
         model_name='mistral:7b-instruct-v0.2-q4_0',
         whisper_model_path='models/base.en',
         llm_temperature=0.7,
-        # Pass noise handling parameters directly to constructor
-        whisper_initial_prompt=STT_INITIAL_PROMPT,
-        whisper_no_context=STT_NO_CONTEXT,
-        whisper_temperature=STT_TEMPERATURE,
-        whisper_preset=STT_PRESET
+        # Pass generic telephony-optimized parameters
+        whisper_initial_prompt=telephony_prompt,
+        whisper_temperature=0.0,  # Greedy decoding for more reliable transcription
+        whisper_no_context=True,  # Each utterance is independent
+        whisper_preset="default"
     )
     await agent.init()
     
@@ -94,7 +103,7 @@ async def initialize_system():
     twilio_handler = TwilioHandler(voice_ai_pipeline, base_url)
     await twilio_handler.start()
     
-    logger.info("System initialized successfully with noise handling optimizations")
+    logger.info("System initialized successfully with knowledge-base agnostic speech enhancements")
 
 @app.route('/', methods=['GET'])
 def index():
