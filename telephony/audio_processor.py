@@ -1,5 +1,5 @@
 """
-Audio processing utilities for telephony integration.
+Enhanced audio processing utilities for telephony integration with improved noise handling.
 
 Handles audio format conversion between Twilio and Voice AI Agent.
 """
@@ -7,6 +7,7 @@ import audioop
 import numpy as np
 import logging
 from typing import Tuple, Dict, Any
+from scipy import signal
 
 from telephony.config import SAMPLE_RATE_TWILIO, SAMPLE_RATE_AI
 
@@ -14,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 class AudioProcessor:
     """
-    Handles audio conversion between Twilio and Voice AI formats.
+    Handles audio conversion between Twilio and Voice AI formats with improved noise handling.
     
     Twilio uses 8kHz mulaw encoding, while our Voice AI uses 16kHz PCM.
     """
@@ -22,7 +23,7 @@ class AudioProcessor:
     @staticmethod
     def mulaw_to_pcm(mulaw_data: bytes) -> np.ndarray:
         """
-        Convert Twilio's mulaw audio to PCM for Voice AI.
+        Convert Twilio's mulaw audio to PCM for Voice AI with enhanced noise filtering.
         
         Args:
             mulaw_data: Audio data in mulaw format
@@ -49,6 +50,9 @@ class AudioProcessor:
             # Convert to numpy array (float32)
             audio_array = np.frombuffer(pcm_data_16k, dtype=np.int16)
             audio_array = audio_array.astype(np.float32) / 32768.0
+            
+            # Apply audio filtering and enhancement
+            audio_array = AudioProcessor.enhance_audio(audio_array)
             
             # Check audio levels
             audio_level = np.mean(np.abs(audio_array)) * 100
@@ -121,9 +125,73 @@ class AudioProcessor:
         return audio_data
     
     @staticmethod
+    def enhance_audio(audio_data: np.ndarray) -> np.ndarray:
+        """
+        Enhance audio quality by reducing noise and improving speech clarity.
+        
+        Args:
+            audio_data: Audio data as numpy array
+            
+        Returns:
+            Enhanced audio data
+        """
+        try:
+            # 1. Apply high-pass filter to remove low-frequency noise (below 80Hz)
+            # Telephone lines often have low frequency hum
+            b, a = signal.butter(4, 80/(SAMPLE_RATE_AI/2), 'highpass')
+            filtered_audio = signal.filtfilt(b, a, audio_data)
+            
+            # 2. Apply a mild de-emphasis filter to reduce hissing sounds in phone calls
+            b, a = signal.butter(1, 3000/(SAMPLE_RATE_AI/2), 'low')
+            de_emphasis = signal.filtfilt(b, a, filtered_audio)
+            
+            # 3. Apply a simple noise gate to remove background noise
+            noise_threshold = 0.005  # Adjust based on expected noise level
+            noise_gate = np.where(np.abs(de_emphasis) < noise_threshold, 0, de_emphasis)
+            
+            # 4. Normalize audio to have consistent volume
+            if np.max(np.abs(noise_gate)) > 0:
+                normalized = noise_gate / np.max(np.abs(noise_gate)) * 0.95
+            else:
+                normalized = noise_gate
+            
+            # 5. Apply a mild compression to even out volumes
+            # Compression ratio 2:1 for values above threshold
+            threshold = 0.2
+            ratio = 0.5  # 2:1 compression
+            
+            def compressor(x, threshold, ratio):
+                # If below threshold, leave it alone
+                # If above threshold, compress it
+                mask = np.abs(x) > threshold
+                sign = np.sign(x)
+                mag = np.abs(x)
+                compressed = np.where(
+                    mask,
+                    threshold + (mag - threshold) * ratio,
+                    mag
+                )
+                return sign * compressed
+            
+            compressed = compressor(normalized, threshold, ratio)
+            
+            # Re-normalize after compression
+            if np.max(np.abs(compressed)) > 0:
+                result = compressed / np.max(np.abs(compressed)) * 0.95
+            else:
+                result = compressed
+                
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error enhancing audio: {e}")
+            # Return original audio if enhancement fails
+            return audio_data
+            
+    @staticmethod
     def detect_silence(audio_data: np.ndarray, threshold: float = 0.01) -> bool:
         """
-        Detect if audio contains silence.
+        Enhanced silence detection with frequency analysis.
         
         Args:
             audio_data: Audio data as numpy array
@@ -132,7 +200,31 @@ class AudioProcessor:
         Returns:
             True if audio is considered silence
         """
-        return np.mean(np.abs(audio_data)) < threshold
+        try:
+            # 1. Check energy level
+            energy = np.mean(np.abs(audio_data))
+            energy_silence = energy < threshold
+            
+            # Only do more expensive analysis if the energy check isn't conclusive
+            if energy < threshold * 2:  # If energy is low but not definitely silent
+                # 2. Check zero-crossing rate (white noise has high ZCR)
+                zcr = np.sum(np.abs(np.diff(np.signbit(audio_data)))) / len(audio_data)
+                
+                # 3. Check spectral flatness (noise typically has flatter spectrum)
+                # Approximate with FFT magnitude variance
+                fft_data = np.abs(np.fft.rfft(audio_data))
+                spectral_flatness = np.std(fft_data) / (np.mean(fft_data) + 1e-10)
+                
+                # Combined decision - true silence has low energy, low-moderate ZCR, and low spectral flatness
+                return energy_silence and zcr < 0.1 and spectral_flatness < 2.0
+            
+            # If energy is very low or very high, just use that criterion
+            return energy_silence
+            
+        except Exception as e:
+            logger.error(f"Error in silence detection: {e}")
+            # Fall back to simple energy threshold
+            return np.mean(np.abs(audio_data)) < threshold
     
     @staticmethod
     def get_audio_info(audio_data: bytes) -> Dict[str, Any]:

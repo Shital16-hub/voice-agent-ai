@@ -1,5 +1,5 @@
 """
-WebSocket handler for Twilio media streams.
+WebSocket handler for Twilio media streams with improved noise handling.
 """
 import json
 import base64
@@ -9,13 +9,14 @@ import time
 import numpy as np
 import re
 from typing import Dict, Any, Callable, Awaitable, Optional, List
+from scipy import signal
 
 from telephony.audio_processor import AudioProcessor
 from telephony.config import CHUNK_SIZE, AUDIO_BUFFER_SIZE, SILENCE_THRESHOLD, SILENCE_DURATION, MAX_BUFFER_SIZE
 
 logger = logging.getLogger(__name__)
 
-# Define patterns for non-speech annotations that should be filtered out
+# Enhanced patterns for non-speech annotations
 NON_SPEECH_PATTERNS = [
     r'\(.*?music.*?\)',         # (music), (tense music), etc.
     r'\(.*?wind.*?\)',          # (wind), (wind blowing), etc.
@@ -33,11 +34,22 @@ NON_SPEECH_PATTERNS = [
     r'\(.*?coughing.*?\)',      # (coughing), etc.
     r'\(.*?clap.*?\)',          # (clap), etc.
     r'\(.*?laugh.*?\)',         # (laughing), etc.
+    # Additional noise patterns
+    r'\[.*?noise.*?\]',         # [noise], etc.
+    r'\(.*?background.*?\)',    # (background), etc.
+    r'\[.*?music.*?\]',         # [music], etc.
+    r'\(.*?static.*?\)',        # (static), etc.
+    r'\[.*?unclear.*?\]',       # [unclear], etc.
+    r'\(.*?inaudible.*?\)',     # (inaudible), etc.
+    r'\<.*?noise.*?\>',         # <noise>, etc.
+    r'music playing',           # Common transcription
+    r'background noise',        # Common transcription
+    r'static',                  # Common transcription
 ]
 
 class WebSocketHandler:
     """
-    Handles WebSocket connections for Twilio media streams.
+    Handles WebSocket connections for Twilio media streams with improved noise handling.
     """
     
     def __init__(self, call_sid: str, pipeline):
@@ -85,11 +97,42 @@ class WebSocketHandler:
         # Create an event to signal when we should stop processing
         self.stop_event = asyncio.Event()
         
+        # Add ambient noise tracking for adaptive thresholds
+        self.ambient_noise_level = 0.01  # Starting threshold
+        self.noise_samples = []
+        self.max_noise_samples = 20
+        
         logger.info(f"WebSocketHandler initialized for call {call_sid}")
+    
+    def _update_ambient_noise_level(self, audio_data: np.ndarray) -> None:
+        """
+        Update ambient noise level based on audio energy.
+        
+        Args:
+            audio_data: Audio data as numpy array
+        """
+        # Calculate energy of the audio
+        energy = np.mean(np.abs(audio_data))
+        
+        # If audio is silence (very low energy), use it to update noise floor
+        if energy < 0.02:  # Very quiet audio
+            self.noise_samples.append(energy)
+            # Keep only recent samples
+            if len(self.noise_samples) > self.max_noise_samples:
+                self.noise_samples.pop(0)
+            
+            # Update ambient noise level (with safety floor)
+            if self.noise_samples:
+                # Use 95th percentile to avoid outliers
+                self.ambient_noise_level = max(
+                    0.005,  # Minimum threshold
+                    np.percentile(self.noise_samples, 95) * 2.0  # Set threshold just above noise
+                )
+                logger.debug(f"Updated ambient noise level to {self.ambient_noise_level:.6f}")
     
     def cleanup_transcription(self, text: str) -> str:
         """
-        Clean up transcription text by removing non-speech annotations.
+        Enhanced cleanup of transcription text by removing non-speech annotations and filler words.
         
         Args:
             text: Original transcription text
@@ -103,7 +146,16 @@ class WebSocketHandler:
         # Remove non-speech annotations
         cleaned_text = self.non_speech_pattern.sub('', text)
         
-        # Clean up any double spaces
+        # Remove common filler words at beginning of sentences
+        cleaned_text = re.sub(r'^(um|uh|er|ah|like|so)\s+', '', cleaned_text, flags=re.IGNORECASE)
+        
+        # Remove repeated words (stuttering)
+        cleaned_text = re.sub(r'\b(\w+)( \1\b)+', r'\1', cleaned_text)
+        
+        # Clean up punctuation
+        cleaned_text = re.sub(r'\s+([.,!?])', r'\1', cleaned_text)
+        
+        # Clean up double spaces
         cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
         
         # Log what was cleaned if substantial
@@ -133,6 +185,16 @@ class WebSocketHandler:
         # Check if it matches any non-speech patterns
         if self.non_speech_pattern.search(text):
             logger.info(f"Transcription contains non-speech patterns: {text}")
+            return False
+            
+        # Estimate confidence based on presence of uncertainty markers
+        confidence_estimate = 1.0
+        if "?" in text or "[" in text or "(" in text or "<" in text:
+            confidence_estimate = 0.6  # Lower confidence if it contains uncertainty markers
+            logger.info(f"Reduced confidence due to uncertainty markers: {text}")
+            
+        if confidence_estimate < 0.7:
+            logger.info(f"Transcription confidence too low: {confidence_estimate}")
             return False
             
         # Check word count
@@ -221,6 +283,7 @@ class WebSocketHandler:
         self.last_response_time = time.time()
         self.conversation_active = True
         self.stop_event.clear()
+        self.noise_samples = []  # Reset noise samples
         
         # Send a welcome message
         await self.send_text_response("I'm listening. How can I help you today?", ws)
@@ -309,6 +372,10 @@ class WebSocketHandler:
                 # Convert buffer to PCM
                 mulaw_bytes = bytes(self.input_buffer)
                 pcm_audio = self.audio_processor.mulaw_to_pcm(mulaw_bytes)
+                
+                # Apply preprocessing to clean the audio
+                pcm_audio = self._preprocess_audio(pcm_audio)
+                
                 self.input_buffer.clear()
                 
                 # Create transcription result directly
@@ -350,6 +417,42 @@ class WebSocketHandler:
         name = mark.get('name')
         logger.debug(f"Mark received: {name}")
     
+    def _preprocess_audio(self, audio_data: np.ndarray) -> np.ndarray:
+        """
+        Preprocess audio data to reduce noise.
+        
+        Args:
+            audio_data: Audio data as numpy array
+            
+        Returns:
+            Preprocessed audio data
+        """
+        try:
+            # 1. Apply high-pass filter to remove low-frequency noise (below 80Hz)
+            b, a = signal.butter(4, 80/(16000/2), 'highpass')
+            filtered_audio = signal.filtfilt(b, a, audio_data)
+            
+            # 2. Simple noise gate (suppress very low amplitudes)
+            noise_gate_threshold = max(0.015, self.ambient_noise_level)
+            noise_gate = np.where(np.abs(filtered_audio) < noise_gate_threshold, 0, filtered_audio)
+            
+            # 3. Normalize audio to have consistent volume
+            if np.max(np.abs(noise_gate)) > 0:
+                normalized = noise_gate / np.max(np.abs(noise_gate)) * 0.95
+            else:
+                normalized = noise_gate
+                
+            # Log stats about the audio
+            orig_energy = np.mean(np.abs(audio_data))
+            proc_energy = np.mean(np.abs(normalized))
+            logger.debug(f"Audio preprocessing: original energy={orig_energy:.4f}, processed energy={proc_energy:.4f}")
+            
+            return normalized
+            
+        except Exception as e:
+            logger.error(f"Error in audio preprocessing: {e}", exc_info=True)
+            return audio_data  # Return original audio if preprocessing fails
+    
     async def _process_audio(self, ws) -> None:
         """
         Process accumulated audio data through the pipeline.
@@ -373,18 +476,13 @@ class WebSocketHandler:
             if len(pcm_audio) < 1000:  # Very small audio chunk
                 logger.warning(f"Audio chunk too small: {len(pcm_audio)} samples")
                 return
+            
+            # Check audio volume and update ambient noise level
+            self._update_ambient_noise_level(pcm_audio)
+            
+            # Apply preprocessing to clean the audio
+            pcm_audio = self._preprocess_audio(pcm_audio)
                 
-            # Check audio volume
-            audio_level = np.mean(np.abs(pcm_audio))
-            if audio_level < 0.001:  # Very quiet audio
-                logger.debug(f"Audio level too low: {audio_level:.6f}, skipping")
-                # Still clear some of the buffer
-                half_size = len(self.input_buffer) // 2
-                self.input_buffer = self.input_buffer[half_size:]
-                return
-            
-            logger.debug(f"Processing audio chunk of size: {len(pcm_audio)} samples")
-            
             # Check if audio contains speech before processing
             if not self._contains_speech(pcm_audio):
                 logger.debug("Audio doesn't contain speech, skipping processing")
@@ -400,6 +498,8 @@ class WebSocketHandler:
             if len(pcm_audio) < min_samples:
                 logger.debug(f"Audio chunk too short ({len(pcm_audio)} samples), accumulating more audio")
                 return
+            
+            logger.debug(f"Processing audio chunk of size: {len(pcm_audio)} samples")
             
             # Set up transcription callback for streaming results
             async def transcription_callback(result):
@@ -430,8 +530,14 @@ class WebSocketHandler:
                 # Clean up transcription
                 transcription = self.cleanup_transcription(transcription)
                 
-                # Only process if it's a valid transcription
-                if transcription and self.is_valid_transcription(transcription):
+                # Estimate confidence
+                confidence_estimate = 1.0
+                if "?" in transcription or "[" in transcription or "(" in transcription:
+                    confidence_estimate = 0.6  # Lower confidence if it contains uncertainty markers
+                    logger.info(f"Reduced confidence due to uncertainty markers: {transcription}")
+                
+                # Only process if it's a valid transcription and has good confidence
+                if transcription and self.is_valid_transcription(transcription) and confidence_estimate > 0.7:
                     logger.info(f"Complete transcription: {transcription}")
                     
                     # Now clear the input buffer since we have a valid transcription
@@ -487,32 +593,45 @@ class WebSocketHandler:
         except Exception as e:
             logger.error(f"Error processing audio: {e}", exc_info=True)
     
-    def _contains_speech(self, audio_data: np.ndarray, threshold: float = 0.005) -> bool:
+    def _contains_speech(self, audio_data: np.ndarray) -> bool:
         """
-        Check if audio contains any speech.
+        Enhanced speech detection with better noise filtering.
         
         Args:
             audio_data: Audio data as numpy array
-            threshold: Energy threshold for speech detection
             
         Returns:
             True if audio contains potential speech
         """
-        # Calculate energy in different frequency bands
         if len(audio_data) < 100:
             return False
             
-        # Simple energy check
-        energy = np.mean(np.abs(audio_data))
-        has_energy = energy > threshold
+        # Calculate RMS energy
+        energy = np.sqrt(np.mean(np.square(audio_data)))
         
-        # Also check for variance (speech has more variance than background noise)
-        variance = np.var(audio_data)
-        has_variance = variance > (threshold * 0.1)
+        # Calculate zero-crossing rate (helps distinguish speech from noise)
+        zero_crossings = np.sum(np.abs(np.diff(np.signbit(audio_data)))) / len(audio_data)
         
-        logger.debug(f"Audio energy: {energy:.6f}, variance: {variance:.6f}, contains speech: {has_energy and has_variance}")
+        # Calculate spectral centroid (speech typically has higher centroids than noise)
+        fft_data = np.abs(np.fft.rfft(audio_data))
+        freqs = np.fft.rfftfreq(len(audio_data), 1/16000)
+        spectral_centroid = np.sum(freqs * fft_data) / (np.sum(fft_data) + 1e-10)
         
-        return has_energy and has_variance
+        # Get threshold based on ambient noise
+        speech_threshold = max(0.01, self.ambient_noise_level * 2.5)
+        
+        # Log values for debugging
+        logger.debug(f"Audio energy: {energy:.6f} (threshold: {speech_threshold:.6f}), "
+                    f"zero crossings: {zero_crossings:.6f}, "
+                    f"spectral centroid: {spectral_centroid:.2f}Hz")
+        
+        # Combined speech detection logic
+        is_speech = (energy > speech_threshold) and \
+                   (zero_crossings > 0.01) and \
+                   (zero_crossings < 0.15) and \
+                   (spectral_centroid > 500)  # Speech typically > 500Hz
+        
+        return is_speech
     
     async def _send_audio(self, audio_data: bytes, ws) -> None:
         """

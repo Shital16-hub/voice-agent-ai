@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Alternative Twilio application using WebSocket streaming.
+Enhanced Twilio application using WebSocket streaming with improved noise handling.
 """
 import os
 import sys
@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from telephony.twilio_handler import TwilioHandler
 from telephony.websocket_handler import WebSocketHandler
 from telephony.config import HOST, PORT, DEBUG, LOG_LEVEL, LOG_FORMAT
+from telephony.config import STT_INITIAL_PROMPT, STT_NO_CONTEXT, STT_TEMPERATURE, STT_PRESET
 from voice_ai_agent import VoiceAIAgent
 from integration.tts_integration import TTSIntegration
 from integration.pipeline import VoiceAIAgentPipeline
@@ -50,17 +51,22 @@ base_url = None
 call_event_loops = {}
 
 async def initialize_system():
-    """Initialize all system components."""
+    """Initialize all system components with noise handling optimizations."""
     global twilio_handler, voice_ai_pipeline, base_url
     
-    logger.info("Initializing Voice AI Agent...")
+    logger.info("Initializing Voice AI Agent with noise handling optimizations...")
     
-    # Initialize Voice AI Agent
+    # Initialize Voice AI Agent with optimized parameters for noise handling
     agent = VoiceAIAgent(
         storage_dir='./storage',
         model_name='mistral:7b-instruct-v0.2-q4_0',
         whisper_model_path='models/base.en',
-        llm_temperature=0.7
+        llm_temperature=0.7,
+        # Pass noise handling parameters directly to constructor
+        whisper_initial_prompt=STT_INITIAL_PROMPT,
+        whisper_no_context=STT_NO_CONTEXT,
+        whisper_temperature=STT_TEMPERATURE,
+        whisper_preset=STT_PRESET
     )
     await agent.init()
     
@@ -88,12 +94,12 @@ async def initialize_system():
     twilio_handler = TwilioHandler(voice_ai_pipeline, base_url)
     await twilio_handler.start()
     
-    logger.info("System initialized successfully")
+    logger.info("System initialized successfully with noise handling optimizations")
 
 @app.route('/', methods=['GET'])
 def index():
     """Simple test endpoint."""
-    return "Voice AI Agent is running!"
+    return "Voice AI Agent is running with improved noise handling!"
 
 @app.route('/voice/incoming', methods=['POST'])
 def handle_incoming_call():
@@ -139,7 +145,7 @@ def handle_incoming_call():
         response.append(connect)
         
         # Add TwiML to keep connection alive if needed
-        response.say("The AI assistant is now listening. Please start speaking.", voice='alice')
+        response.say("The AI assistant is now listening. Please speak clearly.", voice='alice')
         
         logger.info(f"Generated TwiML for WebSocket streaming: {response}")
         return Response(str(response), mimetype='text/xml')
@@ -233,7 +239,7 @@ def run_event_loop_in_thread(loop, ws_handler, ws, call_sid, terminate_flag):
 
 @app.route('/ws/stream/<call_sid>', websocket=True)
 def handle_media_stream(call_sid):
-    """Handle WebSocket media stream."""
+    """Handle WebSocket media stream with improved noise handling."""
     logger.info(f"WebSocket connection attempt for call {call_sid}")
     
     if not twilio_handler or not voice_ai_pipeline:
@@ -245,7 +251,7 @@ def handle_media_stream(call_sid):
         ws = Server.accept(request.environ)
         logger.info(f"WebSocket connection established for call {call_sid}")
         
-        # Create WebSocket handler
+        # Create WebSocket handler with noise handling optimizations
         ws_handler = WebSocketHandler(call_sid, voice_ai_pipeline)
         
         # Create an event loop for this connection
