@@ -20,7 +20,7 @@ class STTConfig(BaseSettings):
     
     # STT settings
     model_name: str = Field(
-        default="nova-2",
+        default="general",
         description="Deepgram STT model to use"
     )
     

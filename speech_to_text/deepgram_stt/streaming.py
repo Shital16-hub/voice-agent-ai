@@ -1,5 +1,6 @@
 """
-Deepgram Speech-to-Text streaming client for real-time transcription.
+Generalized Deepgram STT implementation for better transcription quality
+with any type of conversation.
 """
 import os
 import logging
@@ -8,7 +9,6 @@ import aiohttp
 import json
 import base64
 from typing import Dict, Any, Optional, Union, List, AsyncGenerator, Callable, Awaitable
-import websockets
 from dataclasses import dataclass
 
 from ..config import config
@@ -30,13 +30,11 @@ class StreamingTranscriptionResult:
 
 class DeepgramStreamingSTT:
     """
-    Client for the Deepgram Speech-to-Text streaming API, optimized for telephony.
-    
-    This class handles real-time streaming STT operations using Deepgram's
-    WebSocket API, with telephony-specific optimizations.
+    Generalized version of DeepgramStreamingSTT that uses REST API
+    with enhanced parameters for good transcription quality in any context.
     """
     
-    WEBSOCKET_URL = "wss://api.deepgram.com/v1/listen"
+    API_URL = "https://api.deepgram.com/v1/listen"
     
     def __init__(
         self, 
@@ -49,7 +47,7 @@ class DeepgramStreamingSTT:
         interim_results: Optional[bool] = None
     ):
         """
-        Initialize the Deepgram streaming STT client.
+        Initialize the Deepgram STT client.
         
         Args:
             api_key: Deepgram API key (defaults to environment variable)
@@ -64,64 +62,47 @@ class DeepgramStreamingSTT:
         if not self.api_key:
             raise ValueError("Deepgram API key is required. Set it in .env file or pass directly.")
         
-        self.model_name = model_name or config.model_name
+        self.model_name = model_name or "general"  # Hardcoded to "general" model which is available
         self.language = language or config.language
         self.sample_rate = sample_rate or config.sample_rate
         self.encoding = encoding
         self.channels = channels
         self.interim_results = interim_results if interim_results is not None else config.interim_results
         
-        # State management
-        self.websocket = None
+        # State management for simulating streaming
         self.is_streaming = False
-        self.stream_task = None
+        self.session = None
+        self.chunk_buffer = bytearray()
+        self.buffer_size_threshold = 16384  # Process when buffer reaches ~16KB for better context
         self.utterance_id = 0
         self.last_result = None
     
-    def _get_ws_url_with_params(self, config_obj: Optional[TranscriptionConfig] = None) -> str:
-        """
-        Get WebSocket URL with parameters.
-        
-        Args:
-            config_obj: Optional configuration object
-            
-        Returns:
-            WebSocket URL with parameters
-        """
-        # Start with base parameters
+    def _get_params(self) -> Dict[str, Any]:
+        """Get optimized parameters for the API request."""
         params = {
             "model": self.model_name,
             "language": self.language,
             "encoding": self.encoding,
             "sample_rate": self.sample_rate,
             "channels": self.channels,
-            "interim_results": str(self.interim_results).lower(),
-            "endpointing": config.endpointing,
-            "vad_events": str(config.vad_events).lower(),
             "utterance_end_ms": str(config.utterance_end_ms),
             "smart_format": str(config.smart_format).lower(),
             "filler_words": "false",  # Filter out filler words
             "profanity_filter": str(config.profanity_filter).lower(),
             "alternatives": str(config.alternatives),
             "tier": config.model_options.get("tier", "enhanced"),
+            "punctuate": "true",  # Add punctuation for better readability
+            "diarize": "false"     # Single speaker for telephony
         }
         
-        # Add any parameters from config_obj
-        if config_obj:
-            config_dict = config_obj.dict(exclude_none=True, exclude_unset=True)
-            params.update(config_dict)
-        
-        # Build query string
-        query_string = "&".join([f"{k}={v}" for k, v in params.items()])
-        
-        return f"{self.WEBSOCKET_URL}?{query_string}"
+        return params
     
     async def start_streaming(
         self, 
         config_obj: Optional[TranscriptionConfig] = None
     ) -> None:
         """
-        Start a streaming session.
+        Simulate starting a streaming session.
         
         Args:
             config_obj: Optional configuration object
@@ -129,55 +110,36 @@ class DeepgramStreamingSTT:
         if self.is_streaming:
             await self.stop_streaming()
         
-        # Get WebSocket URL with parameters
-        ws_url = self._get_ws_url_with_params(config_obj)
+        # Create a new aiohttp session
+        self.session = aiohttp.ClientSession()
         
-        # Connect to WebSocket
-        try:
-            self.websocket = await websockets.connect(
-                ws_url,
-                extra_headers={"Authorization": f"Token {self.api_key}"},
-                ping_interval=5,
-                ping_timeout=10
-            )
-            
-            self.is_streaming = True
-            self.utterance_id = 0
-            logger.info("Started Deepgram streaming session")
-            
-        except websockets.exceptions.WebSocketException as e:
-            self.is_streaming = False
-            raise STTStreamingError(f"Failed to connect to Deepgram WebSocket: {str(e)}")
-        except Exception as e:
-            self.is_streaming = False
-            raise STTStreamingError(f"Error starting streaming session: {str(e)}")
+        # Reset buffer
+        self.chunk_buffer = bytearray()
+        self.utterance_id = 0
+        self.is_streaming = True
+        
+        logger.info("Started Deepgram session (simulated streaming)")
     
     async def stop_streaming(self) -> None:
-        """Stop the streaming session."""
+        """Stop the simulated streaming session."""
         if not self.is_streaming:
             return
         
         self.is_streaming = False
         
-        # Close WebSocket connection
-        if self.websocket:
+        # Process any remaining audio in the buffer
+        if len(self.chunk_buffer) > 0:
             try:
-                await self.websocket.close()
+                await self._process_buffer()
             except Exception as e:
-                logger.warning(f"Error closing WebSocket: {str(e)}")
-            finally:
-                self.websocket = None
+                logger.error(f"Error processing final buffer: {e}")
         
-        # Cancel stream task if running
-        if self.stream_task and not self.stream_task.done():
-            self.stream_task.cancel()
-            try:
-                await self.stream_task
-            except asyncio.CancelledError:
-                pass
-            self.stream_task = None
+        # Close the session
+        if self.session:
+            await self.session.close()
+            self.session = None
         
-        logger.info("Stopped Deepgram streaming session")
+        logger.info("Stopped Deepgram session")
     
     async def process_audio_chunk(
         self, 
@@ -185,16 +147,16 @@ class DeepgramStreamingSTT:
         callback: Optional[Callable[[StreamingTranscriptionResult], Awaitable[None]]] = None
     ) -> Optional[StreamingTranscriptionResult]:
         """
-        Process an audio chunk and get transcription.
+        Process an audio chunk.
         
         Args:
             audio_chunk: Audio data chunk
-            callback: Optional async callback for interim results
+            callback: Optional async callback for results
             
         Returns:
-            Optional transcription result (if a final result is available)
+            Optional transcription result
         """
-        if not self.is_streaming or not self.websocket:
+        if not self.is_streaming or not self.session:
             raise STTStreamingError("Not streaming - call start_streaming() first")
         
         try:
@@ -202,95 +164,110 @@ class DeepgramStreamingSTT:
             if not isinstance(audio_chunk, (bytes, bytearray, memoryview)):
                 raise ValueError("Audio chunk must be bytes, bytearray, or memoryview")
             
-            # Send audio chunk to Deepgram
-            await self.websocket.send(audio_chunk)
+            # Add to buffer
+            self.chunk_buffer.extend(audio_chunk)
             
-            # Process any messages that are ready
-            result = await self._process_messages(callback)
-            return result
+            # Process buffer if it's large enough
+            if len(self.chunk_buffer) >= self.buffer_size_threshold:
+                return await self._process_buffer(callback)
+                
+            return None
             
-        except websockets.exceptions.WebSocketException as e:
-            logger.error(f"WebSocket error: {str(e)}")
-            self.is_streaming = False
-            raise STTStreamingError(f"WebSocket error: {str(e)}")
         except Exception as e:
-            logger.error(f"Error processing audio chunk: {str(e)}")
-            raise STTStreamingError(f"Error processing audio chunk: {str(e)}")
+            logger.error(f"Error processing audio chunk: {e}")
+            raise STTStreamingError(f"Error processing audio chunk: {e}")
     
-    async def _process_messages(
+    async def _process_buffer(
         self, 
         callback: Optional[Callable[[StreamingTranscriptionResult], Awaitable[None]]] = None
     ) -> Optional[StreamingTranscriptionResult]:
         """
-        Process incoming messages from Deepgram.
+        Process the current audio buffer with optimized parameters.
         
         Args:
             callback: Optional async callback for results
             
         Returns:
-            Optional transcription result (if a final result is available)
+            Optional transcription result
         """
-        # Check for available messages without blocking
+        if len(self.chunk_buffer) == 0:
+            return None
+            
+        # Create a copy of the buffer
+        audio_data = bytes(self.chunk_buffer)
+        
+        # Clear the buffer
+        self.chunk_buffer = bytearray()
+        
+        # Get optimized parameters
+        params = self._get_params()
+        
+        # Create headers
+        headers = {
+            "Authorization": f"Token {self.api_key}",
+            "Content-Type": "audio/raw"
+        }
+        
         try:
-            # Try to receive a message with a short timeout
-            response_text = await asyncio.wait_for(self.websocket.recv(), timeout=0.01)
-            
-            # Parse the response
-            response = json.loads(response_text)
-            
-            # Check for speech detected event
-            if "type" in response and response["type"] == "SpeechStarted":
-                logger.debug("Speech started detected")
-                return None
-            
-            # Check for speech ended event
-            if "type" in response and response["type"] == "UtteranceEnd":
-                logger.debug("Utterance end detected")
-                return None
-            
-            # Process transcription results
-            if "channel" in response and "alternatives" in response["channel"]:
-                alternatives = response["channel"]["alternatives"]
+            # Send request to Deepgram API
+            async with self.session.post(
+                self.API_URL,
+                params=params,
+                headers=headers,
+                data=audio_data
+            ) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    logger.error(f"Deepgram API error: {response.status}, {error_text}")
+                    return None
+                
+                # Parse the response
+                response_data = await response.json()
+                
+                # Log the full response for debugging
+                logger.debug(f"Deepgram response: {json.dumps(response_data, indent=2)}")
+                
+                # Process the results
+                results = response_data.get("results", {})
+                channels = results.get("channels", [{}])
+                
+                # Get the best channel (usually only one)
+                channel = channels[0] if channels else {}
+                alternatives = channel.get("alternatives", [{}])
+                
+                # Get the best alternative
                 if alternatives:
-                    # Get the first (best) alternative
                     alternative = alternatives[0]
                     transcript = alternative.get("transcript", "")
                     confidence = alternative.get("confidence", 0.0)
-                    is_final = response.get("is_final", False)
                     words = alternative.get("words", [])
                     
-                    # Create result object
+                    # Create a result object
+                    self.utterance_id += 1
                     result = StreamingTranscriptionResult(
                         text=transcript,
-                        is_final=is_final,
+                        is_final=True,  # Always final in this implementation
                         confidence=confidence,
                         words=words,
                         chunk_id=self.utterance_id
                     )
                     
-                    if is_final:
-                        self.utterance_id += 1
-                        self.last_result = result
+                    # Store result
+                    self.last_result = result
                     
                     # Call callback if provided
-                    if callback and (transcript.strip() or is_final):
+                    if callback and transcript.strip():
                         await callback(result)
                     
-                    return result if is_final else None
-            
-            return None
-            
-        except asyncio.TimeoutError:
-            # No messages available, which is normal
-            return None
-        except websockets.exceptions.WebSocketException as e:
-            logger.error(f"WebSocket error while processing messages: {str(e)}")
-            return None
-        except json.JSONDecodeError as e:
-            logger.error(f"Error parsing response: {str(e)}")
+                    return result
+                
+                return None
+                
+        except aiohttp.ClientError as e:
+            logger.error(f"HTTP error: {e}")
             return None
         except Exception as e:
-            logger.error(f"Error processing messages: {str(e)}")
+            logger.error(f"Error processing buffer: {e}")
             return None
     
     async def stream_audio_file(
@@ -331,7 +308,7 @@ class DeepgramStreamingSTT:
                     result = await self.process_audio_chunk(chunk, callback)
                     
                     # Add final result if available
-                    if result and result.is_final:
+                    if result:
                         final_results.append(result)
                     
                     # Simulate real-time streaming if requested
@@ -344,6 +321,6 @@ class DeepgramStreamingSTT:
             return final_results
             
         except Exception as e:
-            logger.error(f"Error streaming audio file: {str(e)}")
+            logger.error(f"Error streaming audio file: {e}")
             await self.stop_streaming()
             raise STTStreamingError(f"Error streaming audio file: {str(e)}")
