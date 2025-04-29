@@ -1,14 +1,19 @@
 """
 Speech-to-text module for the Voice AI Agent.
 
-This module provides real-time streaming speech recognition using Whisper.cpp.
+This module provides real-time streaming speech recognition using Deepgram's API.
 """
 
 import logging
-from speech_to_text.streaming.whisper_streaming import StreamingWhisperASR, StreamingTranscriptionResult
-from speech_to_text.streaming.chunker import AudioChunker, ChunkMetadata
+from speech_to_text.deepgram_stt import (
+    DeepgramSTT, 
+    DeepgramStreamingSTT,
+    StreamingTranscriptionResult,
+    TranscriptionResult
+)
+from speech_to_text.stt_integration import STTIntegration
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # Set up logging
 logging.basicConfig(
@@ -17,9 +22,9 @@ logging.basicConfig(
 )
 
 __all__ = [
-    "StreamingWhisperASR",
+    "DeepgramSTT",
+    "DeepgramStreamingSTT", 
     "StreamingTranscriptionResult",
-    "AudioChunker",
-    "ChunkMetadata",
-    "ConfigLoader",
+    "TranscriptionResult",
+    "STTIntegration",
 ]

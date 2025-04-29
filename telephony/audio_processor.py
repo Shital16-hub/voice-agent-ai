@@ -1,5 +1,5 @@
 """
-Enhanced audio processing utilities for telephony integration with improved noise handling.
+Enhanced audio processing utilities for telephony integration with Deepgram STT.
 
 Handles audio format conversion between Twilio and Voice AI Agent.
 """
@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 class AudioProcessor:
     """
     Handles audio conversion between Twilio and Voice AI formats with improved noise handling.
+    Optimized for Deepgram STT integration.
     
     Twilio uses 8kHz mulaw encoding, while our Voice AI uses 16kHz PCM.
     """
@@ -24,6 +25,7 @@ class AudioProcessor:
     def mulaw_to_pcm(mulaw_data: bytes) -> np.ndarray:
         """
         Convert Twilio's mulaw audio to PCM for Voice AI with enhanced noise filtering.
+        Optimized for Deepgram STT processing.
         
         Args:
             mulaw_data: Audio data in mulaw format
@@ -51,7 +53,7 @@ class AudioProcessor:
             audio_array = np.frombuffer(pcm_data_16k, dtype=np.int16)
             audio_array = audio_array.astype(np.float32) / 32768.0
             
-            # Apply enhanced audio filtering
+            # Apply enhanced audio filtering optimized for Deepgram
             # Apply high-pass filter to remove low-frequency noise
             b, a = signal.butter(6, 100/(SAMPLE_RATE_AI/2), 'highpass')
             audio_array = signal.filtfilt(b, a, audio_array)
@@ -63,6 +65,9 @@ class AudioProcessor:
             # Apply a simple noise gate
             noise_threshold = 0.015  # Adjusted threshold
             audio_array = np.where(np.abs(audio_array) < noise_threshold, 0, audio_array)
+            
+            # Apply pre-emphasis filter to boost higher frequencies
+            audio_array = np.append(audio_array[0], audio_array[1:] - 0.97 * audio_array[:-1])
             
             # Normalize for consistent volume
             max_val = np.max(np.abs(audio_array))
@@ -143,6 +148,7 @@ class AudioProcessor:
     def enhance_audio(audio_data: np.ndarray) -> np.ndarray:
         """
         Enhance audio quality by reducing noise and improving speech clarity.
+        Optimized for Deepgram STT processing.
         
         Args:
             audio_data: Audio data as numpy array
@@ -164,13 +170,16 @@ class AudioProcessor:
             noise_threshold = 0.005  # Adjust based on expected noise level
             noise_gate = np.where(np.abs(de_emphasis) < noise_threshold, 0, de_emphasis)
             
-            # 4. Normalize audio to have consistent volume
-            if np.max(np.abs(noise_gate)) > 0:
-                normalized = noise_gate / np.max(np.abs(noise_gate)) * 0.95
-            else:
-                normalized = noise_gate
+            # 4. Apply pre-emphasis filter to boost higher frequencies (for better speech detection)
+            pre_emphasis = np.append(noise_gate[0], noise_gate[1:] - 0.97 * noise_gate[:-1])
             
-            # 5. Apply a mild compression to even out volumes
+            # 5. Normalize audio to have consistent volume
+            if np.max(np.abs(pre_emphasis)) > 0:
+                normalized = pre_emphasis / np.max(np.abs(pre_emphasis)) * 0.95
+            else:
+                normalized = pre_emphasis
+            
+            # 6. Apply a mild compression to even out volumes
             # Compression ratio 2:1 for values above threshold
             threshold = 0.2
             ratio = 0.5  # 2:1 compression

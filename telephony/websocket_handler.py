@@ -1,5 +1,5 @@
 """
-WebSocket handler for Twilio media streams with improved noise handling.
+WebSocket handler for Twilio media streams with Deepgram STT integration.
 """
 import json
 import base64
@@ -13,6 +13,9 @@ from scipy import signal
 
 from telephony.audio_processor import AudioProcessor
 from telephony.config import CHUNK_SIZE, AUDIO_BUFFER_SIZE, SILENCE_THRESHOLD, SILENCE_DURATION, MAX_BUFFER_SIZE
+
+# Import Deepgram STT
+from speech_to_text.deepgram_stt import DeepgramStreamingSTT, StreamingTranscriptionResult
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +52,7 @@ NON_SPEECH_PATTERNS = [
 
 class WebSocketHandler:
     """
-    Handles WebSocket connections for Twilio media streams with improved noise handling.
+    Handles WebSocket connections for Twilio media streams with Deepgram STT integration.
     """
     
     def __init__(self, call_sid: str, pipeline):
@@ -102,7 +105,12 @@ class WebSocketHandler:
         self.noise_samples = []
         self.max_noise_samples = 20
         
-        logger.info(f"WebSocketHandler initialized for call {call_sid}")
+        # Determine if we're using Deepgram STT
+        self.using_deepgram = (
+            hasattr(pipeline, 'speech_recognizer') and 
+            isinstance(pipeline.speech_recognizer, DeepgramStreamingSTT)
+        )
+        logger.info(f"WebSocketHandler initialized for call {call_sid} with {'Deepgram' if self.using_deepgram else 'Whisper'} STT")
     
     def _update_ambient_noise_level(self, audio_data: np.ndarray) -> None:
         """
@@ -287,6 +295,11 @@ class WebSocketHandler:
         
         # Send a welcome message
         await self.send_text_response("I'm listening. How can I help you today?", ws)
+        
+        # Initialize Deepgram streaming session if using Deepgram
+        if self.using_deepgram:
+            await self.pipeline.speech_recognizer.start_streaming()
+            logger.info("Started Deepgram streaming session")
     
     async def _handle_media(self, data: Dict[str, Any], ws) -> None:
         """
@@ -363,48 +376,10 @@ class WebSocketHandler:
             except asyncio.CancelledError:
                 pass
         
-        # Process any remaining audio
-        if len(self.input_buffer) > 0:
-            try:
-                # Try to process any remaining audio in the buffer
-                logger.info(f"Processing final audio chunk of size: {len(self.input_buffer)}")
-                
-                # Convert buffer to PCM
-                mulaw_bytes = bytes(self.input_buffer)
-                pcm_audio = self.audio_processor.mulaw_to_pcm(mulaw_bytes)
-                
-                # Apply preprocessing to clean the audio
-                pcm_audio = self._preprocess_audio(pcm_audio)
-                
-                self.input_buffer.clear()
-                
-                # Create transcription result directly
-                if hasattr(self.pipeline, 'speech_recognizer'):
-                    # Ensure we're starting fresh
-                    self.pipeline.speech_recognizer.start_streaming()
-                    
-                    # Process the accumulated audio
-                    await self.pipeline.speech_recognizer.process_audio_chunk(pcm_audio)
-                    
-                    # Get the final transcription
-                    transcription, duration = await self.pipeline.speech_recognizer.stop_streaming()
-                    
-                    # Clean up transcription
-                    transcription = self.cleanup_transcription(transcription)
-                    
-                    # Only process if it's a valid transcription
-                    if transcription and self.is_valid_transcription(transcription):
-                        logger.info(f"Final transcription: {transcription}")
-                        
-                        # If we got a valid transcription, try to respond
-                        if transcription and hasattr(self.pipeline, 'query_engine'):
-                            query_result = await self.pipeline.query_engine.query(transcription)
-                            response = query_result.get("response", "")
-                            logger.info(f"Final response: {response}")
-                    else:
-                        logger.info("Final audio did not contain valid speech")
-            except Exception as e:
-                logger.error(f"Error processing final audio: {e}", exc_info=True)
+        # Close Deepgram streaming session if using Deepgram
+        if self.using_deepgram and hasattr(self.pipeline.speech_recognizer, 'is_streaming'):
+            await self.pipeline.speech_recognizer.stop_streaming()
+            logger.info("Stopped Deepgram streaming session")
     
     async def _handle_mark(self, data: Dict[str, Any]) -> None:
         """
@@ -455,8 +430,7 @@ class WebSocketHandler:
     
     async def _process_audio(self, ws) -> None:
         """
-        Process accumulated audio data through the pipeline with enhanced processing.
-        Knowledge-base agnostic version.
+        Process accumulated audio data through the pipeline with Deepgram STT.
         
         Args:
             ws: WebSocket connection
@@ -467,25 +441,10 @@ class WebSocketHandler:
                 mulaw_bytes = bytes(self.input_buffer)
                 
                 # Convert using the enhanced audio processing
-                from scipy import signal
-                import numpy as np
-                import time
-                
-                # First use the standard converter
                 pcm_audio = self.audio_processor.mulaw_to_pcm(mulaw_bytes)
                 
                 # Additional processing to improve recognition
-                # 1. Apply pre-emphasis filter (boost high frequencies)
-                pcm_audio = np.append(pcm_audio[0], pcm_audio[1:] - 0.97 * pcm_audio[:-1])
-                
-                # 2. Apply stronger noise gate
-                noise_threshold = 0.02  # Stronger than default
-                pcm_audio = np.where(np.abs(pcm_audio) < noise_threshold, 0, pcm_audio)
-                
-                # 3. Re-normalize audio
-                max_val = np.max(np.abs(pcm_audio))
-                if max_val > 0:
-                    pcm_audio = pcm_audio * (0.9 / max_val)
+                pcm_audio = self._preprocess_audio(pcm_audio)
                 
             except Exception as e:
                 logger.error(f"Error converting audio: {e}")
@@ -499,42 +458,66 @@ class WebSocketHandler:
                 logger.warning(f"Audio chunk too small: {len(pcm_audio)} samples")
                 return
             
-            # Set up transcription callback for streaming results
-            async def transcription_callback(result):
-                if result and result.text and result.text.strip():
-                    # Clean up the text
-                    cleaned_text = self.cleanup_transcription(result.text)
-                    if cleaned_text:
-                        logger.info(f"Interim transcription: {cleaned_text}")
+            # Create a list to collect transcription results
+            transcription_results = []
             
-            # Start STT streaming if not already active
-            if hasattr(self.pipeline, 'speech_recognizer'):
-                # Reset any existing streaming session
-                if hasattr(self.pipeline.speech_recognizer, 'is_streaming') and self.pipeline.speech_recognizer.is_streaming:
-                    await self.pipeline.speech_recognizer.stop_streaming()
-                
-                # Start a new streaming session
-                self.pipeline.speech_recognizer.start_streaming()
-                
-                # Set generic telephony-specific prompt
-                if hasattr(self.pipeline.speech_recognizer, 'initial_prompt'):
-                    self.pipeline.speech_recognizer.initial_prompt = (
-                        "This is a telephone conversation with a customer. "
-                        "The customer may ask questions about products, services, pricing, or features. "
-                        "Transcribe exactly what is spoken, filtering out noise, static, and line interference."
+            # Define a callback to collect results
+            async def transcription_callback(result):
+                if self.using_deepgram:
+                    # For Deepgram, we care about final results
+                    if result.is_final:
+                        transcription_results.append(result)
+                        logger.debug(f"Received final Deepgram result: {result.text}")
+                else:
+                    # For Whisper, all results are collected
+                    transcription_results.append(result)
+                    logger.debug(f"Received Whisper result: {result.text}")
+            
+            # Process audio through the appropriate STT system
+            try:
+                if self.using_deepgram:
+                    # For Deepgram, convert to bytes format
+                    audio_bytes = (pcm_audio * 32767).astype(np.int16).tobytes()
+                    
+                    # Process chunk with Deepgram
+                    result = await self.pipeline.speech_recognizer.process_audio_chunk(
+                        audio_chunk=audio_bytes,
+                        callback=transcription_callback
                     )
-                    # Also set on model if possible
-                    if hasattr(self.pipeline.speech_recognizer, 'model') and hasattr(self.pipeline.speech_recognizer.model, 'initial_prompt'):
-                        self.pipeline.speech_recognizer.model.initial_prompt = self.pipeline.speech_recognizer.initial_prompt
-                
-                # Process audio chunk
-                await self.pipeline.speech_recognizer.process_audio_chunk(
-                    audio_chunk=pcm_audio,
-                    callback=transcription_callback
-                )
-                
-                # Check for complete transcription
-                transcription, duration = await self.pipeline.speech_recognizer.stop_streaming()
+                    
+                    # Check if we got a final result directly
+                    if result and result.is_final:
+                        transcription_results.append(result)
+                    
+                    # Get transcription if we have results
+                    if transcription_results:
+                        # Use the best result based on confidence
+                        best_result = max(transcription_results, key=lambda r: r.confidence)
+                        transcription = best_result.text
+                    else:
+                        # Stop the Deepgram session to get any pending final results
+                        await self.pipeline.speech_recognizer.stop_streaming()
+                        await self.pipeline.speech_recognizer.start_streaming()
+                        
+                        # No transcription
+                        transcription = ""
+                else:
+                    # For Whisper, use the original approach
+                    # Ensure we're starting fresh
+                    if hasattr(self.pipeline.speech_recognizer, 'is_streaming') and self.pipeline.speech_recognizer.is_streaming:
+                        await self.pipeline.speech_recognizer.stop_streaming()
+                    
+                    # Start a new streaming session
+                    self.pipeline.speech_recognizer.start_streaming()
+                    
+                    # Process audio chunk
+                    await self.pipeline.speech_recognizer.process_audio_chunk(
+                        audio_chunk=pcm_audio,
+                        callback=transcription_callback
+                    )
+                    
+                    # Get final transcription
+                    transcription, _ = await self.pipeline.speech_recognizer.stop_streaming()
                 
                 # Log before cleanup for debugging
                 logger.info(f"RAW TRANSCRIPTION: '{transcription}'")
@@ -594,8 +577,12 @@ class WebSocketHandler:
                     half_size = len(self.input_buffer) // 2
                     self.input_buffer = self.input_buffer[half_size:]
                     logger.debug(f"No valid transcription, reduced buffer to {len(self.input_buffer)} bytes")
-            else:
-                logger.error("Speech recognizer not available in pipeline")
+            
+            except Exception as e:
+                logger.error(f"Error during STT processing: {e}", exc_info=True)
+                # If error, clear part of buffer and continue
+                half_size = len(self.input_buffer) // 2
+                self.input_buffer = self.input_buffer[half_size:]
                 
         except Exception as e:
             logger.error(f"Error processing audio: {e}", exc_info=True)

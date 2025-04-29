@@ -1,15 +1,16 @@
 """
-Voice AI Agent main class that coordinates all components with improved noise handling.
+Voice AI Agent main class that coordinates all components with Deepgram STT integration.
 Generic version that works with any knowledge base.
 """
 import os
 import logging
 import asyncio
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union, Callable, Awaitable
 import numpy as np
 from scipy import signal
 
-from speech_to_text.streaming.whisper_streaming import StreamingWhisperASR, PARAMETER_PRESETS
+# Deepgram STT imports
+from speech_to_text.deepgram_stt import DeepgramStreamingSTT
 from speech_to_text.stt_integration import STTIntegration
 from knowledge_base.conversation_manager import ConversationManager
 from knowledge_base.llama_index.document_store import DocumentStore
@@ -20,46 +21,50 @@ from text_to_speech import DeepgramTTS
 logger = logging.getLogger(__name__)
 
 class VoiceAIAgent:
-    """Main Voice AI Agent class that coordinates all components with noise handling improvements."""
+    """Main Voice AI Agent class that coordinates all components with Deepgram STT."""
     
     def __init__(
         self,
         storage_dir: str = './storage',
         model_name: str = 'mistral:7b-instruct-v0.2-q4_0',
-        whisper_model_path: str = 'models/base.en',
+        api_key: Optional[str] = None,
         llm_temperature: float = 0.7,
-        # Add noise handling parameters with generic context
-        whisper_initial_prompt: str = "This is a telephone conversation with a customer. The customer may ask questions about products, services, pricing, or features. Transcribe exactly what is spoken, filtering out noise, static, and line interference.",
-        whisper_temperature: float = 0.0,
-        whisper_no_context: bool = True,
-        whisper_preset: Optional[str] = "default"
+        **kwargs
     ):
-        """Initialize the Voice AI Agent with improved noise handling configuration."""
+        """
+        Initialize the Voice AI Agent with Deepgram STT.
+        
+        Args:
+            storage_dir: Directory for persistent storage
+            model_name: LLM model name for knowledge base
+            api_key: Deepgram API key (defaults to env variable)
+            llm_temperature: LLM temperature for response generation
+            **kwargs: Additional parameters for customization
+        """
         self.storage_dir = storage_dir
         self.model_name = model_name
-        self.whisper_model_path = whisper_model_path
+        self.api_key = api_key
         self.llm_temperature = llm_temperature
         
-        # Store noise handling parameters
-        self.whisper_initial_prompt = whisper_initial_prompt
-        self.whisper_temperature = whisper_temperature
-        self.whisper_no_context = whisper_no_context
-        self.whisper_preset = whisper_preset
+        # STT Parameters
+        self.stt_language = kwargs.get('language', 'en-US')
+        self.stt_keywords = kwargs.get('keywords', ['price', 'plan', 'cost', 'subscription', 'service'])
         
+        # Component placeholders
         self.speech_recognizer = None
         self.stt_integration = None
         self.conversation_manager = None
         self.query_engine = None
         self.tts_client = None
         
-        # Add noise floor tracking for adaptive threshold
+        # Noise floor tracking for adaptive threshold
         self.noise_floor = 0.005
         self.noise_samples = []
         self.max_noise_samples = 20
         
     def _process_audio(self, audio: np.ndarray) -> np.ndarray:
         """
-        Process audio for improved speech recognition.
+        Process audio for better speech recognition.
         
         Args:
             audio: Audio data as numpy array
@@ -127,50 +132,23 @@ class VoiceAIAgent:
                 )
         
     async def init(self):
-        """Initialize all components with noise handling optimizations."""
-        logger.info("Initializing Voice AI Agent components with noise optimization...")
+        """Initialize all components with Deepgram STT."""
+        logger.info("Initializing Voice AI Agent components with Deepgram STT...")
         
-        # Initialize speech recognizer with improved noise handling parameters
-        self.speech_recognizer = StreamingWhisperASR(
-            model_path=self.whisper_model_path,
-            language="en",
-            n_threads=4,
-            chunk_size_ms=2000,
-            vad_enabled=True,
-            single_segment=True,
-            # Use our noise handling parameters
-            temperature=self.whisper_temperature,
-            initial_prompt=self.whisper_initial_prompt,
-            no_context=self.whisper_no_context,
-            # Use the preset if provided
-            preset=self.whisper_preset
+        # Initialize speech recognizer with Deepgram
+        self.speech_recognizer = DeepgramStreamingSTT(
+            api_key=self.api_key,
+            language=self.stt_language,
+            sample_rate=16000,
+            encoding="linear16",
+            channels=1,
+            interim_results=True
         )
         
-        # Set parameters directly on the model if possible
-        if hasattr(self.speech_recognizer, 'model'):
-            model = self.speech_recognizer.model
-            
-            # Set parameters if supported
-            if hasattr(model, 'temperature'):
-                model.temperature = self.whisper_temperature
-                
-            if hasattr(model, 'initial_prompt'):
-                model.initial_prompt = self.whisper_initial_prompt
-                
-            if hasattr(model, 'no_context'):
-                model.no_context = self.whisper_no_context
-                
-            if hasattr(model, 'single_segment'):
-                model.single_segment = True
-                
-            if hasattr(model, 'beam_size'):
-                model.beam_size = 5  # Wider beam search
-        
-        # Initialize STT integration with enhanced audio processing
-        self.stt_integration = EnhancedSTTIntegration(
+        # Initialize STT integration 
+        self.stt_integration = STTIntegration(
             speech_recognizer=self.speech_recognizer,
-            language="en",
-            agent=self  # Pass self for access to audio processing
+            language=self.stt_language
         )
         
         # Initialize document store and index manager
@@ -199,14 +177,18 @@ class VoiceAIAgent:
         # Initialize TTS client
         self.tts_client = DeepgramTTS()
         
-        logger.info("Voice AI Agent initialization complete with noise handling optimizations")
+        logger.info("Voice AI Agent initialization complete with Deepgram STT")
         
-    async def process_audio(self, audio_data, callback=None):
+    async def process_audio(
+        self,
+        audio_data: Union[bytes, np.ndarray],
+        callback: Optional[Callable[[Any], Awaitable[None]]] = None
+    ) -> Dict[str, Any]:
         """
-        Process audio data with noise handling optimizations.
+        Process audio data with Deepgram STT.
         
         Args:
-            audio_data: Audio data as numpy array
+            audio_data: Audio data as numpy array or bytes
             callback: Optional callback function
             
         Returns:
@@ -214,12 +196,13 @@ class VoiceAIAgent:
         """
         if not self.initialized:
             raise RuntimeError("Voice AI Agent not initialized")
-            
-        # Process audio for better speech recognition
-        enhanced_audio = self._process_audio(audio_data)
         
-        # Use STT integration for processing with enhanced audio
-        result = await self.stt_integration.transcribe_audio_data(enhanced_audio, callback=callback)
+        # Process audio for better speech recognition
+        if isinstance(audio_data, np.ndarray):
+            audio_data = self._process_audio(audio_data)
+        
+        # Use STT integration for processing with Deepgram
+        result = await self.stt_integration.transcribe_audio_data(audio_data, callback=callback)
         
         # Only process valid transcriptions
         if result.get("is_valid", False) and result.get("transcription"):
@@ -242,6 +225,102 @@ class VoiceAIAgent:
                 "error": "No valid speech detected"
             }
     
+    async def process_streaming_audio(
+        self,
+        audio_stream,
+        result_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
+    ) -> Dict[str, Any]:
+        """
+        Process streaming audio with real-time response.
+        
+        Args:
+            audio_stream: Async iterator of audio chunks
+            result_callback: Callback for streaming results
+            
+        Returns:
+            Final processing stats
+        """
+        if not self.initialized:
+            raise RuntimeError("Voice AI Agent not initialized")
+            
+        # Track stats
+        start_time = time.time()
+        chunks_processed = 0
+        results_count = 0
+        
+        # Start streaming session
+        await self.speech_recognizer.start_streaming()
+        
+        try:
+            # Process each audio chunk
+            async for chunk in audio_stream:
+                chunks_processed += 1
+                
+                # Process audio for better recognition if it's numpy array
+                if isinstance(chunk, np.ndarray):
+                    chunk = self._process_audio(chunk)
+                
+                # Convert to bytes for Deepgram if needed
+                if isinstance(chunk, np.ndarray):
+                    audio_bytes = (chunk * 32767).astype(np.int16).tobytes()
+                else:
+                    audio_bytes = chunk
+                    
+                # Process through Deepgram
+                async def process_result(result):
+                    # Only handle final results
+                    if result.is_final:
+                        # Clean up transcription
+                        transcription = self.stt_integration.cleanup_transcription(result.text)
+                        
+                        # Process if valid
+                        if transcription and self.stt_integration.is_valid_transcription(transcription):
+                            # Get response from conversation manager
+                            response = await self.conversation_manager.handle_user_input(transcription)
+                            
+                            # Format result
+                            result_data = {
+                                "transcription": transcription,
+                                "response": response.get("response", ""),
+                                "confidence": result.confidence,
+                                "is_final": True
+                            }
+                            
+                            nonlocal results_count
+                            results_count += 1
+                            
+                            # Call callback if provided
+                            if result_callback:
+                                await result_callback(result_data)
+                
+                # Process chunk
+                await self.speech_recognizer.process_audio_chunk(audio_bytes, process_result)
+                
+            # Stop streaming session
+            await self.speech_recognizer.stop_streaming()
+            
+            # Return stats
+            return {
+                "status": "complete",
+                "chunks_processed": chunks_processed,
+                "results_count": results_count,
+                "total_time": time.time() - start_time
+            }
+            
+        except Exception as e:
+            logger.error(f"Error processing streaming audio: {e}")
+            
+            # Stop streaming session
+            await self.speech_recognizer.stop_streaming()
+            
+            return {
+                "status": "error",
+                "error": str(e),
+                "chunks_processed": chunks_processed,
+                "results_count": results_count,
+                "total_time": time.time() - start_time
+            }
+    
     @property
     def initialized(self) -> bool:
         """Check if all components are initialized."""
@@ -252,75 +331,11 @@ class VoiceAIAgent:
     async def shutdown(self):
         """Shut down all components properly."""
         logger.info("Shutting down Voice AI Agent...")
-        # Any cleanup needed here
         
-        # Example: If there's an active conversation
+        # Close Deepgram streaming session if active
+        if self.speech_recognizer and hasattr(self.speech_recognizer, 'is_streaming') and self.speech_recognizer.is_streaming:
+            await self.speech_recognizer.stop_streaming()
+        
+        # Reset conversation if active
         if self.conversation_manager:
             self.conversation_manager.reset()
-
-
-class EnhancedSTTIntegration(STTIntegration):
-    """Enhanced STT integration with better audio processing for telephony."""
-    
-    def __init__(self, speech_recognizer, language="en", agent=None):
-        """Initialize with reference to agent for audio processing."""
-        super().__init__(speech_recognizer, language)
-        self.agent = agent
-        
-    async def transcribe_audio_data(self, audio_data, is_short_audio=False, callback=None):
-        """Override to enhance audio before transcription."""
-        # Process audio for better speech recognition if agent available
-        if self.agent and hasattr(self.agent, '_process_audio'):
-            # Process if it's a numpy array
-            if isinstance(audio_data, np.ndarray):
-                audio_data = self.agent._process_audio(audio_data)
-        
-        # Call parent method with enhanced audio
-        return await super().transcribe_audio_data(audio_data, is_short_audio, callback)
-        
-    def cleanup_transcription(self, text):
-        """Enhanced cleanup with more patterns for noise."""
-        if not text:
-            return ""
-            
-        # Add these patterns to your existing patterns
-        additional_patterns = [
-            r'\(.*?noise.*?\)', r'\[.*?noise.*?\]',
-            r'\(.*?background.*?\)', r'\[.*?music.*?\]',
-            r'\(.*?static.*?\)', r'\[.*?unclear.*?\]',
-            r'\(.*?inaudible.*?\)', r'\<.*?noise.*?\>',
-            r'music playing', r'background noise',
-            r'static'
-        ]
-        
-        # Compile if needed and add to existing pattern
-        if hasattr(self, 'non_speech_pattern'):
-            # Add to existing pattern if possible
-            pattern_string = self.non_speech_pattern.pattern
-            for pattern in additional_patterns:
-                if pattern not in pattern_string:
-                    pattern_string += '|' + pattern
-            import re
-            self.non_speech_pattern = re.compile(pattern_string)
-            
-        # Rest of your existing code
-        cleaned_text = self.non_speech_pattern.sub('', text)
-        
-        # Remove common filler words at beginning of sentences
-        import re
-        cleaned_text = re.sub(r'^(um|uh|er|ah|like|so)\s+', '', cleaned_text, flags=re.IGNORECASE)
-        
-        # Remove repeated words (stuttering)
-        cleaned_text = re.sub(r'\b(\w+)( \1\b)+', r'\1', cleaned_text)
-        
-        # Clean up punctuation
-        cleaned_text = re.sub(r'\s+([.,!?])', r'\1', cleaned_text)
-        
-        # Clean up double spaces
-        cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
-        
-        # Log changes if substantial
-        if text != cleaned_text:
-            logger.info(f"Cleaned transcription: '{text}' -> '{cleaned_text}'")
-            
-        return cleaned_text
