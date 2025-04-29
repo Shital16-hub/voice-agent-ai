@@ -110,6 +110,10 @@ class WebSocketHandler:
             hasattr(pipeline, 'speech_recognizer') and 
             isinstance(pipeline.speech_recognizer, DeepgramStreamingSTT)
         )
+        
+        # Ensure we start with a fresh deepgram session state
+        self.deepgram_session_active = False
+        
         logger.info(f"WebSocketHandler initialized for call {call_sid} with {'Deepgram' if self.using_deepgram else 'Whisper'} STT")
     
     def _update_ambient_noise_level(self, audio_data: np.ndarray) -> None:
@@ -292,14 +296,20 @@ class WebSocketHandler:
         self.conversation_active = True
         self.stop_event.clear()
         self.noise_samples = []  # Reset noise samples
+        self.deepgram_session_active = False  # Reset Deepgram session state
         
         # Send a welcome message
         await self.send_text_response("I'm listening. How can I help you today?", ws)
         
         # Initialize Deepgram streaming session if using Deepgram
         if self.using_deepgram:
-            await self.pipeline.speech_recognizer.start_streaming()
-            logger.info("Started Deepgram streaming session")
+            try:
+                await self.pipeline.speech_recognizer.start_streaming()
+                self.deepgram_session_active = True
+                logger.info("Started Deepgram streaming session")
+            except Exception as e:
+                logger.error(f"Error starting Deepgram streaming session: {e}")
+                self.deepgram_session_active = False
     
     async def _handle_media(self, data: Dict[str, Any], ws) -> None:
         """
@@ -377,9 +387,13 @@ class WebSocketHandler:
                 pass
         
         # Close Deepgram streaming session if using Deepgram
-        if self.using_deepgram and hasattr(self.pipeline.speech_recognizer, 'is_streaming'):
-            await self.pipeline.speech_recognizer.stop_streaming()
-            logger.info("Stopped Deepgram streaming session")
+        if self.using_deepgram and self.deepgram_session_active:
+            try:
+                await self.pipeline.speech_recognizer.stop_streaming()
+                logger.info("Stopped Deepgram streaming session")
+                self.deepgram_session_active = False
+            except Exception as e:
+                logger.error(f"Error stopping Deepgram streaming session: {e}")
     
     async def _handle_mark(self, data: Dict[str, Any]) -> None:
         """
@@ -479,6 +493,12 @@ class WebSocketHandler:
                     # For Deepgram, convert to bytes format
                     audio_bytes = (pcm_audio * 32767).astype(np.int16).tobytes()
                     
+                    # Make sure the Deepgram streaming session is active
+                    if not self.deepgram_session_active:
+                        logger.info("Starting new Deepgram streaming session")
+                        await self.pipeline.speech_recognizer.start_streaming()
+                        self.deepgram_session_active = True
+                    
                     # Process chunk with Deepgram
                     result = await self.pipeline.speech_recognizer.process_audio_chunk(
                         audio_chunk=audio_bytes,
@@ -495,9 +515,11 @@ class WebSocketHandler:
                         best_result = max(transcription_results, key=lambda r: r.confidence)
                         transcription = best_result.text
                     else:
-                        # Stop the Deepgram session to get any pending final results
-                        await self.pipeline.speech_recognizer.stop_streaming()
-                        await self.pipeline.speech_recognizer.start_streaming()
+                        # If no results, try stopping and restarting the session to get final results
+                        if self.deepgram_session_active:
+                            await self.pipeline.speech_recognizer.stop_streaming()
+                            await self.pipeline.speech_recognizer.start_streaming()
+                            self.deepgram_session_active = True
                         
                         # No transcription
                         transcription = ""
@@ -583,6 +605,17 @@ class WebSocketHandler:
                 # If error, clear part of buffer and continue
                 half_size = len(self.input_buffer) // 2
                 self.input_buffer = self.input_buffer[half_size:]
+                
+                # If we had a Deepgram session error, reset the session
+                if self.using_deepgram:
+                    try:
+                        logger.info("Resetting Deepgram session after error")
+                        await self.pipeline.speech_recognizer.stop_streaming()
+                        await self.pipeline.speech_recognizer.start_streaming()
+                        self.deepgram_session_active = True
+                    except Exception as session_error:
+                        logger.error(f"Error resetting Deepgram session: {session_error}")
+                        self.deepgram_session_active = False
                 
         except Exception as e:
             logger.error(f"Error processing audio: {e}", exc_info=True)
