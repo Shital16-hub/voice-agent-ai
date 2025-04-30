@@ -109,16 +109,17 @@ class VoiceAIAgent:
             if self.api_key:
                 try:
                     # Create an optimized Deepgram client with telephony-specific settings
+                    # Changed the model from "enhanced" to "general" to avoid permission issues
                     self.speech_recognizer = DeepgramStreamingSTT(
                         api_key=self.api_key,
-                        model_name="enhanced",  # Use enhanced model for better telephony performance
+                        model_name="general",  # Changed from "enhanced" to "general"
                         language=self.stt_language,
                         sample_rate=16000,
                         encoding="linear16",
                         channels=1,
-                        interim_results=True,  # Enable interim results for responsiveness
+                        interim_results=True  # Enable interim results for responsiveness
                     )
-                    logger.info("Successfully initialized Deepgram STT with enhanced model")
+                    logger.info("Successfully initialized Deepgram STT with general model")
                     
                 except Exception as e:
                     logger.error(f"Failed to initialize Deepgram: {e}")
@@ -139,12 +140,12 @@ class VoiceAIAgent:
             index_manager = IndexManager(storage_dir=self.storage_dir)
             await index_manager.init()
             
-            # Initialize query engine with improved caching
+            # Initialize query engine with improved configuration
+            # Removed the use_cache parameter as it's not supported
             self.query_engine = QueryEngine(
                 index_manager=index_manager, 
                 llm_model_name=self.model_name,
-                llm_temperature=self.llm_temperature,
-                use_cache=True  # Enable caching for faster responses
+                llm_temperature=self.llm_temperature
             )
             await self.query_engine.init()
             

@@ -1,4 +1,9 @@
 """
+This is an updated version of DeepgramStreamingSTT to fix the streaming state management issues.
+Replace the streaming.py file in your speech_to_text/deepgram_stt/ directory with this content.
+"""
+
+"""
 Generalized Deepgram STT implementation for better transcription quality
 with any type of conversation, with enhanced telephony optimization.
 """
@@ -8,6 +13,7 @@ import asyncio
 import aiohttp
 import json
 import base64
+import time
 from typing import Dict, Any, Optional, Union, List, AsyncGenerator, Callable, Awaitable
 from dataclasses import dataclass
 
@@ -62,7 +68,7 @@ class DeepgramStreamingSTT:
         if not self.api_key:
             raise ValueError("Deepgram API key is required. Set it in .env file or pass directly.")
         
-        self.model_name = model_name or "enhanced"  # Use enhanced model for better transcription
+        self.model_name = model_name or "general"  # Use general model instead of enhanced
         self.language = language or config.language
         self.sample_rate = sample_rate or config.sample_rate
         self.encoding = encoding
@@ -76,6 +82,13 @@ class DeepgramStreamingSTT:
         self.buffer_size_threshold = 12288  # Reduced from 16384 for lower latency (12KB)
         self.utterance_id = 0
         self.last_result = None
+        
+        # Add a lock to prevent concurrent streaming operations
+        self.streaming_lock = asyncio.Lock()
+        
+        # Create a start completion event to track when streaming is truly started
+        self.streaming_started = asyncio.Event()
+        self.streaming_started.clear()
         
         # Telephony-optimized parameters
         self.smart_format = True  # Enable smart formatting for better readability
@@ -110,7 +123,7 @@ class DeepgramStreamingSTT:
             "filler_words": "false",  # Filter out filler words
             "profanity_filter": "false",  # Don't filter profanity for telephony
             "alternatives": "1",  # Just one alternative for speed
-            "tier": "enhanced",  # Use enhanced tier for better quality
+            "tier": "base",  # Use base tier instead of enhanced to avoid permission issues
             "punctuate": "true",  # Add punctuation
             "diarize": "false",   # Single speaker for telephony
             "numerals": "true",   # Convert numbers to numerals
@@ -133,40 +146,61 @@ class DeepgramStreamingSTT:
         Args:
             config_obj: Optional configuration object
         """
-        if self.is_streaming:
-            await self.stop_streaming()
-        
-        # Create a new aiohttp session with optimized timeout
-        timeout = aiohttp.ClientTimeout(total=30, connect=3, sock_connect=3, sock_read=10)
-        self.session = aiohttp.ClientSession(timeout=timeout)
-        
-        # Reset buffer
-        self.chunk_buffer = bytearray()
-        self.utterance_id = 0
-        self.is_streaming = True
-        
-        logger.info("Started Deepgram session with optimized parameters")
+        # Only lock for starting/stopping operations
+        async with self.streaming_lock:
+            if self.is_streaming:
+                await self.stop_streaming()
+            
+            # Create a new aiohttp session with optimized timeout
+            timeout = aiohttp.ClientTimeout(total=30, connect=3, sock_connect=3, sock_read=10)
+            self.session = aiohttp.ClientSession(timeout=timeout)
+            
+            # Reset buffer
+            self.chunk_buffer = bytearray()
+            self.utterance_id = 0
+            self.is_streaming = True
+            
+            # Signal that streaming has started
+            self.streaming_started.set()
+            
+            logger.info("Started Deepgram session with optimized parameters")
     
-    async def stop_streaming(self) -> None:
-        """Stop the simulated streaming session."""
-        if not self.is_streaming:
-            return
+    async def stop_streaming(self) -> Optional[Tuple[str, float]]:
+        """
+        Stop the simulated streaming session.
         
-        self.is_streaming = False
-        
-        # Process any remaining audio in the buffer
-        if len(self.chunk_buffer) > 0:
-            try:
-                await self._process_buffer()
-            except Exception as e:
-                logger.error(f"Error processing final buffer: {e}")
-        
-        # Close the session
-        if self.session:
-            await self.session.close()
-            self.session = None
-        
-        logger.info("Stopped Deepgram session")
+        Returns:
+            Optional tuple of (transcription, duration) or None on error
+        """
+        # Only lock for starting/stopping operations
+        async with self.streaming_lock:
+            if not self.is_streaming:
+                logger.warning("stop_streaming called but not currently streaming")
+                return None
+            
+            self.is_streaming = False
+            self.streaming_started.clear()
+            
+            # Process any remaining audio in the buffer
+            result = None
+            if len(self.chunk_buffer) > 0:
+                try:
+                    result = await self._process_buffer()
+                except Exception as e:
+                    logger.error(f"Error processing final buffer: {e}")
+            
+            # Close the session
+            if self.session:
+                await self.session.close()
+                self.session = None
+            
+            logger.info("Stopped Deepgram session")
+            
+            # Return transcription result if available
+            if result and hasattr(result, 'text'):
+                return result.text, 0.0
+            
+            return None
     
     async def process_audio_chunk(
         self, 
@@ -183,8 +217,19 @@ class DeepgramStreamingSTT:
         Returns:
             Optional transcription result
         """
+        # No lock here to avoid deadlocks
         if not self.is_streaming or not self.session:
-            raise STTStreamingError("Not streaming - call start_streaming() first")
+            # Check if streaming is initialized
+            if not self.is_streaming:
+                # Auto-initialize streaming if needed
+                try:
+                    await self.start_streaming()
+                    # Wait for streaming to be properly initialized
+                    await asyncio.wait_for(self.streaming_started.wait(), timeout=5.0)
+                except Exception as e:
+                    raise STTStreamingError(f"Failed to auto-initialize streaming: {e}")
+            else:
+                raise STTStreamingError("Not streaming - call start_streaming() first")
         
         try:
             # Ensure audio is in bytes format
@@ -225,6 +270,11 @@ class DeepgramStreamingSTT:
         
         # Clear the buffer
         self.chunk_buffer = bytearray()
+        
+        # Verify we're still streaming
+        if not self.is_streaming or not self.session:
+            logger.warning("Not streaming while processing buffer")
+            return None
         
         # Get optimized parameters
         params = self._get_params()
@@ -325,6 +375,8 @@ class DeepgramStreamingSTT:
         try:
             # Start streaming
             await self.start_streaming()
+            # Wait for streaming to be properly initialized
+            await asyncio.wait_for(self.streaming_started.wait(), timeout=5.0)
             
             # Open the audio file
             with open(file_path, 'rb') as f:

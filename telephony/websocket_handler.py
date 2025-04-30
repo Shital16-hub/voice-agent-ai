@@ -542,6 +542,24 @@ class WebSocketHandler:
             
             # Process audio through STT
             try:
+                # Ensure STT is properly initialized and in streaming mode
+                if hasattr(self.pipeline, 'speech_recognizer'):
+                    # Make sure streaming is started before processing
+                    if hasattr(self.pipeline.speech_recognizer, 'start_streaming'):
+                        # Check if it's an async method
+                        if asyncio.iscoroutinefunction(self.pipeline.speech_recognizer.start_streaming):
+                            # Make sure streaming is started
+                            if not getattr(self.pipeline.speech_recognizer, 'is_streaming', False):
+                                await self.pipeline.speech_recognizer.start_streaming()
+                                # Add a small delay to ensure streaming is fully started
+                                await asyncio.sleep(0.1)
+                        else:
+                            # Handle synchronous start_streaming
+                            if not getattr(self.pipeline.speech_recognizer, 'is_streaming', False):
+                                self.pipeline.speech_recognizer.start_streaming()
+                                # Add a small delay to ensure streaming is fully started
+                                await asyncio.sleep(0.1)
+                
                 # Determine what type of STT we're using by checking attributes and methods
                 using_whisper = False
                 using_deepgram = False
@@ -565,6 +583,22 @@ class WebSocketHandler:
                     )
                     logger.debug("Processed audio with Whisper STT")
                 elif using_deepgram:
+                    # For Deepgram, ensure we're streaming first by checking and waiting
+                    streaming_started = getattr(self.pipeline.speech_recognizer, 'streaming_started', None)
+                    if streaming_started and hasattr(streaming_started, 'wait'):
+                        try:
+                            # Wait for streaming to be properly initialized
+                            await asyncio.wait_for(streaming_started.wait(), timeout=2.0)
+                        except asyncio.TimeoutError:
+                            logger.warning("Timeout waiting for Deepgram streaming to initialize")
+                            # Try restarting streaming
+                            await self.pipeline.speech_recognizer.start_streaming()
+                            # Wait again, but shorter timeout
+                            try:
+                                await asyncio.wait_for(streaming_started.wait(), timeout=1.0)
+                            except:
+                                pass
+                    
                     # Process with Deepgram (expects bytes)
                     await self.pipeline.speech_recognizer.process_audio_chunk(
                         audio_chunk=audio_bytes,  # Use bytes for Deepgram
@@ -587,13 +621,37 @@ class WebSocketHandler:
                         )
                 
                 # Get final transcription
+                final_transcription = ""
                 if hasattr(self.pipeline.speech_recognizer, 'stop_streaming'):
                     # Check if stop_streaming is async
-                    if asyncio.iscoroutinefunction(self.pipeline.speech_recognizer.stop_streaming):
-                        final_transcription, _ = await self.pipeline.speech_recognizer.stop_streaming()
-                    else:
-                        # Handle synchronous stop_streaming
-                        final_transcription, _ = self.pipeline.speech_recognizer.stop_streaming()
+                    try:
+                        if asyncio.iscoroutinefunction(self.pipeline.speech_recognizer.stop_streaming):
+                            result = await self.pipeline.speech_recognizer.stop_streaming()
+                            # Check if result is None or a tuple
+                            if result is not None:
+                                # Handle as tuple
+                                if isinstance(result, tuple) and len(result) >= 1:
+                                    final_transcription, _ = result
+                                else:
+                                    # Handle as single value
+                                    final_transcription = str(result)
+                            else:
+                                # Deepgram error case - result is None
+                                final_transcription = ""
+                        else:
+                            # Handle synchronous stop_streaming
+                            result = self.pipeline.speech_recognizer.stop_streaming()
+                            # Similar unpacking with safety checks
+                            if result is not None:
+                                if isinstance(result, tuple) and len(result) >= 1:
+                                    final_transcription, _ = result
+                                else:
+                                    final_transcription = str(result)
+                            else:
+                                final_transcription = ""
+                    except Exception as e:
+                        logger.error(f"Error getting final transcription: {e}")
+                        final_transcription = ""
                     
                     # Add to results if not empty
                     if final_transcription:
@@ -754,13 +812,17 @@ class WebSocketHandler:
                     logger.debug(f"No valid transcription, reduced buffer to {len(self.input_buffer)} bytes")
                 
                 # Restart STT streaming session for next input
-                if hasattr(self.pipeline.speech_recognizer, 'start_streaming'):
+                if hasattr(self.pipeline, 'speech_recognizer'):
                     # Check if start_streaming is async
                     if asyncio.iscoroutinefunction(self.pipeline.speech_recognizer.start_streaming):
                         await self.pipeline.speech_recognizer.start_streaming()
+                        # Add a small delay to ensure streaming is fully started
+                        await asyncio.sleep(0.1)
                     else:
                         # Handle synchronous start_streaming
                         self.pipeline.speech_recognizer.start_streaming()
+                        # Add a small delay to ensure streaming is fully started
+                        await asyncio.sleep(0.1)
                     logger.info("Reset STT streaming session for next input")
             
             except Exception as e:
@@ -774,16 +836,25 @@ class WebSocketHandler:
                     try:
                         # Try to reset STT with error handling for sync/async methods
                         if hasattr(self.pipeline.speech_recognizer, 'stop_streaming'):
-                            if asyncio.iscoroutinefunction(self.pipeline.speech_recognizer.stop_streaming):
-                                await self.pipeline.speech_recognizer.stop_streaming()
-                            else:
-                                self.pipeline.speech_recognizer.stop_streaming()
+                            try:
+                                if asyncio.iscoroutinefunction(self.pipeline.speech_recognizer.stop_streaming):
+                                    await self.pipeline.speech_recognizer.stop_streaming()
+                                else:
+                                    self.pipeline.speech_recognizer.stop_streaming()
+                            except Exception:
+                                pass
+                        
+                        await asyncio.sleep(0.2)  # Add delay between stop and start
                         
                         if hasattr(self.pipeline.speech_recognizer, 'start_streaming'):
                             if asyncio.iscoroutinefunction(self.pipeline.speech_recognizer.start_streaming):
                                 await self.pipeline.speech_recognizer.start_streaming()
+                                # Add a small delay to ensure streaming is fully started
+                                await asyncio.sleep(0.1)
                             else:
                                 self.pipeline.speech_recognizer.start_streaming()
+                                # Add a small delay to ensure streaming is fully started
+                                await asyncio.sleep(0.1)
                             logger.info("Reset STT after error")
                     except Exception as reset_error:
                         logger.error(f"Error resetting STT: {reset_error}")
