@@ -1,6 +1,6 @@
 """
 Generalized Deepgram STT implementation for better transcription quality
-with any type of conversation.
+with any type of conversation, with enhanced telephony optimization.
 """
 import os
 import logging
@@ -31,7 +31,7 @@ class StreamingTranscriptionResult:
 class DeepgramStreamingSTT:
     """
     Generalized version of DeepgramStreamingSTT that uses REST API
-    with enhanced parameters for good transcription quality in any context.
+    with enhanced parameters for superior transcription quality in telephony contexts.
     """
     
     API_URL = "https://api.deepgram.com/v1/listen"
@@ -58,11 +58,11 @@ class DeepgramStreamingSTT:
             channels: Number of audio channels (default 1)
             interim_results: Whether to return interim results (default True)
         """
-        self.api_key = api_key or config.deepgram_api_key
+        self.api_key = api_key or os.getenv("DEEPGRAM_API_KEY")
         if not self.api_key:
             raise ValueError("Deepgram API key is required. Set it in .env file or pass directly.")
         
-        self.model_name = model_name or "general"  # Hardcoded to "general" model which is available
+        self.model_name = model_name or "enhanced"  # Use enhanced model for better transcription
         self.language = language or config.language
         self.sample_rate = sample_rate or config.sample_rate
         self.encoding = encoding
@@ -73,9 +73,28 @@ class DeepgramStreamingSTT:
         self.is_streaming = False
         self.session = None
         self.chunk_buffer = bytearray()
-        self.buffer_size_threshold = 16384  # Process when buffer reaches ~16KB for better context
+        self.buffer_size_threshold = 12288  # Reduced from 16384 for lower latency (12KB)
         self.utterance_id = 0
         self.last_result = None
+        
+        # Telephony-optimized parameters
+        self.smart_format = True  # Enable smart formatting for better readability
+        self.endpointing = 700  # 700ms for better segmentation (increased from default)
+        self.vad_turnoff = 650  # 650ms VAD turnoff for better phrase detection
+        
+        # Noise reduction
+        self.diarize = False  # Disable diarization - single speaker in telephony
+        self.multichannel = False  # Single channel for telephony
+        self.filler_words = False  # Disable filler words for cleaner transcription
+        
+        # Boost important keywords for telephony context
+        self.keywords = [
+            "help", "agent", "person", "service", "support", 
+            "customer", "assistance", "problem", "issue", "question",
+            "price", "cost", "plan", "subscription", "payment"
+        ]
+        
+        logger.info(f"Initialized DeepgramStreamingSTT with model: {self.model_name}")
     
     def _get_params(self) -> Dict[str, Any]:
         """Get optimized parameters for the API request."""
@@ -85,15 +104,22 @@ class DeepgramStreamingSTT:
             "encoding": self.encoding,
             "sample_rate": self.sample_rate,
             "channels": self.channels,
-            "utterance_end_ms": str(config.utterance_end_ms),
-            "smart_format": str(config.smart_format).lower(),
+            "utterance_end_ms": "700",  # Increased for better chunking
+            "vad_turnoff": "650",  # Increased for better silence detection
+            "smart_format": "true",  # Enable smart formatting
             "filler_words": "false",  # Filter out filler words
-            "profanity_filter": str(config.profanity_filter).lower(),
-            "alternatives": str(config.alternatives),
-            "tier": config.model_options.get("tier", "enhanced"),
-            "punctuate": "true",  # Add punctuation for better readability
-            "diarize": "false"     # Single speaker for telephony
+            "profanity_filter": "false",  # Don't filter profanity for telephony
+            "alternatives": "1",  # Just one alternative for speed
+            "tier": "enhanced",  # Use enhanced tier for better quality
+            "punctuate": "true",  # Add punctuation
+            "diarize": "false",   # Single speaker for telephony
+            "numerals": "true",   # Convert numbers to numerals
+            "interim_results": "true" if self.interim_results else "false"
         }
+        
+        # Add keywords if available
+        if self.keywords:
+            params["keywords"] = json.dumps(self.keywords)
         
         return params
     
@@ -110,15 +136,16 @@ class DeepgramStreamingSTT:
         if self.is_streaming:
             await self.stop_streaming()
         
-        # Create a new aiohttp session
-        self.session = aiohttp.ClientSession()
+        # Create a new aiohttp session with optimized timeout
+        timeout = aiohttp.ClientTimeout(total=30, connect=3, sock_connect=3, sock_read=10)
+        self.session = aiohttp.ClientSession(timeout=timeout)
         
         # Reset buffer
         self.chunk_buffer = bytearray()
         self.utterance_id = 0
         self.is_streaming = True
         
-        logger.info("Started Deepgram session (simulated streaming)")
+        logger.info("Started Deepgram session with optimized parameters")
     
     async def stop_streaming(self) -> None:
         """Stop the simulated streaming session."""
@@ -209,12 +236,13 @@ class DeepgramStreamingSTT:
         }
         
         try:
-            # Send request to Deepgram API
+            # Send request to Deepgram API with optimized timeout
             async with self.session.post(
                 self.API_URL,
                 params=params,
                 headers=headers,
-                data=audio_data
+                data=audio_data,
+                timeout=5.0  # Reduced timeout for better responsiveness
             ) as response:
                 if response.status != 200:
                     error_text = await response.text()
@@ -224,8 +252,13 @@ class DeepgramStreamingSTT:
                 # Parse the response
                 response_data = await response.json()
                 
-                # Log the full response for debugging
-                logger.debug(f"Deepgram response: {json.dumps(response_data, indent=2)}")
+                # Log the response structure for debugging
+                if logger.isEnabledFor(logging.DEBUG):
+                    debug_response = {
+                        "has_results": "results" in response_data,
+                        "channels": len(response_data.get("results", {}).get("channels", [])) if "results" in response_data else 0
+                    }
+                    logger.debug(f"Deepgram response structure: {debug_response}")
                 
                 # Process the results
                 results = response_data.get("results", {})

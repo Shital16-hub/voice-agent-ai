@@ -12,7 +12,7 @@ import re
 from typing import Dict, Any, Callable, Awaitable, Optional, List, Union
 from collections import deque
 
-from telephony.audio_processor import AudioProcessor
+from telephony.audio_preprocessor import AudioPreprocessor, SpeechState
 from telephony.config import (
     CHUNK_SIZE, AUDIO_BUFFER_SIZE, SILENCE_THRESHOLD, SILENCE_DURATION, 
     MAX_BUFFER_SIZE, ENABLE_BARGE_IN, BARGE_IN_THRESHOLD, BARGE_IN_DETECTION_WINDOW
@@ -45,10 +45,16 @@ NON_SPEECH_PATTERNS = [
     r'\(.*?static.*?\)',        # (static), etc.
     r'\[.*?unclear.*?\]',       # [unclear], etc.
     r'\(.*?inaudible.*?\)',     # (inaudible), etc.
-    r'<.*?noise.*?>',         # <noise>, etc.
+    r'<.*?noise.*?>',           # <noise>, etc.
     r'music playing',           # Common transcription
     r'background noise',        # Common transcription
     r'static',                  # Common transcription
+    r'\*.*?\*',                 # *any text* (scoff, etc.)
+    r'^\(.*?\)$',               # Entire text is (in parentheses)
+    r'clicking',                # keyboard/tongue clicking
+    r'clacking',                # keyboard clacking
+    r'tongue',                  # tongue clicks
+    r'keyboard',                # keyboard noises
 ]
 
 class WebSocketHandler:
@@ -68,7 +74,12 @@ class WebSocketHandler:
         self.call_sid = call_sid
         self.stream_sid = None
         self.pipeline = pipeline
-        self.audio_processor = AudioProcessor()  # Enhanced audio processor with preprocessing capability
+        self.audio_processor = pipeline.speech_recognizer.audio_processor if hasattr(pipeline.speech_recognizer, 'audio_processor') else None
+        
+        # Initialize audio processor if not already present
+        if not self.audio_processor:
+            from telephony.audio_processor import AudioProcessor
+            self.audio_processor = AudioProcessor()
         
         # Audio buffers
         self.input_buffer = bytearray()
@@ -96,8 +107,8 @@ class WebSocketHandler:
         self.non_speech_pattern = re.compile('|'.join(NON_SPEECH_PATTERNS))
         
         # Conversation flow management with increased pause
-        self.pause_after_response = 3.0  # Wait 3 seconds after response before processing new input
-        self.min_words_for_valid_query = 2  # Minimum words for a valid query
+        self.pause_after_response = 4.0  # Increased from 3.0 seconds - wait 4 seconds after response
+        self.min_words_for_valid_query = 3  # Increased from 2 - minimum 3 words for a valid query
         
         # Create an event to signal when we should stop processing
         self.stop_event = asyncio.Event()
@@ -112,11 +123,14 @@ class WebSocketHandler:
         
         # New: Track consecutive silent frames for better silence detection
         self.consecutive_silent_frames = 0
-        self.min_silent_frames_for_silence = 5  # Minimum frames to consider actual silence
+        self.min_silent_frames_for_silence = 10  # Increased from 5 - minimum 10 frames to be considered silence
         
         # New: Add a flag to prevent multiple barge-in detections in quick succession
         self.last_barge_in_time = 0
-        self.barge_in_cooldown_sec = 1.5  # 1.5 second cooldown between barge-in detections
+        self.barge_in_cooldown_sec = 1.5  # 1.5 second cooldown between barge-ins
+        
+        # Track chunks processed since last processing 
+        self.chunks_since_last_process = 0
         
         logger.info(f"WebSocketHandler initialized for call {call_sid} with enhanced audio preprocessing")
     
@@ -132,7 +146,19 @@ class WebSocketHandler:
         """
         if not text:
             return ""
-            
+        
+        # Add stronger filter for non-speech annotations - complete filter on noise-only transcriptions
+        if re.search(r'^\(.*?\)$', text) or text.startswith('*') or text.endswith('*'):
+            logger.info(f"Detected non-speech annotation, ignoring: '{text}'")
+            return ""  # Return empty for parenthesized content
+        
+        # Remove noise keywords
+        noise_keywords = ["click", "keyboard", "tongue", "scoff", "static", "clacking"]
+        for keyword in noise_keywords:
+            if keyword in text.lower():
+                logger.info(f"Detected noise keyword '{keyword}', ignoring: '{text}'")
+                return ""  # Return empty for noise content
+        
         # Remove non-speech annotations
         cleaned_text = self.non_speech_pattern.sub('', text)
         
@@ -172,6 +198,12 @@ class WebSocketHandler:
             logger.info("Transcription contains only non-speech annotations")
             return False
         
+        # Add noise keyword filtering
+        noise_keywords = ["click", "keyboard", "tongue", "scoff", "static", "*"]
+        if any(keyword in text.lower() for keyword in noise_keywords):
+            logger.info(f"Transcription contains noise keywords: {text}")
+            return False
+        
         # Be more lenient with question marks and punctuation in confidence calculation
         confidence_estimate = 1.0
         if ("[" in text or "(" in text or "<" in text) and not "?" in text:
@@ -182,7 +214,7 @@ class WebSocketHandler:
             logger.info(f"Transcription confidence too low: {confidence_estimate}")
             return False
         
-        # Check word count
+        # Check word count - increased minimum requirement
         word_count = len(cleaned_text.split())
         if word_count < self.min_words_for_valid_query:
             logger.info(f"Transcription too short: {word_count} words")
@@ -276,6 +308,7 @@ class WebSocketHandler:
         self.startup_time = time.time()  # Reset startup time
         self.consecutive_silent_frames = 0
         self.last_barge_in_time = 0
+        self.chunks_since_last_process = 0
         
         # Reset the audio processor
         self.audio_processor.reset()
@@ -325,6 +358,9 @@ class WebSocketHandler:
             # Add to input buffer
             self.input_buffer.extend(audio_data)
             
+            # Increment chunks counter
+            self.chunks_since_last_process += 1
+            
             # Check for startup delay period
             time_since_startup = time.time() - self.startup_time
             if time_since_startup < self.startup_delay_sec:
@@ -334,6 +370,10 @@ class WebSocketHandler:
             # Check for barge-in if agent is speaking
             if self.audio_processor.preprocessor.agent_speaking:
                 audio_array = self.audio_processor.mulaw_to_pcm(audio_data)
+                # Ensure float32 format
+                if audio_array.dtype != np.float32:
+                    audio_array = audio_array.astype(np.float32)
+                    
                 if self.audio_processor.check_for_barge_in(audio_array):
                     # Enough time since last barge-in?
                     current_time = time.time()
@@ -361,6 +401,7 @@ class WebSocketHandler:
                                     await self._process_audio(ws)
                                 finally:
                                     self.is_processing = False
+                                    self.chunks_since_last_process = 0
             
             # Limit buffer size to prevent memory issues
             if len(self.input_buffer) > MAX_BUFFER_SIZE:
@@ -377,13 +418,18 @@ class WebSocketHandler:
                 return
             
             # Process buffer when it's large enough and not already processing
-            if len(self.input_buffer) >= AUDIO_BUFFER_SIZE and not self.is_processing:
+            if (len(self.input_buffer) >= AUDIO_BUFFER_SIZE and 
+                not self.is_processing and 
+                (self.audio_processor.preprocessor.speech_state == SpeechState.CONFIRMED_SPEECH or 
+                 self.chunks_since_last_process >= 5)):  # Only process every 5 chunks if no speech
+                
                 async with self.processing_lock:
                     if not self.is_processing:  # Double-check within lock
                         self.is_processing = True
                         try:
                             logger.info(f"Processing audio buffer of size: {len(self.input_buffer)} bytes")
                             await self._process_audio(ws)
+                            self.chunks_since_last_process = 0  # Reset counter
                         finally:
                             self.is_processing = False
             
@@ -447,8 +493,9 @@ class WebSocketHandler:
                 # Convert using the enhanced audio processing
                 pcm_audio = self.audio_processor.mulaw_to_pcm(mulaw_bytes)
                 
-                # Apply additional preprocessing if needed
-                # Note: Most preprocessing is now done inside mulaw_to_pcm via AudioPreprocessor
+                # Ensure float32 format
+                if pcm_audio.dtype != np.float32:
+                    pcm_audio = pcm_audio.astype(np.float32)
                 
             except Exception as e:
                 logger.error(f"Error converting audio: {e}")
@@ -516,12 +563,14 @@ class WebSocketHandler:
                         audio_chunk=pcm_audio,  # Pass numpy array for Whisper
                         callback=transcription_callback
                     )
+                    logger.debug("Processed audio with Whisper STT")
                 elif using_deepgram:
                     # Process with Deepgram (expects bytes)
                     await self.pipeline.speech_recognizer.process_audio_chunk(
                         audio_chunk=audio_bytes,  # Use bytes for Deepgram
                         callback=transcription_callback
                     )
+                    logger.debug("Processed audio with Deepgram STT")
                 else:
                     # Try both formats if we can't determine the type
                     try:
@@ -591,6 +640,23 @@ class WebSocketHandler:
                 transcription = self.cleanup_transcription(transcription)
                 logger.info(f"CLEANED TRANSCRIPTION: '{transcription}'")
                 
+                # Check for noise keywords - skip knowledge base query for noise
+                noise_keywords = ["click", "keyboard", "tongue", "scoff", "static", "*", "(", ")"]
+                if any(keyword in transcription.lower() for keyword in noise_keywords):
+                    logger.info(f"Detected noise keywords in transcription, skipping: '{transcription}'")
+                    # Clear part of buffer and continue
+                    half_size = len(self.input_buffer) // 2
+                    self.input_buffer = self.input_buffer[half_size:]
+                    return
+                
+                # Check for empty or short transcriptions
+                if not transcription or len(transcription.split()) < self.min_words_for_valid_query:
+                    logger.info(f"Transcription too short, skipping: '{transcription}'")
+                    # Clear part of buffer and continue
+                    half_size = len(self.input_buffer) // 2
+                    self.input_buffer = self.input_buffer[half_size:]
+                    return
+                
                 # Only process if it's a valid transcription
                 if transcription and self.is_valid_transcription(transcription):
                     logger.info(f"Complete transcription: {transcription}")
@@ -608,6 +674,14 @@ class WebSocketHandler:
                         if hasattr(self.pipeline, 'query_engine'):
                             query_result = await self.pipeline.query_engine.query(transcription)
                             response = query_result.get("response", "")
+                            
+                            # Make responses more concise for telephony
+                            if len(response.split()) > 100:  # Long response
+                                paragraphs = response.split("\n\n")
+                                if len(paragraphs) > 2:
+                                    # Keep first two paragraphs and summarize
+                                    response = "\n\n".join(paragraphs[:2])
+                                    response += "\n\nI have more details if you'd like me to continue."
                             
                             logger.info(f"Generated response: {response}")
                             

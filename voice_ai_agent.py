@@ -1,6 +1,6 @@
 """
 Enhanced Voice AI Agent main class that coordinates all components with improved
-speech/noise discrimination for telephony applications.
+speech/noise discrimination and Deepgram STT integration for telephony applications.
 """
 import os
 import logging
@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 class VoiceAIAgent:
     """
     Enhanced Voice AI Agent class that integrates the new AudioPreprocessor component
-    for superior speech/noise discrimination.
+    and prioritizes Deepgram STT for superior speech/noise discrimination.
     """
     
     def __init__(
@@ -47,24 +47,29 @@ class VoiceAIAgent:
             model_name: LLM model name for knowledge base
             api_key: Deepgram API key (defaults to env variable)
             llm_temperature: LLM temperature for response generation
-            whisper_model_path: Path to whisper model (if not using Deepgram)
+            whisper_model_path: Path to whisper model (fallback if Deepgram unavailable)
             enable_debug: Enable detailed debug logging
             **kwargs: Additional parameters for customization
         """
         self.storage_dir = storage_dir
         self.model_name = model_name
-        self.api_key = api_key
+        self.api_key = api_key or os.getenv("DEEPGRAM_API_KEY")
         self.llm_temperature = llm_temperature
         self.whisper_model_path = whisper_model_path
         self.enable_debug = enable_debug
         
         # STT Parameters
         self.stt_language = kwargs.get('language', 'en-US')
-        self.stt_keywords = kwargs.get('keywords', ['price', 'plan', 'cost', 'subscription', 'service'])
         
-        # Enhanced speech processing parameters
+        # Optimized telephony keywords
+        self.stt_keywords = kwargs.get('keywords', [
+            'price', 'plan', 'cost', 'subscription', 'service', 'features',
+            'support', 'help', 'agent', 'assistant', 'voice'
+        ])
+        
+        # Enhanced speech processing parameters - primarily for fallback to Whisper
         self.whisper_initial_prompt = kwargs.get('whisper_initial_prompt', 
-            "This is a telephone conversation. Focus only on the clearly spoken words and ignore background noise.")
+            "This is a telephone conversation. Focus only on clear speech and ignore background noise.")
         self.whisper_temperature = kwargs.get('whisper_temperature', 0.0)
         self.whisper_no_context = kwargs.get('whisper_no_context', True)
         self.whisper_preset = kwargs.get('whisper_preset', "default")
@@ -76,12 +81,12 @@ class VoiceAIAgent:
         self.query_engine = None
         self.tts_client = None
         
-        # Create the dedicated audio preprocessor for enhanced speech/noise discrimination
+        # Create the dedicated audio preprocessor with improved thresholds
         self.audio_preprocessor = AudioPreprocessor(
             sample_rate=16000,
             enable_barge_in=True,
-            barge_in_threshold=0.045,
-            min_speech_frames_for_barge_in=10,
+            barge_in_threshold=0.055,  # Increased from 0.045
+            min_speech_frames_for_barge_in=12,  # Increased from 10
             barge_in_cooldown_ms=2000,
             enable_debug=self.enable_debug
         )
@@ -93,37 +98,37 @@ class VoiceAIAgent:
         logger.info("Initializing Voice AI Agent components with enhanced speech processing...")
         
         try:
-            # Initialize speech recognizer with Deepgram if API key provided
+            # Check if Deepgram API key is available
+            if not self.api_key:
+                logger.warning("No Deepgram API key found. Check your environment variables.")
+                self.api_key = os.getenv("DEEPGRAM_API_KEY")
+                if not self.api_key:
+                    logger.warning("Still no Deepgram API key, will fall back to Whisper if needed")
+
+            # Initialize speech recognizer with Deepgram - make this the primary path
             if self.api_key:
-                self.speech_recognizer = DeepgramStreamingSTT(
-                    api_key=self.api_key,
-                    language=self.stt_language,
-                    sample_rate=16000,
-                    encoding="linear16",
-                    channels=1,
-                    interim_results=True
-                )
-                logger.info("Initialized Deepgram STT")
+                try:
+                    # Create an optimized Deepgram client with telephony-specific settings
+                    self.speech_recognizer = DeepgramStreamingSTT(
+                        api_key=self.api_key,
+                        model_name="enhanced",  # Use enhanced model for better telephony performance
+                        language=self.stt_language,
+                        sample_rate=16000,
+                        encoding="linear16",
+                        channels=1,
+                        interim_results=True,  # Enable interim results for responsiveness
+                    )
+                    logger.info("Successfully initialized Deepgram STT with enhanced model")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to initialize Deepgram: {e}")
+                    logger.warning("Falling back to Whisper STT")
+                    self._init_whisper_fallback()
             else:
-                # Initialize Whisper if no Deepgram API key
-                from speech_to_text.streaming.whisper_streaming import StreamingWhisperASR
-                
-                # Use optimized Whisper parameters
-                self.speech_recognizer = StreamingWhisperASR(
-                    model_path=self.whisper_model_path or "base.en",
-                    language="en",
-                    n_threads=4,
-                    chunk_size_ms=2000,
-                    vad_enabled=True,
-                    single_segment=True,
-                    temperature=self.whisper_temperature,
-                    initial_prompt=self.whisper_initial_prompt,
-                    no_context=self.whisper_no_context,
-                    preset=self.whisper_preset
-                )
-                logger.info(f"Initialized Whisper STT with preset: {self.whisper_preset}")
+                # Initialize Whisper as fallback if no Deepgram API key
+                self._init_whisper_fallback()
             
-            # Initialize STT integration 
+            # Initialize STT integration with better validation thresholds
             self.stt_integration = STTIntegration(
                 speech_recognizer=self.speech_recognizer,
                 language=self.stt_language
@@ -134,11 +139,12 @@ class VoiceAIAgent:
             index_manager = IndexManager(storage_dir=self.storage_dir)
             await index_manager.init()
             
-            # Initialize query engine
+            # Initialize query engine with improved caching
             self.query_engine = QueryEngine(
                 index_manager=index_manager, 
                 llm_model_name=self.model_name,
-                llm_temperature=self.llm_temperature
+                llm_temperature=self.llm_temperature,
+                use_cache=True  # Enable caching for faster responses
             )
             await self.query_engine.init()
             
@@ -160,6 +166,27 @@ class VoiceAIAgent:
         except Exception as e:
             logger.error(f"Error initializing Voice AI Agent: {e}", exc_info=True)
             raise
+    
+    def _init_whisper_fallback(self):
+        """Initialize Whisper as a fallback STT solution with optimized settings."""
+        from speech_to_text.streaming.whisper_streaming import StreamingWhisperASR
+        
+        # Use optimized Whisper parameters for lower latency
+        self.speech_recognizer = StreamingWhisperASR(
+            model_path=self.whisper_model_path or "base.en",  # Use smaller model for speed
+            language="en",
+            n_threads=8,  # Increased from 4 for better CPU utilization
+            chunk_size_ms=1500,  # Decreased from 2000 for lower latency
+            overlap_ms=100,  # Reduced overlap for speed
+            vad_enabled=True,
+            single_segment=True,
+            temperature=0.0,
+            beam_size=1,  # Added for faster processing
+            initial_prompt=self.whisper_initial_prompt,
+            no_context=self.whisper_no_context,
+            preset=self.whisper_preset
+        )
+        logger.info(f"Initialized Whisper STT fallback with preset: {self.whisper_preset}")
         
     def process_audio_with_enhanced_preprocessing(self, audio_data: np.ndarray) -> np.ndarray:
         """
@@ -171,6 +198,10 @@ class VoiceAIAgent:
         Returns:
             Processed audio data
         """
+        # Ensure audio is in the correct format
+        if audio_data.dtype != np.float32:
+            audio_data = audio_data.astype(np.float32)
+            
         # Use the dedicated audio preprocessor
         return self.audio_preprocessor.process_audio(audio_data)
     
@@ -184,6 +215,10 @@ class VoiceAIAgent:
         Returns:
             True if speech is detected
         """
+        # Ensure audio is in the correct format
+        if audio_data.dtype != np.float32:
+            audio_data = audio_data.astype(np.float32)
+            
         # Use the dedicated audio preprocessor's speech detection
         return self.audio_preprocessor.contains_speech(audio_data)
     
@@ -205,8 +240,15 @@ class VoiceAIAgent:
         if not hasattr(self, 'speech_recognizer') or not self.speech_recognizer:
             raise RuntimeError("Voice AI Agent not initialized")
         
+        start_time = time.time()
+        
         # Process audio for better speech recognition
         if isinstance(audio_data, np.ndarray):
+            # Ensure float32 format
+            if audio_data.dtype != np.float32:
+                audio_data = audio_data.astype(np.float32)
+                
+            # Apply enhanced preprocessing
             audio_data = self.process_audio_with_enhanced_preprocessing(audio_data)
             
             # Check if audio contains actual speech
@@ -216,15 +258,29 @@ class VoiceAIAgent:
                 return {
                     "status": "no_speech",
                     "transcription": "",
-                    "error": "No speech detected"
+                    "error": "No speech detected",
+                    "processing_time": time.time() - start_time
                 }
         
         # Use STT integration for processing
         result = await self.stt_integration.transcribe_audio_data(audio_data, callback=callback)
         
+        # Add additional validation for noise filtering
+        transcription = result.get("transcription", "")
+        
+        # Filter out noise-only transcriptions
+        noise_keywords = ["click", "keyboard", "tongue", "scoff", "static", "*", "(", ")"]
+        if any(keyword in transcription.lower() for keyword in noise_keywords):
+            logger.info(f"Filtered out noise transcription: '{transcription}'")
+            return {
+                "status": "filtered_noise",
+                "transcription": transcription,
+                "filtered": True,
+                "processing_time": time.time() - start_time
+            }
+        
         # Only process valid transcriptions
-        if result.get("is_valid", False) and result.get("transcription"):
-            transcription = result["transcription"]
+        if result.get("is_valid", False) and transcription and len(transcription.split()) >= 3:
             logger.info(f"Valid transcription: {transcription}")
             
             # Process through conversation manager
@@ -233,14 +289,16 @@ class VoiceAIAgent:
             return {
                 "transcription": transcription,
                 "response": response.get("response", ""),
-                "status": "success"
+                "status": "success",
+                "processing_time": time.time() - start_time
             }
         else:
-            logger.info("Invalid or empty transcription")
+            logger.info(f"Invalid or too short transcription: '{transcription}'")
             return {
                 "status": "invalid_transcription",
-                "transcription": result.get("transcription", ""),
-                "error": "No valid speech detected"
+                "transcription": transcription,
+                "error": "No valid speech detected",
+                "processing_time": time.time() - start_time
             }
     
     async def process_streaming_audio(
@@ -277,6 +335,11 @@ class VoiceAIAgent:
                 
                 # Process audio for better recognition if it's numpy array
                 if isinstance(chunk, np.ndarray):
+                    # Ensure float32 format
+                    if chunk.dtype != np.float32:
+                        chunk = chunk.astype(np.float32)
+                    
+                    # Apply enhanced preprocessing
                     chunk = self.process_audio_with_enhanced_preprocessing(chunk)
                     
                     # Skip further processing if no speech detected
@@ -290,15 +353,21 @@ class VoiceAIAgent:
                 else:
                     audio_bytes = chunk
                     
-                # Process through STT
+                # Process through STT with noise filtering
                 async def process_result(result):
                     # Only handle final results
                     if getattr(result, 'is_final', True):
                         # Clean up transcription
                         transcription = self.stt_integration.cleanup_transcription(result.text)
                         
-                        # Process if valid
-                        if transcription and self.stt_integration.is_valid_transcription(transcription):
+                        # Filter out noise transcriptions
+                        noise_keywords = ["click", "keyboard", "tongue", "scoff", "static", "*", "(", ")"]
+                        if any(keyword in transcription.lower() for keyword in noise_keywords):
+                            logger.info(f"Filtered out noise transcription: '{transcription}'")
+                            return
+                        
+                        # Process if valid and has minimum words
+                        if transcription and self.stt_integration.is_valid_transcription(transcription) and len(transcription.split()) >= 3:
                             # Get response from conversation manager
                             response = await self.conversation_manager.handle_user_input(transcription)
                             
