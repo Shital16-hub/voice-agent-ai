@@ -1,23 +1,23 @@
 """
-TTS Integration module for Voice AI Agent.
+TTS Integration module for Voice AI Agent using Google Cloud TTS.
 
-This module provides functions for integrating text-to-speech
+This module provides classes and functions for integrating text-to-speech
 capabilities with the Voice AI Agent system.
 """
 import logging
 import time
 from typing import Optional, Dict, Any, AsyncIterator, Union, List, Callable, Awaitable
 
-from text_to_speech import DeepgramTTS, RealTimeResponseHandler, AudioProcessor
+from text_to_speech import GoogleCloudTTS, RealTimeResponseHandler, AudioProcessor
 
 logger = logging.getLogger(__name__)
 
 class TTSIntegration:
     """
-    Text-to-Speech integration for Voice AI Agent.
+    Text-to-Speech integration for Voice AI Agent using Google Cloud TTS.
     
-    Provides an abstraction layer for TTS functionality, handling initialization,
-    single-text processing, and streaming capabilities.
+    Provides an abstraction layer for TTS functionality,
+    handling initialization, single-text processing, and streaming capabilities.
     """
     
     def __init__(
@@ -29,7 +29,7 @@ class TTSIntegration:
         Initialize the TTS integration.
         
         Args:
-            voice: Voice ID to use for Deepgram TTS
+            voice: Voice name to use for Google Cloud TTS
             enable_caching: Whether to enable TTS caching
         """
         self.voice = voice
@@ -48,19 +48,17 @@ class TTSIntegration:
             return
             
         try:
-            # Initialize the DeepgramTTS client with linear16 format
-            self.tts_client = DeepgramTTS(
-                voice=self.voice, 
-                enable_caching=self.enable_caching,
-                container_format="linear16",  # Use linear16 for PCM WAV
-                sample_rate=16000  # Set sample rate for telephony
+            # Initialize the Google Cloud TTS client
+            self.tts_client = GoogleCloudTTS(
+                voice_name=self.voice, 
+                enable_caching=self.enable_caching
             )
             
             # Initialize the RealTimeResponseHandler
-            self.tts_handler = RealTimeResponseHandler(tts_streamer=None, tts_client=self.tts_client)
+            self.tts_handler = RealTimeResponseHandler(tts_client=self.tts_client)
             
             self.initialized = True
-            logger.info(f"Initialized TTS with voice: {self.voice or 'default'}, format: linear16")
+            logger.info(f"Initialized TTS with voice: {self.voice or 'default'}")
         except Exception as e:
             logger.error(f"Error initializing TTS: {e}")
             raise
@@ -167,7 +165,7 @@ class TTSIntegration:
         # Reset the TTS handler for this new session
         if self.tts_handler:
             await self.tts_handler.stop()
-            self.tts_handler = RealTimeResponseHandler(tts_streamer=None, tts_client=self.tts_client)
+            self.tts_handler = RealTimeResponseHandler(tts_client=self.tts_client)
         
         # Process each text chunk
         total_chunks = 0

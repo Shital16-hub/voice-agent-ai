@@ -1,17 +1,17 @@
 """
-Streaming functionality for text-to-speech processing.
+Streaming functionality for text-to-speech processing using Google Cloud TTS.
 
 This module provides utilities for handling streaming text input
 and audio output for real-time voice applications.
 """
 import asyncio
 import logging
-from typing import AsyncGenerator, Dict, List, Optional, Any, Callable
+from typing import AsyncGenerator, Dict, List, Optional, Any, Callable, Awaitable
 import queue
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-from .deepgram_tts import DeepgramTTS
+from .google_tts import GoogleCloudTTS
 from .config import config
 from .exceptions import TTSStreamingError
 
@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 class TTSStreamer:
     """
-    Manages real-time streaming of text to speech.
+    Manages real-time streaming of text to speech using Google Cloud TTS.
     
     Optimized for low-latency voice applications, this class manages the streaming
     of text from a knowledge base to speech output in real-time.
@@ -27,17 +27,17 @@ class TTSStreamer:
 
     def __init__(
         self,
-        tts_client: Optional[DeepgramTTS] = None,
+        tts_client: Optional[GoogleCloudTTS] = None,
         **tts_kwargs
     ):
         """
         Initialize the TTS streamer.
         
         Args:
-            tts_client: Existing DeepgramTTS client, or one will be created
-            **tts_kwargs: Arguments to pass to DeepgramTTS if creating a new client
+            tts_client: Existing GoogleCloudTTS client, or one will be created
+            **tts_kwargs: Arguments to pass to GoogleCloudTTS if creating a new client
         """
-        self.tts_client = tts_client or DeepgramTTS(**tts_kwargs)
+        self.tts_client = tts_client or GoogleCloudTTS(**tts_kwargs)
         self.text_queue = asyncio.Queue()
         self.running = False
     
@@ -110,7 +110,7 @@ class TTSStreamer:
 
 class RealTimeResponseHandler:
     """
-    Handles real-time response text from the knowledge base to speech output.
+    Handles real-time response text from the knowledge base to speech output using Google Cloud TTS.
     
     This class is designed to receive word-by-word output from the knowledge base
     and efficiently stream it to the TTS system.
@@ -119,6 +119,7 @@ class RealTimeResponseHandler:
     def __init__(
         self,
         tts_streamer: Optional[TTSStreamer] = None,
+        tts_client: Optional[GoogleCloudTTS] = None,
         **tts_kwargs
     ):
         """
@@ -126,9 +127,16 @@ class RealTimeResponseHandler:
         
         Args:
             tts_streamer: Existing TTSStreamer or one will be created
-            **tts_kwargs: Arguments to pass to TTSStreamer if creating a new one
+            tts_client: Existing GoogleCloudTTS client to pass to TTSStreamer if created
+            **tts_kwargs: Arguments to pass to GoogleCloudTTS if creating a new one
         """
-        self.tts_streamer = tts_streamer or TTSStreamer(**tts_kwargs)
+        if tts_streamer:
+            self.tts_streamer = tts_streamer
+        elif tts_client:
+            self.tts_streamer = TTSStreamer(tts_client=tts_client)
+        else:
+            self.tts_streamer = TTSStreamer(**tts_kwargs)
+            
         self.buffer = ""
         self.buffer_lock = asyncio.Lock()
         self.audio_queue = asyncio.Queue()
@@ -163,7 +171,7 @@ class RealTimeResponseHandler:
             async for audio_chunk in self.tts_streamer.start_streaming():
                 await self.audio_queue.put(audio_chunk)
         except Exception as e:
-            logger.error(f"Error in TTS stream processor: {str(e)}")
+            logger.error(f"Error in TTS stream processor: {e}")
         finally:
             # Signal the end of streaming
             await self.audio_queue.put(None)

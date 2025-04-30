@@ -62,3 +62,7 @@ pandas
 pytest
 pytest-asyncio
 typing-extensions
+
+# Google Cloud TTS
+google-cloud-texttospeech
+google-auth
