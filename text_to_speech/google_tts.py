@@ -115,6 +115,7 @@ class GoogleCloudTTS:
         audio_config = {
             "audio_encoding": encoding,
             "sample_rate_hertz": config.sample_rate,
+            "speaking_rate": 1.8,
         }
         
         # Add effects profile if specified
@@ -305,7 +306,7 @@ class GoogleCloudTTS:
                     text = f"<speak>{text}</speak>"
                 synthesis_input.ssml = text
             else:
-                synthesis_input.text = text
+                synthesis_input.ssml = f'<speak><prosody rate="1.15">{text}</prosody></speak>'
             
             # Configure voice
             voice_params = self._get_voice_params()

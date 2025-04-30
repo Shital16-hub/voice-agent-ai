@@ -16,7 +16,7 @@ from knowledge_base.conversation_manager import ConversationManager
 from knowledge_base.llama_index.document_store import DocumentStore
 from knowledge_base.llama_index.index_manager import IndexManager
 from knowledge_base.llama_index.query_engine import QueryEngine
-from text_to_speech import DeepgramTTS
+from text_to_speech import GoogleCloudTTS
 
 logger = logging.getLogger(__name__)
 
@@ -175,7 +175,7 @@ class VoiceAIAgent:
         await self.conversation_manager.init()
         
         # Initialize TTS client
-        self.tts_client = DeepgramTTS()
+        self.tts_client = GoogleCloudTTS()
         
         logger.info("Voice AI Agent initialization complete with Deepgram STT")
         
