@@ -66,9 +66,9 @@ class AudioPreprocessor:
         self.enable_debug = enable_debug
         
         # Enhanced adaptive noise tracking
+        self.noise_samples = []
+        self.max_samples = 50  # Increased for better statistics
         self.ambient_noise_level = 0.01  # Starting threshold
-        self.noise_samples: List[float] = []
-        self.max_noise_samples = 50  # Increased for better statistics
         self.min_noise_floor = 0.005  # Minimum noise floor
         
         # Enhanced energy thresholds with hysteresis
@@ -101,7 +101,7 @@ class AudioPreprocessor:
         self.spectral_history: List[np.ndarray] = []
         self.max_spectral_history = 10
         
-        # Time-domain filters states
+        # Time-domain filters states - no longer used with simplified approach
         self.hp_filter_state = None  # For high-pass filter
         self.bp_filter_state = None  # For band-pass filter
         
@@ -123,7 +123,7 @@ class AudioPreprocessor:
         if energy < 0.02:  # Very quiet audio
             self.noise_samples.append(energy)
             # Keep only recent samples
-            if len(self.noise_samples) > self.max_noise_samples:
+            if len(self.noise_samples) > self.max_samples:
                 self.noise_samples.pop(0)
             
             # Update ambient noise level (with safety floor)
@@ -207,17 +207,17 @@ class AudioPreprocessor:
     def _apply_spectral_subtraction(self, audio_data: np.ndarray) -> np.ndarray:
         """
         Apply spectral subtraction to reduce background noise.
-        Enhanced version with perceptual weighting for better speech clarity.
+        Simplified implementation that avoids shape mismatch issues.
         
         Args:
             audio_data: Audio data as numpy array
-            
+                
         Returns:
             Enhanced audio data
         """
         if len(audio_data) < 512:  # Need enough samples for a good FFT
             return audio_data
-            
+                
         try:
             # Compute STFT
             f, t, Zxx = signal.stft(audio_data, fs=self.sample_rate, nperseg=512, noverlap=384)
@@ -226,45 +226,23 @@ class AudioPreprocessor:
             magnitude = np.abs(Zxx)
             phase = np.angle(Zxx)
             
-            # Add to spectral history for better noise estimation
-            self.spectral_history.append(magnitude.copy())
-            if len(self.spectral_history) > self.max_spectral_history:
-                self.spectral_history.pop(0)
+            # Simplified noise estimation that doesn't depend on history
+            # Estimate noise as the minimum magnitude across time for each frequency
+            # This avoids any shape mismatch issues completely
+            noise_spectrum = np.min(magnitude, axis=1, keepdims=True) * 1.5
             
-            # Estimate noise spectrum from history - more robust than single frame
-            if len(self.spectral_history) >= 3:
-                # Sort magnitude values across time for each frequency
-                sorted_magnitudes = np.sort([spec.flatten() for spec in self.spectral_history])
-                
-                # Use lower percentiles for noise estimate (10th percentile)
-                noise_percentile = 10
-                noise_idx = max(0, min(int(len(self.spectral_history) * noise_percentile / 100), 
-                                      len(self.spectral_history) - 1))
-                noise_magnitude = sorted_magnitudes[noise_idx].reshape(magnitude.shape)
-            else:
-                # Fallback for initial frames - use lowest 10% of current frame
-                frame_energy = np.sum(magnitude**2, axis=0)
-                sorted_frames = np.argsort(frame_energy)
-                noise_frames = max(1, int(0.1 * len(sorted_frames)))
-                noise_indices = sorted_frames[:noise_frames]
-                
-                # Average noise spectrum over noise frames
-                noise_magnitude = np.mean(magnitude[:, noise_indices], axis=1, keepdims=True)
+            # Create frequency weights for speech bands
+            speech_weight = np.ones((len(f), 1))  # Shape is (freq, 1) for broadcasting
+            speech_band = (f >= 300) & (f <= 3400)
+            speech_weight[speech_band, 0] = 0.7  # Reduce subtraction in speech bands
             
-            # Apply spectral subtraction with psychoacoustic enhancement
-            # Higher oversubtraction factor for telephony audio
-            oversubtraction_factor = 2.0  # Increased from typical 1.5 for telephony
-            spectral_floor = 0.02  # Increased minimum retention for better speech
+            # Apply simple spectral subtraction with floor
+            oversubtraction_factor = 2.0
+            spectral_floor = 0.02
             
-            # Perceptual weighting - subtract more noise in non-speech bands
-            # Speech is typically 300-3400 Hz in telephony
-            speech_weight = np.ones_like(f)
-            speech_idx = (f >= 300) & (f <= 3400)
-            speech_weight[speech_idx] = 0.7  # Lower weight = less subtraction in speech bands
-            
-            # Apply weighted subtraction with flooring
+            # This broadcasted operation is safe because everything has compatible dimensions
             magnitude_enhanced = np.maximum(
-                magnitude - oversubtraction_factor * speech_weight[:, np.newaxis] * noise_magnitude,
+                magnitude - oversubtraction_factor * speech_weight * noise_spectrum,
                 spectral_floor * magnitude
             )
             
@@ -279,14 +257,14 @@ class AudioPreprocessor:
                 audio_enhanced = audio_enhanced[:len(audio_data)]
             
             return audio_enhanced
-            
+                
         except Exception as e:
             logger.error(f"Error in spectral subtraction: {e}")
             return audio_data  # Return original if processing fails
     
     def _apply_time_domain_filters(self, audio_data: np.ndarray) -> np.ndarray:
         """
-        Apply time-domain filters with state preservation for smoother results.
+        Apply time-domain filters with a simpler approach that avoids state issues.
         
         Args:
             audio_data: Audio data as numpy array
@@ -295,26 +273,14 @@ class AudioPreprocessor:
             Filtered audio data
         """
         try:
-            # High-pass filter to remove low-frequency noise (below 100Hz)
-            # Design filter if not done yet
-            if self.hp_filter_state is None:
-                b_hp, a_hp = signal.butter(6, 100/(self.sample_rate/2), 'highpass')
-                self.hp_filter_state = [b_hp, a_hp, np.zeros(5)]  # 6th order = 5 states
+            # Apply high-pass filter without state preservation
+            # This is simpler and more robust, avoiding state size issues
+            b_hp, a_hp = signal.butter(4, 100/(self.sample_rate/2), 'highpass')
+            audio_hp = signal.filtfilt(b_hp, a_hp, audio_data)
             
-            # Apply filter with state
-            b_hp, a_hp, zi_hp = self.hp_filter_state
-            audio_hp, zf_hp = signal.lfilter(b_hp, a_hp, audio_data, zi=zi_hp)
-            self.hp_filter_state[2] = zf_hp  # Update filter state
-            
-            # Band-pass filter for telephony freq range (300-3400 Hz)
-            if self.bp_filter_state is None:
-                b_bp, a_bp = signal.butter(4, [300/(self.sample_rate/2), 3400/(self.sample_rate/2)], 'band')
-                self.bp_filter_state = [b_bp, a_bp, np.zeros(3)]  # 4th order = 3 states
-            
-            # Apply filter with state
-            b_bp, a_bp, zi_bp = self.bp_filter_state
-            audio_filtered, zf_bp = signal.lfilter(b_bp, a_bp, audio_hp, zi=zi_bp)
-            self.bp_filter_state[2] = zf_bp  # Update filter state
+            # Apply band-pass filter without state preservation
+            b_bp, a_bp = signal.butter(4, [300/(self.sample_rate/2), 3400/(self.sample_rate/2)], 'band')
+            audio_filtered = signal.filtfilt(b_bp, a_bp, audio_hp)
             
             return audio_filtered
             
@@ -723,16 +689,35 @@ class AudioPreprocessor:
                 logger.info("Agent speaking stopped")
     
     def reset(self) -> None:
-        """Reset preprocessor state."""
+        """Reset preprocessor state completely, avoiding any state persistence issues."""
+        # Reset speech detection state
         self.speech_state = SpeechState.SILENCE
         self.potential_speech_frames = 0
         self.confirmed_speech_frames = 0
         self.silence_frames = 0
+        
+        # Reset barge-in tracking
         self.agent_speaking = False
         self.barge_in_detected = False
+        self.agent_speaking_start_time = 0.0
+        self.last_barge_in_time = 0.0
+        
+        # Reset buffers and history collections
         self.spectral_history = []
         self.recent_audio_buffer.clear()
+        self.speech_band_energies.clear()
+        self.noise_samples = []
+        
+        # Reset threshold values to defaults
+        self.ambient_noise_level = 0.01
+        self.low_threshold = self.ambient_noise_level * 2.0
+        self.high_threshold = self.ambient_noise_level * 3.5
+        
+        # Reset frame counter
+        self.frame_count = 0
+        
+        # Remove filter states completely - no longer used with new implementation
         self.hp_filter_state = None
         self.bp_filter_state = None
-        self.frame_count = 0
+        
         logger.info("Audio preprocessor state reset")
