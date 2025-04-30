@@ -18,9 +18,9 @@ class TTSConfig(BaseSettings):
         description="Path to Google Cloud credentials JSON file"
     )
     
-    # TTS settings
+    # TTS settings - Using Standard voice instead of Neural to avoid SSML issues
     voice_name: str = Field(
-        default="en-US-Polyglot-1",
+        default="en-US-Standard-D",
         description="Google TTS voice name to use"
     )
     
@@ -117,8 +117,9 @@ class TTSConfig(BaseSettings):
         description="Enable SSML optimizations for telephony"
     )
     
+    # Using a simple SSML template without emphasis tags which can cause issues
     telephony_ssml_template: str = Field(
-        default='<speak><prosody rate="{rate}"><emphasis level="moderate">{text}</emphasis></prosody></speak>',
+        default='<speak><prosody rate="{rate}">{text}</prosody></speak>',
         description="SSML template for telephony optimization"
     )
     

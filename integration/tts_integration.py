@@ -6,6 +6,7 @@ capabilities with the Voice AI Agent system.
 """
 import logging
 import time
+import asyncio
 from typing import Optional, Dict, Any, AsyncIterator, Union, List, Callable, Awaitable
 
 from text_to_speech import GoogleCloudTTS, RealTimeResponseHandler, AudioProcessor
@@ -65,40 +66,45 @@ class TTSIntegration:
     
     async def text_to_speech(self, text: str) -> bytes:
         """
-        Convert text to speech.
-        
-        Args:
-            text: Text to convert to speech
-            
-        Returns:
-            Audio data as bytes
+        Convert text to speech with robust fallback mechanisms.
         """
         if not self.initialized:
             await self.init()
         
         try:
-            # Get audio data from TTS client
-            audio_data = await self.tts_client.synthesize(text)
+            # First attempt: Try with plain text (no SSML)
+            try:
+                audio_data = await self.tts_client.synthesize(text, is_ssml=False)
+            except Exception as first_error:
+                logger.warning(f"Plain text TTS failed: {first_error}. Trying with default voice...")
+                
+                # Second attempt: Use a default/standard voice
+                try:
+                    # Create a temporary client with a Standard voice
+                    temp_client = GoogleCloudTTS(voice_name="en-US-Standard-D")
+                    audio_data = await temp_client.synthesize(text, is_ssml=False)
+                except Exception as second_error:
+                    logger.error(f"Both TTS attempts failed: {second_error}")
+                    
+                    # Last resort: Generate 500ms of silence or a simple tone
+                    silence_size = int(16000 * 0.5 * 2)  # 500ms of silence at 16kHz, 16-bit
+                    audio_data = b'\x00' * silence_size
             
-            # Ensure the audio data has an even number of bytes
+            # Ensure even number of bytes & add pause
             if len(audio_data) % 2 != 0:
                 audio_data = audio_data + b'\x00'
-                logger.debug("Padded audio data to make even length")
             
-            # Add a short pause after speech for better conversation flow
             if self.add_pause_after_speech:
-                # Generate silence based on pause_duration_ms
-                silence_size = int(16000 * (self.pause_duration_ms / 1000) * 2)  # 16-bit samples
+                silence_size = int(16000 * (self.pause_duration_ms / 1000) * 2)
                 silence_data = b'\x00' * silence_size
-                
-                # Append silence to audio data
                 audio_data = audio_data + silence_data
-                logger.debug(f"Added {self.pause_duration_ms}ms pause after speech")
             
             return audio_data
         except Exception as e:
             logger.error(f"Error in text to speech conversion: {e}")
-            raise
+            # Return silence as last resort
+            silence_size = int(16000 * 0.5 * 2)
+            return b'\x00' * silence_size
     
     async def text_to_speech_streaming(
         self, 
@@ -139,7 +145,9 @@ class TTSIntegration:
                 
         except Exception as e:
             logger.error(f"Error in streaming text to speech: {e}")
-            raise
+            # Yield silent audio as fallback
+            silence_size = int(16000 * 0.5 * 2)  # 500ms of silence
+            yield b'\x00' * silence_size
     
     async def process_realtime_text(
         self,
@@ -176,8 +184,14 @@ class TTSIntegration:
                 if not chunk or not chunk.strip():
                     continue
                 
-                # Process the text chunk
-                audio_data = await self.text_to_speech(chunk)
+                # Process the text chunk with simpler SSML
+                try:
+                    simple_chunk = "<speak>" + chunk + "</speak>"
+                    audio_data = await self.tts_client.synthesize(simple_chunk, is_ssml=True)
+                except Exception as ssml_error:
+                    # Fall back to plain text
+                    logger.warning(f"SSML synthesis failed: {ssml_error}. Using plain text.")
+                    audio_data = await self.tts_client.synthesize(chunk, is_ssml=False)
                 
                 # Track statistics
                 total_chunks += 1
@@ -223,7 +237,12 @@ class TTSIntegration:
             await self.init()
         
         try:
-            audio_data = await self.tts_client.synthesize_with_ssml(ssml)
+            # Ensure proper SSML format
+            if not ssml.startswith('<speak>'):
+                ssml = f"<speak>{ssml}</speak>"
+                
+            audio_data = await self.tts_client.synthesize(ssml, is_ssml=True)
+            
             # Ensure even number of bytes
             if len(audio_data) % 2 != 0:
                 audio_data = audio_data + b'\x00'
@@ -238,7 +257,9 @@ class TTSIntegration:
             return audio_data
         except Exception as e:
             logger.error(f"Error in SSML processing: {e}")
-            raise
+            # Return silent audio rather than raising
+            silence_size = int(16000 * 0.5 * 2)  # 500ms of silence
+            return b'\x00' * silence_size
     
     async def cleanup(self) -> None:
         """Clean up resources."""

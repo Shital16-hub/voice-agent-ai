@@ -5,6 +5,7 @@ Generic version that works with any knowledge base.
 import os
 import logging
 import asyncio
+import time  # Added missing time import
 from typing import Optional, Dict, Any, Union, Callable, Awaitable
 import numpy as np
 from scipy import signal

@@ -95,52 +95,38 @@ class AudioProcessor:
     def pcm_to_mulaw(pcm_data: bytes, source_sample_rate: int = None) -> bytes:
         """
         Convert PCM audio from Google Cloud TTS to mulaw for Twilio with enhanced quality.
-        
-        Args:
-            pcm_data: Audio data in PCM format
-            source_sample_rate: Sample rate of the source PCM data (None to auto-detect)
-            
-        Returns:
-            Audio data in mulaw format optimized for telephony
         """
         try:
+            # Check for extremely small data
+            if len(pcm_data) < 320:  # Less than 20ms at 8kHz
+                # Pad tiny chunks to avoid warnings
+                padding_size = 320 - len(pcm_data)
+                pcm_data = pcm_data + (b'\x00' * padding_size)
+                logger.debug(f"Padded small audio chunk from {len(pcm_data)-padding_size} to {len(pcm_data)} bytes")
+            
             # Try to detect input format and parameters
             detected_sample_rate = source_sample_rate or SAMPLE_RATE_AI
             
-            # If it looks like a WAV file, extract data from it
+            # Convert to PCM if WAV
             if pcm_data[:4] == b'RIFF' and pcm_data[8:12] == b'WAVE':
-                # Parse WAV header to get sample rate and extract raw PCM
                 with io.BytesIO(pcm_data) as wav_io:
                     with wave.open(wav_io, 'rb') as wav_file:
                         detected_sample_rate = wav_file.getframerate()
                         n_channels = wav_file.getnchannels()
                         sample_width = wav_file.getsampwidth()
                         pcm_data = wav_file.readframes(wav_file.getnframes())
-                        logger.debug(f"Detected WAV: {detected_sample_rate}Hz, {n_channels} channels, {sample_width} bytes/sample")
             
             # Ensure we have an even number of bytes for 16-bit samples
             if len(pcm_data) % 2 != 0:
                 pcm_data = pcm_data + b'\x00'
-                logger.debug("Padded audio data to make even length")
             
-            # Amplify the signal a bit to ensure good volume over the phone
+            # Amplify the signal for better volume
             try:
-                pcm_data = audioop.mul(pcm_data, 2, 1.2)  # Amplify by 20%
+                pcm_data = audioop.mul(pcm_data, 2, 1.3)
             except Exception as amp_error:
                 logger.warning(f"Could not amplify audio: {amp_error}")
             
-            # Apply a slight compression to improve clarity over telephony
-            try:
-                # Compression: reduce dynamic range to make quieter sounds more audible
-                pcm_data = audioop.compress(pcm_data, 2, 5, 2)  # parameters: fragment size=2, threshold=5, ratio=2:1
-            except Exception as comp_error:
-                logger.warning(f"Could not compress audio: {comp_error}")
-            
-            # Optimize frequency response for telephony
-            # This can be done in numpy, but would require converting back and forth
-            # Instead, we use the resampling step to handle this
-            
-            # Resample from detected rate to 8kHz for Twilio (this also acts as a low-pass filter)
+            # Resample to 8kHz for Twilio
             if detected_sample_rate != SAMPLE_RATE_TWILIO:
                 try:
                     pcm_data_8k, _ = audioop.ratecv(
@@ -149,26 +135,26 @@ class AudioProcessor:
                         SAMPLE_RATE_TWILIO, 
                         None
                     )
-                    logger.debug(f"Resampled audio from {detected_sample_rate}Hz to {SAMPLE_RATE_TWILIO}Hz")
                 except Exception as resample_error:
                     logger.error(f"Error resampling audio: {resample_error}")
-                    pcm_data_8k = pcm_data  # Use original as fallback
+                    pcm_data_8k = pcm_data
             else:
                 pcm_data_8k = pcm_data
             
-            # Convert to mulaw - this gives us the 8-bit encoding Twilio expects
+            # Convert to mulaw
             mulaw_data = audioop.lin2ulaw(pcm_data_8k, 2)
             
-            # Log the conversion details
-            compression_ratio = len(pcm_data) / len(mulaw_data) if len(mulaw_data) > 0 else 0
-            logger.info(f"Converted {len(pcm_data)} bytes of PCM to {len(mulaw_data)} bytes of mulaw (ratio: {compression_ratio:.1f}x)")
+            # Ensure minimum size for mulaw data
+            if len(mulaw_data) < 160:  # Minimum 20ms chunk
+                padding_needed = 160 - len(mulaw_data)
+                mulaw_data = mulaw_data + bytes([0x7f] * padding_needed)  # Use 0x7f (silence) for padding
             
             return mulaw_data
             
         except Exception as e:
             logger.error(f"Error converting PCM to mulaw: {e}", exc_info=True)
-            # Return empty data rather than raising an exception
-            return b''
+            # Return silence rather than empty data
+            return bytes([0x7f] * 160)  # Return 20ms of silence
     
     @staticmethod
     def normalize_audio(audio_data: np.ndarray) -> np.ndarray:
@@ -220,8 +206,8 @@ class AudioProcessor:
             else:
                 normalized = pre_emphasis
             
-            # 6. Apply a mild compression to even out volumes
-            # Compression ratio 2:1 for values above threshold
+            # 6. Apply a mild compression to even out volumes using a simple function
+            # instead of the unavailable audioop.compress
             threshold = 0.2
             ratio = 0.5  # 2:1 compression
             
@@ -414,14 +400,11 @@ class AudioProcessor:
             # 2. Increase volume slightly for better clarity over phone
             pcm_data = audioop.mul(pcm_data, width, 1.3)
             
-            # 3. Apply dynamic range compression
-            pcm_data = audioop.compress(pcm_data, width, 6, 2)
-            
-            # 4. Resample to 8 kHz (telephone quality)
+            # 3. Resample to 8 kHz (telephone quality)
             if sample_rate != SAMPLE_RATE_TWILIO:
                 pcm_data, _ = audioop.ratecv(pcm_data, width, 1, sample_rate, SAMPLE_RATE_TWILIO, None)
             
-            # 5. Convert to μ-law for Twilio
+            # 4. Convert to μ-law for Twilio
             mulaw_data = audioop.lin2ulaw(pcm_data, width)
             
             # Return μ-law encoded data ready for telephony

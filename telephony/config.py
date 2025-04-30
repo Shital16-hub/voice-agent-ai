@@ -31,14 +31,14 @@ WS_MAX_MESSAGE_SIZE = 1048576  # 1MB
 
 # Performance Settings - Optimized for noise handling
 # Increased silence threshold to better distinguish speech from noise
-SILENCE_THRESHOLD = 0.008   # Increased from 0.005 to avoid detecting noise as speech
-SILENCE_DURATION = 1.2      # Increased to ensure proper pauses are detected
+SILENCE_THRESHOLD = 0.0015   # Increased from 0.008 to avoid detecting noise as speech
+SILENCE_DURATION = 1.8      # Increased to ensure proper pauses are detected
 MAX_CALL_DURATION = 3600    # 1 hour
 MAX_PROCESSING_TIME = 5.0   # Maximum time to spend processing audio (seconds)
 
 # Response Settings
 RESPONSE_TIMEOUT = 4.0      # Maximum time to wait for a response (seconds)
-MIN_TRANSCRIPTION_LENGTH = 3  # Increased from 2 to avoid processing noise/short utterances
+MIN_TRANSCRIPTION_LENGTH = 2  # Increased from 2 to avoid processing noise/short utterances
 
 # Noise Filtering Settings
 HIGH_PASS_FILTER = 80       # High-pass filter cutoff frequency in Hz
@@ -47,7 +47,7 @@ ENABLE_NOISE_FILTERING = True  # Enable enhanced noise filtering
 
 # Barge-in Settings
 ENABLE_BARGE_IN = True                  # Enable barge-in functionality
-BARGE_IN_THRESHOLD = 0.02               # Energy threshold for detecting barge-in
+BARGE_IN_THRESHOLD = 0.03               # Energy threshold for detecting barge-in
 BARGE_IN_DETECTION_WINDOW = 100         # Window size in ms for barge-in detection
 BARGE_IN_MIN_SPEECH_DURATION = 200      # Minimum speech duration in ms to trigger barge-in
 

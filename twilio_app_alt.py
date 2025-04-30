@@ -15,7 +15,7 @@ from flask import Flask, request, Response
 from simple_websocket import Server, ConnectionClosed
 from dotenv import load_dotenv
 from twilio.twiml.voice_response import VoiceResponse, Connect, Stream
-from twilio.rest import Client
+from twilio.rest import Client  # Imported but not used - consider removing if not needed
 
 # Load environment variables
 load_dotenv()
@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from telephony.twilio_handler import TwilioHandler
 from telephony.websocket_handler import WebSocketHandler
 from telephony.config import HOST, PORT, DEBUG, LOG_LEVEL, LOG_FORMAT
+# These config variables appear to be imported but not used - consider removing if not needed
 from telephony.config import STT_INITIAL_PROMPT, STT_NO_CONTEXT, STT_TEMPERATURE, STT_PRESET
 from voice_ai_agent import VoiceAIAgent
 from integration.tts_integration import TTSIntegration
@@ -50,6 +51,7 @@ base_url = None
 # Dictionary to store event loops and state for each call
 call_event_loops = {}
 
+
 async def initialize_system():
     """Initialize all system components with knowledge-base agnostic speech enhancements."""
     global twilio_handler, voice_ai_pipeline, base_url
@@ -69,6 +71,7 @@ async def initialize_system():
     agent = VoiceAIAgent(
         storage_dir='./storage',
         model_name='mistral:7b-instruct-v0.2-q4_0',
+        # Note: The following parameters may need adjustment based on VoiceAIAgent implementation
         whisper_model_path='models/base.en',
         llm_temperature=0.7,
         # Pass generic telephony-optimized parameters
@@ -105,10 +108,12 @@ async def initialize_system():
     
     logger.info("System initialized successfully with knowledge-base agnostic speech enhancements")
 
+
 @app.route('/', methods=['GET'])
 def index():
     """Simple test endpoint."""
     return "Voice AI Agent is running with improved noise handling!"
+
 
 @app.route('/voice/incoming', methods=['POST'])
 def handle_incoming_call():
@@ -166,6 +171,7 @@ def handle_incoming_call():
 </Response>'''
         return Response(fallback_twiml, mimetype='text/xml')
 
+
 @app.route('/voice/status', methods=['POST'])
 def handle_status_callback():
     """Handle call status callbacks."""
@@ -200,15 +206,19 @@ def handle_status_callback():
                     # Wait for thread to join with timeout
                     thread = loop_info['thread']
                     thread.join(timeout=1.0)
-                    
-                # Remove from tracking
-                del call_event_loops[call_sid]
-                logger.info(f"Cleaned up event loop resources for call {call_sid}")
+                
+                try:
+                    # Remove from tracking with better error handling
+                    del call_event_loops[call_sid]
+                    logger.info(f"Cleaned up event loop resources for call {call_sid}")
+                except KeyError:
+                    logger.warning(f"Call {call_sid} already removed from tracking")
                 
         return Response('', status=204)
     except Exception as e:
         logger.error(f"Error handling status callback: {e}", exc_info=True)
         return Response('', status=204)
+
 
 def run_event_loop_in_thread(loop, ws_handler, ws, call_sid, terminate_flag):
     """Run event loop in a separate thread."""
@@ -245,6 +255,7 @@ def run_event_loop_in_thread(loop, ws_handler, ws, call_sid, terminate_flag):
         # Clean up call_event_loops entry if it still exists
         if call_sid in call_event_loops:
             del call_event_loops[call_sid]
+
 
 @app.route('/ws/stream/<call_sid>', websocket=True)
 def handle_media_stream(call_sid):
@@ -341,6 +352,7 @@ def handle_media_stream(call_sid):
         # Return empty response
         return ""
 
+
 @app.route('/ws-test')
 def ws_test():
     """WebSocket connection test page."""
@@ -386,6 +398,7 @@ def ws_test():
     </html>
     """
 
+
 @app.route('/ws/test', websocket=True)
 def ws_test_endpoint():
     """WebSocket test endpoint."""
@@ -411,6 +424,7 @@ def ws_test_endpoint():
     
     return ""
 
+
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint."""
@@ -421,6 +435,7 @@ def health_check():
     
     return Response(json.dumps({"status": "healthy"}), 
                    mimetype='application/json')
+
 
 if __name__ == '__main__':
     # Initialize the system

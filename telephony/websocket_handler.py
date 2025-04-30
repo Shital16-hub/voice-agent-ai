@@ -45,7 +45,7 @@ NON_SPEECH_PATTERNS = [
     r'\(.*?static.*?\)',        # (static), etc.
     r'\[.*?unclear.*?\]',       # [unclear], etc.
     r'\(.*?inaudible.*?\)',     # (inaudible), etc.
-    r'\<.*?noise.*?\>',         # <noise>, etc.
+    r'<.*?noise.*?>',         # <noise>, etc.
     r'music playing',           # Common transcription
     r'background noise',        # Common transcription
     r'static',                  # Common transcription
@@ -194,12 +194,6 @@ class WebSocketHandler:
     def is_valid_transcription(self, text: str) -> bool:
         """
         Check if a transcription is valid and worth processing.
-        
-        Args:
-            text: Transcription text
-            
-        Returns:
-            True if the transcription is valid
         """
         # Clean up the text first
         cleaned_text = self.cleanup_transcription(text)
@@ -208,28 +202,23 @@ class WebSocketHandler:
         if not cleaned_text:
             logger.info("Transcription contains only non-speech annotations")
             return False
-            
-        # Check if it matches any non-speech patterns
-        if self.non_speech_pattern.search(text):
-            logger.info(f"Transcription contains non-speech patterns: {text}")
-            return False
-            
-        # Estimate confidence based on presence of uncertainty markers
+        
+        # Be more lenient with question marks and punctuation in confidence calculation
         confidence_estimate = 1.0
-        if "?" in text or "[" in text or "(" in text or "<" in text:
-            confidence_estimate = 0.6  # Lower confidence if it contains uncertainty markers
+        if ("[" in text or "(" in text or "<" in text) and not "?" in text:
+            confidence_estimate = 0.7  # Only reduce for annotation markers, not question marks
             logger.info(f"Reduced confidence due to uncertainty markers: {text}")
-            
-        if confidence_estimate < 0.7:
+        
+        if confidence_estimate < 0.65:
             logger.info(f"Transcription confidence too low: {confidence_estimate}")
             return False
-            
+        
         # Check word count
         word_count = len(cleaned_text.split())
         if word_count < self.min_words_for_valid_query:
             logger.info(f"Transcription too short: {word_count} words")
             return False
-            
+        
         return True
     
     async def handle_message(self, message: str, ws) -> None:
@@ -389,13 +378,6 @@ class WebSocketHandler:
             logger.error(f"Error processing media payload: {e}", exc_info=True)
     
     async def _check_for_barge_in(self, audio_data: bytes, ws) -> None:
-        """
-        Check incoming audio for user interruption while agent is speaking.
-        
-        Args:
-            audio_data: Raw audio data from Twilio
-            ws: WebSocket connection
-        """
         try:
             # Convert μ-law to PCM
             pcm_audio = self.audio_processor.mulaw_to_pcm(audio_data)
@@ -403,38 +385,51 @@ class WebSocketHandler:
             # Add to recent audio buffer for detection window
             self.recent_audio_buffer.append(pcm_audio)
             
-            # Limit buffer to detection window size
-            if len(self.recent_audio_buffer) > 5:  # Keep only last 5 chunks (~100ms)
+            # Limit buffer to detection window size - increase from 5 to 8 for better detection
+            if len(self.recent_audio_buffer) > 8:  # Keep last 8 chunks (~160ms) for better accuracy
                 self.recent_audio_buffer.pop(0)
             
-            # Combine recent audio for analysis
-            if len(self.recent_audio_buffer) > 0:
+            # Only attempt barge-in detection if we have enough audio
+            if len(self.recent_audio_buffer) >= 3:  # Require at least 3 chunks (60ms) of audio
                 combined_audio = np.concatenate(self.recent_audio_buffer)
                 
-                # Check for speech in the audio
-                if self._contains_speech(combined_audio, threshold=self.barge_in_threshold):
-                    logger.info("Barge-in detected! User is interrupting.")
+                # Use a higher threshold to avoid false triggers
+                higher_threshold = self.barge_in_threshold * 1.5  # Increase threshold by 50%
+                
+                # Require more consistent speech detection (longer duration)
+                if self._contains_speech(combined_audio, threshold=higher_threshold):
+                    # Check energy level
+                    energy = np.sqrt(np.mean(np.square(combined_audio)))
                     
-                    # Set barge-in flag and trigger cancellation
-                    self.barge_in_detected = True
-                    self.speech_cancellation_event.set()
-                    
-                    # Send a small, empty audio to stop current playback
-                    silence_data = b'\x00' * 160  # 10ms of silence
-                    silent_mulaw = self.audio_processor.pcm_to_mulaw(silence_data)
-                    await self._send_audio(silent_mulaw, ws, is_interrupt=True)
-                    
-                    # Reset agent speaking state
-                    self.is_agent_speaking = False
-                    
-                    # Clear recent audio buffer
-                    self.recent_audio_buffer = []
-                    
-                    # Trigger immediate processing of the interruption
-                    if len(self.input_buffer) > 0:
-                        logger.info("Processing interruption immediately")
-                        await self._process_audio(ws)
-        
+                    # Only trigger barge-in for significantly loud audio
+                    if energy > higher_threshold * 2:
+                        logger.info(f"Barge-in detected! Speech energy: {energy:.4f}")
+                        
+                        # Set barge-in flag and trigger cancellation
+                        self.barge_in_detected = True
+                        self.speech_cancellation_event.set()
+                        
+                        # This adds a delay to avoid rapid back-and-forth interruptions
+                        await asyncio.sleep(0.3)  # 300ms debounce
+                        
+                        # Send silence and process interruption
+                        try:
+                            silence_data = b'\x00' * 160
+                            silent_mulaw = self.audio_processor.pcm_to_mulaw(silence_data)
+                            await self._send_audio(silent_mulaw, ws, is_interrupt=True)
+                            
+                            # Reset agent speaking state
+                            self.is_agent_speaking = False
+                            
+                            # Clear recent audio buffer
+                            self.recent_audio_buffer = []
+                            
+                            # Only process interruption if we have enough audio
+                            if len(self.input_buffer) > 2000:  # Require more audio (2000 bytes)
+                                logger.info("Processing interruption immediately")
+                                await self._process_audio(ws)
+                        except Exception as barge_in_error:
+                            logger.error(f"Error handling barge-in: {barge_in_error}")
         except Exception as e:
             logger.error(f"Error checking for barge-in: {e}", exc_info=True)
     
@@ -644,19 +639,43 @@ class WebSocketHandler:
                             
                             # Convert to speech
                             if response and hasattr(self.pipeline, 'tts_integration'):
-                                # Set agent speaking state before sending audio
-                                self.is_agent_speaking = True
-                                self.barge_in_detected = False
-                                self.speech_cancellation_event.clear()
-                                
-                                speech_audio = await self.pipeline.tts_integration.text_to_speech(response)
-                                
-                                # Convert to mulaw for Twilio
-                                mulaw_audio = self.audio_processor.pcm_to_mulaw(speech_audio)
-                                
-                                # Send back to Twilio
-                                logger.info(f"Sending audio response ({len(mulaw_audio)} bytes)")
-                                await self._send_audio(mulaw_audio, ws)
+                                try:
+                                    # Set agent speaking state before sending audio
+                                    self.is_agent_speaking = True
+                                    self.barge_in_detected = False
+                                    self.speech_cancellation_event.clear()
+                                    
+                                    speech_audio = await self.pipeline.tts_integration.text_to_speech(response)
+                                    
+                                    # Convert to mulaw for Twilio
+                                    mulaw_audio = self.audio_processor.pcm_to_mulaw(speech_audio)
+                                    
+                                    # Send back to Twilio
+                                    logger.info(f"Sending audio response ({len(mulaw_audio)} bytes)")
+                                    await self._send_audio(mulaw_audio, ws)
+                                    
+                                except Exception as tts_error:
+                                    logger.error(f"TTS Error: {tts_error}. Sending fallback response.", exc_info=True)
+                                    
+                                    # Try to send a text-based fallback response
+                                    fallback_message = "I'm having trouble generating speech at the moment. Let me try again in a moment."
+                                    
+                                    try:
+                                        # Try to use a simple SSML template that works with all voices
+                                        simple_audio = await self.pipeline.tts_integration.tts_client.synthesize(
+                                            "<speak>" + fallback_message + "</speak>", 
+                                            is_ssml=True
+                                        )
+                                        fallback_mulaw = self.audio_processor.pcm_to_mulaw(simple_audio)
+                                        await self._send_audio(fallback_mulaw, ws)
+                                    except Exception as fallback_error:
+                                        logger.error(f"Failed to generate fallback response: {fallback_error}")
+                                        
+                                        # Use a pre-recorded or simple beep as last resort
+                                        silence_duration = 0.5  # seconds
+                                        silence_size = int(8000 * silence_duration)
+                                        fallback_audio = b'\x7f' * silence_size  # Simple beep
+                                        await self._send_audio(fallback_audio, ws)
                                 
                                 # Reset agent speaking state
                                 self.is_agent_speaking = False
@@ -670,7 +689,11 @@ class WebSocketHandler:
                         # Try to send a fallback response
                         fallback_message = "I'm sorry, I'm having trouble understanding. Could you try again?"
                         try:
-                            fallback_audio = await self.pipeline.tts_integration.text_to_speech(fallback_message)
+                            # Use simple SSML template
+                            fallback_audio = await self.pipeline.tts_integration.tts_client.synthesize(
+                                "<speak>" + fallback_message + "</speak>",
+                                is_ssml=True
+                            )
                             mulaw_fallback = self.audio_processor.pcm_to_mulaw(fallback_audio)
                             await self._send_audio(mulaw_fallback, ws)
                             self.last_response_time = time.time()
@@ -756,6 +779,11 @@ class WebSocketHandler:
             # Ensure the audio data is valid
             if not audio_data or len(audio_data) == 0:
                 logger.warning("Attempted to send empty audio data")
+                return
+                
+            # Skip very small chunks unless they're for interruption
+            if len(audio_data) < 320 and not is_interrupt:
+                logger.debug(f"Skipping very small audio chunk: {len(audio_data)} bytes")
                 return
                 
             # Check connection status

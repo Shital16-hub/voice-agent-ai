@@ -305,33 +305,17 @@ class GoogleCloudTTS:
     
     def _synthesize_sync(self, text: str, is_ssml: bool) -> bytes:
         """
-        Synchronous method to synthesize speech using Google Cloud TTS,
-        optimized for telephony transmission.
-        
-        Args:
-            text: Text to synthesize
-            is_ssml: Whether the text is SSML
-            
-        Returns:
-            Audio data as bytes
+        Synchronous method to synthesize speech using Google Cloud TTS.
         """
         try:
             # Create the synthesis input
             synthesis_input = texttospeech.SynthesisInput()
+            
+            # Set text or SSML based on the is_ssml flag
             if is_ssml:
-                # Ensure proper SSML format
-                if not text.startswith('<speak>'):
-                    text = f"<speak>{text}</speak>"
                 synthesis_input.ssml = text
             else:
-                # Use telephony-optimized SSML if enabled
-                if getattr(config, 'enable_telephony_optimization', True):
-                    template = getattr(config, 'telephony_ssml_template', 
-                                     '<speak><prosody rate="{rate}"><emphasis level="moderate">{text}</emphasis></prosody></speak>')
-                    synthesis_input.ssml = template.format(rate=config.ssml_rate, text=text)
-                else:
-                    # Standard SSML with rate
-                    synthesis_input.ssml = f'<speak><prosody rate="{config.ssml_rate}">{text}</prosody></speak>'
+                synthesis_input.text = text
             
             # Configure voice
             voice_params = self._get_voice_params()
@@ -339,15 +323,11 @@ class GoogleCloudTTS:
             
             # Configure audio specifically for telephony
             audio_config_params = self._get_audio_config()
-            
-            # Force sample rate to 8kHz for better telephony compatibility
-            audio_config_params["sample_rate_hertz"] = 8000
-            
+            audio_config_params["sample_rate_hertz"] = 8000  # Force 8kHz for telephony
             audio_config = texttospeech.AudioConfig(**audio_config_params)
             
             # Log synthesis parameters
-            logger.debug(f"Synthesizing speech with: voice={self.voice_name}, "
-                        f"rate={config.ssml_rate}, sample_rate=8000Hz")
+            logger.debug(f"Synthesizing speech with: voice={self.voice_name}, text={text[:50]}...")
             
             # Perform synthesis
             response = self.client.synthesize_speech(
@@ -419,4 +399,8 @@ class GoogleCloudTTS:
         Returns:
             Audio data as bytes
         """
+        # Ensure proper SSML format
+        if not ssml.startswith('<speak>'):
+            ssml = f"<speak>{ssml}</speak>"
+            
         return await self.synthesize(ssml, is_ssml=True)
