@@ -1,5 +1,5 @@
 """
-WebSocket handler for Twilio media streams with Deepgram STT integration.
+WebSocket handler for Twilio media streams with interruption support (barge-in).
 """
 import json
 import base64
@@ -8,11 +8,12 @@ import logging
 import time
 import numpy as np
 import re
-from typing import Dict, Any, Callable, Awaitable, Optional, List
+from typing import Dict, Any, Callable, Awaitable, Optional, List, Union
 from scipy import signal
 
 from telephony.audio_processor import AudioProcessor
 from telephony.config import CHUNK_SIZE, AUDIO_BUFFER_SIZE, SILENCE_THRESHOLD, SILENCE_DURATION, MAX_BUFFER_SIZE
+from telephony.config import ENABLE_BARGE_IN, BARGE_IN_THRESHOLD, BARGE_IN_DETECTION_WINDOW
 
 # Import Deepgram STT
 from speech_to_text.deepgram_stt import DeepgramStreamingSTT, StreamingTranscriptionResult
@@ -52,7 +53,7 @@ NON_SPEECH_PATTERNS = [
 
 class WebSocketHandler:
     """
-    Handles WebSocket connections for Twilio media streams with Deepgram STT integration.
+    Handles WebSocket connections for Twilio media streams with barge-in support.
     """
     
     def __init__(self, call_sid: str, pipeline):
@@ -114,7 +115,21 @@ class WebSocketHandler:
         # Ensure we start with a fresh deepgram session state
         self.deepgram_session_active = False
         
+        # Barge-in support
+        self.is_agent_speaking = False
+        self.can_be_interrupted = ENABLE_BARGE_IN
+        self.barge_in_detected = False
+        self.barge_in_detection_window = BARGE_IN_DETECTION_WINDOW  # ms
+        self.barge_in_threshold = BARGE_IN_THRESHOLD
+        self.speech_cancellation_event = asyncio.Event()
+        self.speech_cancellation_event.clear()
+        
+        # Maintain recent audio buffer for interruption detection
+        self.recent_audio_buffer = []
+        self.recent_audio_buffer_size = int(self.barge_in_detection_window * 16)  # samples at 16kHz
+        
         logger.info(f"WebSocketHandler initialized for call {call_sid} with {'Deepgram' if self.using_deepgram else 'Whisper'} STT")
+        logger.info(f"Barge-in functionality {'enabled' if self.can_be_interrupted else 'disabled'}")
     
     def _update_ambient_noise_level(self, audio_data: np.ndarray) -> None:
         """
@@ -290,6 +305,9 @@ class WebSocketHandler:
         self.output_buffer.clear()
         self.is_speaking = False
         self.is_processing = False
+        self.is_agent_speaking = False
+        self.barge_in_detected = False
+        self.speech_cancellation_event.clear()
         self.silence_start_time = None
         self.last_transcription = ""
         self.last_response_time = time.time()
@@ -297,6 +315,7 @@ class WebSocketHandler:
         self.stop_event.clear()
         self.noise_samples = []  # Reset noise samples
         self.deepgram_session_active = False  # Reset Deepgram session state
+        self.recent_audio_buffer = []  # Reset audio buffer for barge-in detection
         
         # Send a welcome message
         await self.send_text_response("I'm listening. How can I help you today?", ws)
@@ -313,7 +332,7 @@ class WebSocketHandler:
     
     async def _handle_media(self, data: Dict[str, Any], ws) -> None:
         """
-        Handle media event with audio data.
+        Handle media event with audio data and support for barge-in.
         
         Args:
             data: Media event data
@@ -336,6 +355,10 @@ class WebSocketHandler:
             
             # Add to input buffer
             self.input_buffer.extend(audio_data)
+            
+            # Check for barge-in if agent is speaking
+            if self.is_agent_speaking and self.can_be_interrupted:
+                await self._check_for_barge_in(audio_data, ws)
             
             # Limit buffer size to prevent memory issues
             if len(self.input_buffer) > MAX_BUFFER_SIZE:
@@ -365,6 +388,56 @@ class WebSocketHandler:
         except Exception as e:
             logger.error(f"Error processing media payload: {e}", exc_info=True)
     
+    async def _check_for_barge_in(self, audio_data: bytes, ws) -> None:
+        """
+        Check incoming audio for user interruption while agent is speaking.
+        
+        Args:
+            audio_data: Raw audio data from Twilio
+            ws: WebSocket connection
+        """
+        try:
+            # Convert μ-law to PCM
+            pcm_audio = self.audio_processor.mulaw_to_pcm(audio_data)
+            
+            # Add to recent audio buffer for detection window
+            self.recent_audio_buffer.append(pcm_audio)
+            
+            # Limit buffer to detection window size
+            if len(self.recent_audio_buffer) > 5:  # Keep only last 5 chunks (~100ms)
+                self.recent_audio_buffer.pop(0)
+            
+            # Combine recent audio for analysis
+            if len(self.recent_audio_buffer) > 0:
+                combined_audio = np.concatenate(self.recent_audio_buffer)
+                
+                # Check for speech in the audio
+                if self._contains_speech(combined_audio, threshold=self.barge_in_threshold):
+                    logger.info("Barge-in detected! User is interrupting.")
+                    
+                    # Set barge-in flag and trigger cancellation
+                    self.barge_in_detected = True
+                    self.speech_cancellation_event.set()
+                    
+                    # Send a small, empty audio to stop current playback
+                    silence_data = b'\x00' * 160  # 10ms of silence
+                    silent_mulaw = self.audio_processor.pcm_to_mulaw(silence_data)
+                    await self._send_audio(silent_mulaw, ws, is_interrupt=True)
+                    
+                    # Reset agent speaking state
+                    self.is_agent_speaking = False
+                    
+                    # Clear recent audio buffer
+                    self.recent_audio_buffer = []
+                    
+                    # Trigger immediate processing of the interruption
+                    if len(self.input_buffer) > 0:
+                        logger.info("Processing interruption immediately")
+                        await self._process_audio(ws)
+        
+        except Exception as e:
+            logger.error(f"Error checking for barge-in: {e}", exc_info=True)
+    
     async def _handle_stop(self, data: Dict[str, Any]) -> None:
         """
         Handle stream stop event.
@@ -377,6 +450,7 @@ class WebSocketHandler:
         self.connected = False
         self.connection_active.clear()
         self.stop_event.set()
+        self.speech_cancellation_event.set()  # Cancel any ongoing speech
         
         # Cancel keep-alive task
         if self.keep_alive_task:
@@ -570,6 +644,11 @@ class WebSocketHandler:
                             
                             # Convert to speech
                             if response and hasattr(self.pipeline, 'tts_integration'):
+                                # Set agent speaking state before sending audio
+                                self.is_agent_speaking = True
+                                self.barge_in_detected = False
+                                self.speech_cancellation_event.clear()
+                                
                                 speech_audio = await self.pipeline.tts_integration.text_to_speech(response)
                                 
                                 # Convert to mulaw for Twilio
@@ -578,6 +657,9 @@ class WebSocketHandler:
                                 # Send back to Twilio
                                 logger.info(f"Sending audio response ({len(mulaw_audio)} bytes)")
                                 await self._send_audio(mulaw_audio, ws)
+                                
+                                # Reset agent speaking state
+                                self.is_agent_speaking = False
                                 
                                 # Update state
                                 self.last_transcription = transcription
@@ -620,18 +702,22 @@ class WebSocketHandler:
         except Exception as e:
             logger.error(f"Error processing audio: {e}", exc_info=True)
     
-    def _contains_speech(self, audio_data: np.ndarray) -> bool:
+    def _contains_speech(self, audio_data: np.ndarray, threshold: float = None) -> bool:
         """
         Enhanced speech detection with better noise filtering.
         
         Args:
             audio_data: Audio data as numpy array
+            threshold: Custom threshold (defaults to instance threshold)
             
         Returns:
             True if audio contains potential speech
         """
         if len(audio_data) < 100:
             return False
+        
+        # Use provided threshold or instance default
+        detection_threshold = threshold if threshold is not None else (self.ambient_noise_level * 3.0)
             
         # Calculate RMS energy
         energy = np.sqrt(np.mean(np.square(audio_data)))
@@ -644,29 +730,27 @@ class WebSocketHandler:
         freqs = np.fft.rfftfreq(len(audio_data), 1/16000)
         spectral_centroid = np.sum(freqs * fft_data) / (np.sum(fft_data) + 1e-10)
         
-        # Get threshold based on ambient noise
-        speech_threshold = max(0.01, self.ambient_noise_level * 2.5)
-        
         # Log values for debugging
-        logger.debug(f"Audio energy: {energy:.6f} (threshold: {speech_threshold:.6f}), "
+        logger.debug(f"Audio energy: {energy:.6f} (threshold: {detection_threshold:.6f}), "
                     f"zero crossings: {zero_crossings:.6f}, "
                     f"spectral centroid: {spectral_centroid:.2f}Hz")
         
         # Combined speech detection logic
-        is_speech = (energy > speech_threshold) and \
+        is_speech = (energy > detection_threshold) and \
                    (zero_crossings > 0.01) and \
                    (zero_crossings < 0.15) and \
                    (spectral_centroid > 500)  # Speech typically > 500Hz
         
         return is_speech
     
-    async def _send_audio(self, audio_data: bytes, ws) -> None:
+    async def _send_audio(self, audio_data: bytes, ws, is_interrupt: bool = False) -> None:
         """
-        Send audio data to Twilio with enhanced telephony optimization.
+        Send audio data to Twilio with barge-in support.
         
         Args:
             audio_data: Audio data as bytes
             ws: WebSocket connection
+            is_interrupt: Whether this is a barge-in interruption
         """
         try:
             # Ensure the audio data is valid
@@ -679,24 +763,30 @@ class WebSocketHandler:
                 logger.warning("WebSocket connection is closed, cannot send audio")
                 return
             
-            # Get audio info
-            audio_info = self.audio_processor.get_audio_info(audio_data)
-            logger.debug(f"Preparing to send audio: {audio_info}")
-            
-            # Apply telephony optimization if not already μ-law
-            if audio_info.get("format") != "mulaw":
-                logger.debug("Optimizing audio for telephony")
-                optimized_audio = self.audio_processor.optimize_for_telephony(audio_data)
-            else:
-                optimized_audio = audio_data
+            # Get audio info for debugging
+            if not is_interrupt:
+                audio_info = self.audio_processor.get_audio_info(audio_data)
+                logger.debug(f"Sending audio: format={audio_info.get('format', 'unknown')}, size={len(audio_data)} bytes")
             
             # Split audio into smaller chunks to avoid timeouts
             chunk_size = 320  # 20ms of 8kHz μ-law mono audio
-            chunks = [optimized_audio[i:i+chunk_size] for i in range(0, len(optimized_audio), chunk_size)]
+            chunks = [audio_data[i:i+chunk_size] for i in range(0, len(audio_data), chunk_size)]
             
-            logger.debug(f"Splitting {len(optimized_audio)} bytes into {len(chunks)} chunks")
+            logger.debug(f"Splitting {len(audio_data)} bytes into {len(chunks)} chunks")
+            
+            # Set agent speaking flag if this isn't an interrupt signal
+            if not is_interrupt:
+                self.is_agent_speaking = True
             
             for i, chunk in enumerate(chunks):
+                # Check if we should cancel speech (barge-in detected)
+                if self.barge_in_detected or self.speech_cancellation_event.is_set():
+                    logger.info(f"Cancelling speech output at chunk {i}/{len(chunks)} due to barge-in")
+                    # Only send a few more chunks to avoid abrupt cutoff
+                    if i > 5:  # We've sent enough to avoid an abrupt stop
+                        break
+                    # Otherwise, continue with a few more chunks for a smoother transition
+                
                 try:
                     # Encode audio to base64
                     audio_base64 = base64.b64encode(chunk).decode('utf-8')
@@ -713,9 +803,10 @@ class WebSocketHandler:
                     # Send message
                     ws.send(json.dumps(message))
                     
-                    # Add a small delay between chunks to prevent flooding
-                    if i < len(chunks) - 1:
-                        await asyncio.sleep(0.01)  # 10ms delay between chunks
+                    # Add a small delay between chunks to prevent flooding and allow
+                    # for barge-in detection during speech
+                    if i < len(chunks) - 1 and i % 5 == 0:  # Every 5 chunks (~100ms)
+                        await asyncio.sleep(0.01)  # 10ms delay 
                     
                 except Exception as e:
                     if "Connection closed" in str(e):
@@ -727,7 +818,11 @@ class WebSocketHandler:
                         logger.error(f"Error sending audio chunk {i+1}/{len(chunks)}: {e}")
                         return
             
-            logger.debug(f"Sent {len(chunks)} audio chunks ({len(optimized_audio)} bytes total)")
+            logger.debug(f"Sent {len(chunks)} audio chunks ({len(audio_data)} bytes total)")
+            
+            # Reset speaking flag after sending all chunks
+            if not is_interrupt:
+                self.is_agent_speaking = False
             
         except Exception as e:
             logger.error(f"Error sending audio: {e}", exc_info=True)
@@ -746,6 +841,11 @@ class WebSocketHandler:
         try:
             # Convert text to speech
             if hasattr(self.pipeline, 'tts_integration'):
+                # Set agent speaking state
+                self.is_agent_speaking = True
+                self.barge_in_detected = False
+                self.speech_cancellation_event.clear()
+                
                 speech_audio = await self.pipeline.tts_integration.text_to_speech(text)
                 
                 # Convert to mulaw
@@ -754,6 +854,9 @@ class WebSocketHandler:
                 # Send audio
                 await self._send_audio(mulaw_audio, ws)
                 logger.info(f"Sent text response: '{text}'")
+                
+                # Reset agent speaking state
+                self.is_agent_speaking = False
                 
                 # Update last response time to add pause
                 self.last_response_time = time.time()

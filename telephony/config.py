@@ -45,6 +45,12 @@ HIGH_PASS_FILTER = 80       # High-pass filter cutoff frequency in Hz
 NOISE_GATE_THRESHOLD = 0.015  # Noise gate threshold
 ENABLE_NOISE_FILTERING = True  # Enable enhanced noise filtering
 
+# Barge-in Settings
+ENABLE_BARGE_IN = True                  # Enable barge-in functionality
+BARGE_IN_THRESHOLD = 0.02               # Energy threshold for detecting barge-in
+BARGE_IN_DETECTION_WINDOW = 100         # Window size in ms for barge-in detection
+BARGE_IN_MIN_SPEECH_DURATION = 200      # Minimum speech duration in ms to trigger barge-in
+
 # Logging Configuration
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
