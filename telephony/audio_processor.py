@@ -1,11 +1,13 @@
 """
-Enhanced audio processing utilities for telephony integration with Deepgram STT.
+Enhanced audio processing utilities for telephony integration with Google Cloud TTS.
 
 Handles audio format conversion between Twilio and Voice AI Agent.
 """
 import audioop
 import numpy as np
 import logging
+import io
+import wave
 from typing import Tuple, Dict, Any
 from scipy import signal
 
@@ -15,8 +17,8 @@ logger = logging.getLogger(__name__)
 
 class AudioProcessor:
     """
-    Handles audio conversion between Twilio and Voice AI formats with improved noise handling.
-    Optimized for Deepgram STT integration.
+    Handles audio conversion between Twilio and Voice AI formats with improved telephony performance.
+    Optimized for Google Cloud TTS integration.
     
     Twilio uses 8kHz mulaw encoding, while our Voice AI uses 16kHz PCM.
     """
@@ -25,7 +27,6 @@ class AudioProcessor:
     def mulaw_to_pcm(mulaw_data: bytes) -> np.ndarray:
         """
         Convert Twilio's mulaw audio to PCM for Voice AI with enhanced noise filtering.
-        Optimized for Deepgram STT processing.
         
         Args:
             mulaw_data: Audio data in mulaw format
@@ -91,40 +92,81 @@ class AudioProcessor:
             return np.array([], dtype=np.float32)
     
     @staticmethod
-    def pcm_to_mulaw(pcm_data: bytes) -> bytes:
+    def pcm_to_mulaw(pcm_data: bytes, source_sample_rate: int = None) -> bytes:
         """
-        Convert PCM audio from Voice AI to mulaw for Twilio.
+        Convert PCM audio from Google Cloud TTS to mulaw for Twilio with enhanced quality.
         
         Args:
             pcm_data: Audio data in PCM format
+            source_sample_rate: Sample rate of the source PCM data (None to auto-detect)
             
         Returns:
-            Audio data in mulaw format
+            Audio data in mulaw format optimized for telephony
         """
         try:
-            # Check if the data length is a multiple of 2 (for 16-bit samples)
+            # Try to detect input format and parameters
+            detected_sample_rate = source_sample_rate or SAMPLE_RATE_AI
+            
+            # If it looks like a WAV file, extract data from it
+            if pcm_data[:4] == b'RIFF' and pcm_data[8:12] == b'WAVE':
+                # Parse WAV header to get sample rate and extract raw PCM
+                with io.BytesIO(pcm_data) as wav_io:
+                    with wave.open(wav_io, 'rb') as wav_file:
+                        detected_sample_rate = wav_file.getframerate()
+                        n_channels = wav_file.getnchannels()
+                        sample_width = wav_file.getsampwidth()
+                        pcm_data = wav_file.readframes(wav_file.getnframes())
+                        logger.debug(f"Detected WAV: {detected_sample_rate}Hz, {n_channels} channels, {sample_width} bytes/sample")
+            
+            # Ensure we have an even number of bytes for 16-bit samples
             if len(pcm_data) % 2 != 0:
-                # Pad with a zero byte to make it even
                 pcm_data = pcm_data + b'\x00'
                 logger.debug("Padded audio data to make even length")
             
-            # Resample from 16kHz to 8kHz
-            pcm_data_8k, _ = audioop.ratecv(
-                pcm_data, 2, 1, 
-                SAMPLE_RATE_AI, 
-                SAMPLE_RATE_TWILIO, 
-                None
-            )
+            # Amplify the signal a bit to ensure good volume over the phone
+            try:
+                pcm_data = audioop.mul(pcm_data, 2, 1.2)  # Amplify by 20%
+            except Exception as amp_error:
+                logger.warning(f"Could not amplify audio: {amp_error}")
             
-            # Convert to mulaw
+            # Apply a slight compression to improve clarity over telephony
+            try:
+                # Compression: reduce dynamic range to make quieter sounds more audible
+                pcm_data = audioop.compress(pcm_data, 2, 5, 2)  # parameters: fragment size=2, threshold=5, ratio=2:1
+            except Exception as comp_error:
+                logger.warning(f"Could not compress audio: {comp_error}")
+            
+            # Optimize frequency response for telephony
+            # This can be done in numpy, but would require converting back and forth
+            # Instead, we use the resampling step to handle this
+            
+            # Resample from detected rate to 8kHz for Twilio (this also acts as a low-pass filter)
+            if detected_sample_rate != SAMPLE_RATE_TWILIO:
+                try:
+                    pcm_data_8k, _ = audioop.ratecv(
+                        pcm_data, 2, 1, 
+                        detected_sample_rate, 
+                        SAMPLE_RATE_TWILIO, 
+                        None
+                    )
+                    logger.debug(f"Resampled audio from {detected_sample_rate}Hz to {SAMPLE_RATE_TWILIO}Hz")
+                except Exception as resample_error:
+                    logger.error(f"Error resampling audio: {resample_error}")
+                    pcm_data_8k = pcm_data  # Use original as fallback
+            else:
+                pcm_data_8k = pcm_data
+            
+            # Convert to mulaw - this gives us the 8-bit encoding Twilio expects
             mulaw_data = audioop.lin2ulaw(pcm_data_8k, 2)
             
-            logger.debug(f"Converted {len(pcm_data)} bytes of PCM to {len(mulaw_data)} bytes of mulaw")
+            # Log the conversion details
+            compression_ratio = len(pcm_data) / len(mulaw_data) if len(mulaw_data) > 0 else 0
+            logger.info(f"Converted {len(pcm_data)} bytes of PCM to {len(mulaw_data)} bytes of mulaw (ratio: {compression_ratio:.1f}x)")
             
             return mulaw_data
             
         except Exception as e:
-            logger.error(f"Error converting PCM to mulaw: {e}")
+            logger.error(f"Error converting PCM to mulaw: {e}", exc_info=True)
             # Return empty data rather than raising an exception
             return b''
     
@@ -148,7 +190,6 @@ class AudioProcessor:
     def enhance_audio(audio_data: np.ndarray) -> np.ndarray:
         """
         Enhance audio quality by reducing noise and improving speech clarity.
-        Optimized for Deepgram STT processing.
         
         Args:
             audio_data: Audio data as numpy array
@@ -270,6 +311,18 @@ class AudioProcessor:
             # Check first few bytes for common patterns
             if audio_data[:4] == b'RIFF':
                 info["format"] = "wav"
+                
+                # Try to get more WAV info
+                try:
+                    with io.BytesIO(audio_data) as f:
+                        with wave.open(f, 'rb') as wav:
+                            info["channels"] = wav.getnchannels()
+                            info["sample_width"] = wav.getsampwidth()
+                            info["frame_rate"] = wav.getframerate()
+                            info["n_frames"] = wav.getnframes()
+                            info["duration"] = wav.getnframes() / wav.getframerate()
+                except Exception as e:
+                    logger.warning(f"Error extracting WAV info: {e}")
             else:
                 # Rough guess based on values
                 sample_values = np.frombuffer(audio_data[:100], dtype=np.uint8)
@@ -320,3 +373,61 @@ class AudioProcessor:
         except Exception as e:
             logger.error(f"Error converting PCM16 to float32: {e}")
             return np.array([], dtype=np.float32)
+    
+    @staticmethod
+    def optimize_for_telephony(audio_data: bytes) -> bytes:
+        """
+        Optimize audio specifically for telephony transmission.
+        This ensures the best possible audio quality over phone lines.
+        
+        Args:
+            audio_data: Audio data as bytes (WAV or raw PCM)
+            
+        Returns:
+            Optimized audio data
+        """
+        try:
+            # Determine if WAV or raw PCM
+            is_wav = audio_data[:4] == b'RIFF' and audio_data[8:12] == b'WAVE'
+            
+            if is_wav:
+                # Extract PCM data and parameters from WAV
+                with io.BytesIO(audio_data) as wav_io:
+                    with wave.open(wav_io, 'rb') as wav_in:
+                        sample_rate = wav_in.getframerate()
+                        channels = wav_in.getnchannels()
+                        width = wav_in.getsampwidth()
+                        pcm_data = wav_in.readframes(wav_in.getnframes())
+            else:
+                # Assume 16-bit PCM at SAMPLE_RATE_AI
+                pcm_data = audio_data
+                sample_rate = SAMPLE_RATE_AI
+                channels = 1
+                width = 2
+                
+            # Multi-stage processing for telephony optimization
+            
+            # 1. Convert to mono if stereo
+            if channels > 1:
+                pcm_data = audioop.tomono(pcm_data, width, 0.5, 0.5)
+            
+            # 2. Increase volume slightly for better clarity over phone
+            pcm_data = audioop.mul(pcm_data, width, 1.3)
+            
+            # 3. Apply dynamic range compression
+            pcm_data = audioop.compress(pcm_data, width, 6, 2)
+            
+            # 4. Resample to 8 kHz (telephone quality)
+            if sample_rate != SAMPLE_RATE_TWILIO:
+                pcm_data, _ = audioop.ratecv(pcm_data, width, 1, sample_rate, SAMPLE_RATE_TWILIO, None)
+            
+            # 5. Convert to μ-law for Twilio
+            mulaw_data = audioop.lin2ulaw(pcm_data, width)
+            
+            # Return μ-law encoded data ready for telephony
+            return mulaw_data
+            
+        except Exception as e:
+            logger.error(f"Error optimizing audio for telephony: {e}", exc_info=True)
+            # Return original data if optimization fails
+            return audio_data

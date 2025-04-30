@@ -20,12 +20,12 @@ class TTSConfig(BaseSettings):
     
     # TTS settings
     voice_name: str = Field(
-        default="en-US-Neural2-F",
+        default="en-US-Polyglot-1",
         description="Google TTS voice name to use"
     )
     
     voice_gender: str = Field(
-        default="FEMALE",
+        default="MALE",
         description="Voice gender (MALE/FEMALE/NEUTRAL)"
     )
     
@@ -34,9 +34,10 @@ class TTSConfig(BaseSettings):
         description="Language code for TTS"
     )
     
+    # Telephony-optimized settings
     sample_rate: int = Field(
-        default=24000,
-        description="Audio sample rate in Hz"
+        default=8000,  # Changed to 8kHz for telephony
+        description="Audio sample rate in Hz - 8kHz is best for telephony"
     )
     
     audio_encoding: str = Field(
@@ -47,6 +48,34 @@ class TTSConfig(BaseSettings):
     audio_profile: str = Field(
         default="telephony-class-application",
         description="Audio profile for optimization"
+    )
+    
+    # Voice quality settings
+    speaking_rate: float = Field(
+        default=1.1,  # Slightly faster than normal, but not too fast
+        description="Speaking rate in API (1.0 is normal, >1.0 is faster)"
+    )
+    
+    pitch: float = Field(
+        default=0.0,
+        description="Pitch adjustment in semitones (0.0 is normal)"
+    )
+    
+    # SSML settings for extra control
+    ssml_rate: str = Field(
+        default="1.1",  # Slightly faster than normal
+        description="SSML speaking rate value (can be numeric like '1.1' or text like 'medium')"
+    )
+    
+    ssml_pitch: str = Field(
+        default="0",
+        description="SSML pitch adjustment in semitones (e.g. '0', '+2', '-1')"
+    )
+    
+    # Explicitly enable SSML by default
+    use_ssml: bool = Field(
+        default=True,
+        description="Whether to use SSML for all TTS requests"
     )
     
     # Streaming settings
@@ -76,16 +105,21 @@ class TTSConfig(BaseSettings):
         description="Directory for caching TTS results"
     )
     
-    # SSML settings
-    enable_ssml: bool = Field(
-        default=True,
-        description="Enable SSML support"
-    )
-    
     # Fallback settings
     fallback_message: str = Field(
         default="I'm sorry, I'm having trouble generating speech at the moment.",
         description="Fallback message when TTS fails"
+    )
+    
+    # SSML telephony optimizations
+    enable_telephony_optimization: bool = Field(
+        default=True,
+        description="Enable SSML optimizations for telephony"
+    )
+    
+    telephony_ssml_template: str = Field(
+        default='<speak><prosody rate="{rate}"><emphasis level="moderate">{text}</emphasis></prosody></speak>',
+        description="SSML template for telephony optimization"
     )
     
     class Config:

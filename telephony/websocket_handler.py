@@ -662,7 +662,7 @@ class WebSocketHandler:
     
     async def _send_audio(self, audio_data: bytes, ws) -> None:
         """
-        Send audio data to Twilio.
+        Send audio data to Twilio with enhanced telephony optimization.
         
         Args:
             audio_data: Audio data as bytes
@@ -679,11 +679,22 @@ class WebSocketHandler:
                 logger.warning("WebSocket connection is closed, cannot send audio")
                 return
             
-            # Split audio into smaller chunks to avoid timeouts
-            chunk_size = 4000  # Smaller chunks (250ms of audio at 8kHz mono)
-            chunks = [audio_data[i:i+chunk_size] for i in range(0, len(audio_data), chunk_size)]
+            # Get audio info
+            audio_info = self.audio_processor.get_audio_info(audio_data)
+            logger.debug(f"Preparing to send audio: {audio_info}")
             
-            logger.debug(f"Splitting {len(audio_data)} bytes into {len(chunks)} chunks")
+            # Apply telephony optimization if not already μ-law
+            if audio_info.get("format") != "mulaw":
+                logger.debug("Optimizing audio for telephony")
+                optimized_audio = self.audio_processor.optimize_for_telephony(audio_data)
+            else:
+                optimized_audio = audio_data
+            
+            # Split audio into smaller chunks to avoid timeouts
+            chunk_size = 320  # 20ms of 8kHz μ-law mono audio
+            chunks = [optimized_audio[i:i+chunk_size] for i in range(0, len(optimized_audio), chunk_size)]
+            
+            logger.debug(f"Splitting {len(optimized_audio)} bytes into {len(chunks)} chunks")
             
             for i, chunk in enumerate(chunks):
                 try:
@@ -704,7 +715,7 @@ class WebSocketHandler:
                     
                     # Add a small delay between chunks to prevent flooding
                     if i < len(chunks) - 1:
-                        await asyncio.sleep(0.02)  # 20ms delay between chunks
+                        await asyncio.sleep(0.01)  # 10ms delay between chunks
                     
                 except Exception as e:
                     if "Connection closed" in str(e):
@@ -716,7 +727,7 @@ class WebSocketHandler:
                         logger.error(f"Error sending audio chunk {i+1}/{len(chunks)}: {e}")
                         return
             
-            logger.debug(f"Sent {len(chunks)} audio chunks ({len(audio_data)} bytes total)")
+            logger.debug(f"Sent {len(chunks)} audio chunks ({len(optimized_audio)} bytes total)")
             
         except Exception as e:
             logger.error(f"Error sending audio: {e}", exc_info=True)
