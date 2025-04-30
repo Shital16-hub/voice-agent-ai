@@ -1,5 +1,5 @@
 """
-WebSocket handler for Twilio media streams with interruption support (barge-in).
+WebSocket handler for Twilio media streams with improved speech/noise discrimination and barge-in detection.
 """
 import json
 import base64
@@ -10,6 +10,7 @@ import numpy as np
 import re
 from typing import Dict, Any, Callable, Awaitable, Optional, List, Union
 from scipy import signal
+from collections import deque
 
 from telephony.audio_processor import AudioProcessor
 from telephony.config import CHUNK_SIZE, AUDIO_BUFFER_SIZE, SILENCE_THRESHOLD, SILENCE_DURATION, MAX_BUFFER_SIZE
@@ -51,9 +52,17 @@ NON_SPEECH_PATTERNS = [
     r'static',                  # Common transcription
 ]
 
+# Speech state enum for state machine
+class SpeechState:
+    """Speech state for detection state machine"""
+    SILENCE = 0
+    POTENTIAL_SPEECH = 1
+    CONFIRMED_SPEECH = 2
+    SPEECH_ENDED = 3
+
 class WebSocketHandler:
     """
-    Handles WebSocket connections for Twilio media streams with barge-in support.
+    Handles WebSocket connections for Twilio media streams with enhanced speech/noise discrimination.
     """
     
     def __init__(self, call_sid: str, pipeline):
@@ -101,10 +110,14 @@ class WebSocketHandler:
         # Create an event to signal when we should stop processing
         self.stop_event = asyncio.Event()
         
-        # Add ambient noise tracking for adaptive thresholds
+        # Enhanced adaptive noise tracking for better speech/noise discrimination
         self.ambient_noise_level = 0.01  # Starting threshold
         self.noise_samples = []
-        self.max_noise_samples = 20
+        self.max_noise_samples = 30  # Increased from 20 for better statistics
+        self.noise_floor_multiplier = 2.5  # Multiplier for noise floor to set low threshold
+        
+        # Speech frequency band energies for better detection
+        self.speech_band_energies = deque(maxlen=20)
         
         # Determine if we're using Deepgram STT
         self.using_deepgram = (
@@ -115,25 +128,32 @@ class WebSocketHandler:
         # Ensure we start with a fresh deepgram session state
         self.deepgram_session_active = False
         
-        # Barge-in support
+        # Enhanced barge-in detection with state machine
         self.is_agent_speaking = False
         self.can_be_interrupted = ENABLE_BARGE_IN
         self.barge_in_detected = False
-        self.barge_in_detection_window = BARGE_IN_DETECTION_WINDOW  # ms
-        self.barge_in_threshold = BARGE_IN_THRESHOLD
         self.speech_cancellation_event = asyncio.Event()
         self.speech_cancellation_event.clear()
         
-        # Maintain recent audio buffer for interruption detection
-        self.recent_audio_buffer = []
-        self.recent_audio_buffer_size = int(self.barge_in_detection_window * 16)  # samples at 16kHz
+        # Double-threshold barge-in detection with state machine
+        self.speech_state = SpeechState.SILENCE
+        self.potential_speech_frames = 0  # Count of consecutive potential speech frames
+        self.confirmed_speech_frames = 0  # Count of consecutive confirmed speech frames
+        self.potential_speech_threshold = self.ambient_noise_level * 2.0  # Lower threshold
+        self.confirmed_speech_threshold = self.ambient_noise_level * 3.5  # Higher threshold
+        self.min_speech_frames_for_barge_in = 5  # Minimum frames to consider interruption (was 3)
+        
+        # Maintain enhanced audio buffer for interruption detection
+        self.recent_audio_buffer = deque(maxlen=15)  # Increased from 8 to 15 chunks for better detection
+        self.barge_in_detection_window = BARGE_IN_DETECTION_WINDOW  # ms
+        self.barge_in_threshold = BARGE_IN_THRESHOLD
         
         logger.info(f"WebSocketHandler initialized for call {call_sid} with {'Deepgram' if self.using_deepgram else 'Whisper'} STT")
         logger.info(f"Barge-in functionality {'enabled' if self.can_be_interrupted else 'disabled'}")
     
     def _update_ambient_noise_level(self, audio_data: np.ndarray) -> None:
         """
-        Update ambient noise level based on audio energy.
+        Enhanced adaptive noise level tracking with better statistical approach.
         
         Args:
             audio_data: Audio data as numpy array
@@ -150,12 +170,74 @@ class WebSocketHandler:
             
             # Update ambient noise level (with safety floor)
             if self.noise_samples:
-                # Use 95th percentile to avoid outliers
+                # Use 90th percentile to avoid outliers
                 self.ambient_noise_level = max(
                     0.005,  # Minimum threshold
-                    np.percentile(self.noise_samples, 95) * 2.0  # Set threshold just above noise
+                    np.percentile(self.noise_samples, 90) * 2.0  # Set threshold just above noise
                 )
                 logger.debug(f"Updated ambient noise level to {self.ambient_noise_level:.6f}")
+                
+                # Update speech detection thresholds
+                self.potential_speech_threshold = self.ambient_noise_level * self.noise_floor_multiplier
+                self.confirmed_speech_threshold = self.ambient_noise_level * 3.5
+    
+    def _calculate_speech_band_energy(self, audio_data: np.ndarray) -> Dict[str, float]:
+        """
+        Calculate energy in specific frequency bands relevant to speech.
+        
+        Args:
+            audio_data: Audio data as numpy array
+            
+        Returns:
+            Dictionary with energy in different frequency bands
+        """
+        if len(audio_data) < 256:  # Need enough samples for FFT
+            return {
+                "low_band": 0.0,
+                "speech_band": 0.0,
+                "high_band": 0.0,
+                "speech_ratio": 0.0
+            }
+            
+        try:
+            # Calculate FFT
+            fft_data = np.abs(np.fft.rfft(audio_data))
+            freqs = np.fft.rfftfreq(len(audio_data), 1/16000)
+            
+            # Define frequency bands
+            low_band_idx = (freqs < 300)
+            speech_band_idx = (freqs >= 300) & (freqs <= 3400)  # Primary speech frequencies
+            high_band_idx = (freqs > 3400)
+            
+            # Calculate energy in each band
+            low_energy = np.sum(fft_data[low_band_idx])
+            speech_energy = np.sum(fft_data[speech_band_idx])
+            high_energy = np.sum(fft_data[high_band_idx])
+            
+            total_energy = low_energy + speech_energy + high_energy + 1e-10
+            
+            # Calculate ratios
+            speech_ratio = speech_energy / total_energy
+            
+            result = {
+                "low_band": low_energy / total_energy,
+                "speech_band": speech_ratio,
+                "high_band": high_energy / total_energy,
+                "speech_ratio": speech_ratio
+            }
+            
+            # Store speech band energy for tracking
+            self.speech_band_energies.append(speech_ratio)
+            
+            return result
+        except Exception as e:
+            logger.error(f"Error calculating frequency bands: {e}")
+            return {
+                "low_band": 0.0,
+                "speech_band": 0.0,
+                "high_band": 0.0,
+                "speech_ratio": 0.0
+            }
     
     def cleanup_transcription(self, text: str) -> str:
         """
@@ -194,6 +276,12 @@ class WebSocketHandler:
     def is_valid_transcription(self, text: str) -> bool:
         """
         Check if a transcription is valid and worth processing.
+        
+        Args:
+            text: Transcription text
+            
+        Returns:
+            True if the transcription is valid
         """
         # Clean up the text first
         cleaned_text = self.cleanup_transcription(text)
@@ -304,7 +392,11 @@ class WebSocketHandler:
         self.stop_event.clear()
         self.noise_samples = []  # Reset noise samples
         self.deepgram_session_active = False  # Reset Deepgram session state
-        self.recent_audio_buffer = []  # Reset audio buffer for barge-in detection
+        self.recent_audio_buffer.clear()  # Reset audio buffer for barge-in detection
+        self.speech_state = SpeechState.SILENCE  # Reset speech state machine
+        self.potential_speech_frames = 0
+        self.confirmed_speech_frames = 0
+        self.speech_band_energies.clear()  # Clear speech band energies
         
         # Send a welcome message
         await self.send_text_response("I'm listening. How can I help you today?", ws)
@@ -321,7 +413,7 @@ class WebSocketHandler:
     
     async def _handle_media(self, data: Dict[str, Any], ws) -> None:
         """
-        Handle media event with audio data and support for barge-in.
+        Handle media event with audio data and enhanced speech/noise discrimination.
         
         Args:
             data: Media event data
@@ -378,6 +470,13 @@ class WebSocketHandler:
             logger.error(f"Error processing media payload: {e}", exc_info=True)
     
     async def _check_for_barge_in(self, audio_data: bytes, ws) -> None:
+        """
+        Enhanced barge-in detection with double-threshold approach and state machine.
+        
+        Args:
+            audio_data: Raw audio data
+            ws: WebSocket connection
+        """
         try:
             # Convert μ-law to PCM
             pcm_audio = self.audio_processor.mulaw_to_pcm(audio_data)
@@ -385,51 +484,96 @@ class WebSocketHandler:
             # Add to recent audio buffer for detection window
             self.recent_audio_buffer.append(pcm_audio)
             
-            # Limit buffer to detection window size - increase from 5 to 8 for better detection
-            if len(self.recent_audio_buffer) > 8:  # Keep last 8 chunks (~160ms) for better accuracy
-                self.recent_audio_buffer.pop(0)
-            
             # Only attempt barge-in detection if we have enough audio
-            if len(self.recent_audio_buffer) >= 3:  # Require at least 3 chunks (60ms) of audio
-                combined_audio = np.concatenate(self.recent_audio_buffer)
+            if len(self.recent_audio_buffer) >= 5:  # Need at least 5 chunks (100ms) of audio
+                # Combine the most recent audio frames
+                combined_audio = np.concatenate(list(self.recent_audio_buffer))
                 
-                # Use a higher threshold to avoid false triggers
-                higher_threshold = self.barge_in_threshold * 1.5  # Increase threshold by 50%
+                # Process audio with enhanced preprocessing
+                enhanced_audio = self._preprocess_audio(combined_audio)
                 
-                # Require more consistent speech detection (longer duration)
-                if self._contains_speech(combined_audio, threshold=higher_threshold):
-                    # Check energy level
-                    energy = np.sqrt(np.mean(np.square(combined_audio)))
-                    
-                    # Only trigger barge-in for significantly loud audio
-                    if energy > higher_threshold * 2:
-                        logger.info(f"Barge-in detected! Speech energy: {energy:.4f}")
+                # Calculate energy metrics
+                rms_energy = np.sqrt(np.mean(np.square(enhanced_audio)))
+                
+                # Calculate speech band energy
+                band_energies = self._calculate_speech_band_energy(enhanced_audio)
+                speech_ratio = band_energies["speech_ratio"]
+                
+                # State machine for barge-in detection (reduces false positives)
+                if self.speech_state == SpeechState.SILENCE:
+                    # Check if potential speech detected (lower threshold)
+                    if rms_energy > self.potential_speech_threshold and speech_ratio > 0.5:
+                        self.speech_state = SpeechState.POTENTIAL_SPEECH
+                        self.potential_speech_frames = 1
+                        logger.debug(f"Potential speech detected: energy={rms_energy:.4f}, speech_ratio={speech_ratio:.2f}")
+                
+                elif self.speech_state == SpeechState.POTENTIAL_SPEECH:
+                    # Check if we still have potential speech
+                    if rms_energy > self.potential_speech_threshold and speech_ratio > 0.5:
+                        self.potential_speech_frames += 1
+                        # Check if we have enough frames to move to confirmed speech
+                        if self.potential_speech_frames >= 3:  # Require 3 consecutive frames
+                            # Check against higher threshold for confirmation
+                            if rms_energy > self.confirmed_speech_threshold and speech_ratio > 0.6:
+                                self.speech_state = SpeechState.CONFIRMED_SPEECH
+                                self.confirmed_speech_frames = 1
+                                logger.info(f"Speech confirmed: energy={rms_energy:.4f}, speech_ratio={speech_ratio:.2f}")
+                    else:
+                        # Drop back to silence state
+                        self.speech_state = SpeechState.SILENCE
+                        self.potential_speech_frames = 0
+                
+                elif self.speech_state == SpeechState.CONFIRMED_SPEECH:
+                    # Check if we still have confirmed speech
+                    if rms_energy > self.confirmed_speech_threshold:
+                        self.confirmed_speech_frames += 1
                         
-                        # Set barge-in flag and trigger cancellation
-                        self.barge_in_detected = True
-                        self.speech_cancellation_event.set()
-                        
-                        # This adds a delay to avoid rapid back-and-forth interruptions
-                        await asyncio.sleep(0.3)  # 300ms debounce
-                        
-                        # Send silence and process interruption
-                        try:
-                            silence_data = b'\x00' * 160
-                            silent_mulaw = self.audio_processor.pcm_to_mulaw(silence_data)
-                            await self._send_audio(silent_mulaw, ws, is_interrupt=True)
+                        # Check if we have enough frames to trigger barge-in
+                        if self.confirmed_speech_frames >= self.min_speech_frames_for_barge_in:
+                            logger.info(f"Barge-in detected! Sustained speech for {self.confirmed_speech_frames} frames")
+                            logger.info(f"Speech energy: {rms_energy:.4f}, speech_ratio: {speech_ratio:.2f}")
                             
-                            # Reset agent speaking state
-                            self.is_agent_speaking = False
+                            # Set barge-in flag and trigger cancellation
+                            self.barge_in_detected = True
+                            self.speech_cancellation_event.set()
                             
-                            # Clear recent audio buffer
-                            self.recent_audio_buffer = []
+                            # This adds a delay to avoid rapid back-and-forth interruptions
+                            await asyncio.sleep(0.3)  # 300ms debounce
                             
-                            # Only process interruption if we have enough audio
-                            if len(self.input_buffer) > 2000:  # Require more audio (2000 bytes)
-                                logger.info("Processing interruption immediately")
-                                await self._process_audio(ws)
-                        except Exception as barge_in_error:
-                            logger.error(f"Error handling barge-in: {barge_in_error}")
+                            # Send silence and process interruption
+                            try:
+                                silence_data = b'\x00' * 160
+                                silent_mulaw = self.audio_processor.pcm_to_mulaw(silence_data)
+                                await self._send_audio(silent_mulaw, ws, is_interrupt=True)
+                                
+                                # Reset agent speaking state
+                                self.is_agent_speaking = False
+                                
+                                # Reset speech state machine
+                                self.speech_state = SpeechState.SILENCE
+                                self.potential_speech_frames = 0
+                                self.confirmed_speech_frames = 0
+                                
+                                # Clear recent audio buffer
+                                self.recent_audio_buffer.clear()
+                                
+                                # Only process interruption if we have enough audio
+                                if len(self.input_buffer) > 2000:  # Require more audio (2000 bytes)
+                                    logger.info("Processing interruption immediately")
+                                    await self._process_audio(ws)
+                            except Exception as barge_in_error:
+                                logger.error(f"Error handling barge-in: {barge_in_error}")
+                    else:
+                        # Drop back to potential speech or silence
+                        if rms_energy > self.potential_speech_threshold:
+                            self.speech_state = SpeechState.POTENTIAL_SPEECH
+                            self.potential_speech_frames = 1
+                            self.confirmed_speech_frames = 0
+                        else:
+                            self.speech_state = SpeechState.SILENCE
+                            self.potential_speech_frames = 0
+                            self.confirmed_speech_frames = 0
+
         except Exception as e:
             logger.error(f"Error checking for barge-in: {e}", exc_info=True)
     
@@ -477,7 +621,7 @@ class WebSocketHandler:
     
     def _preprocess_audio(self, audio_data: np.ndarray) -> np.ndarray:
         """
-        Preprocess audio data to reduce noise.
+        Enhanced audio preprocessing with spectral gating and speech emphasis.
         
         Args:
             audio_data: Audio data as numpy array
@@ -486,34 +630,90 @@ class WebSocketHandler:
             Preprocessed audio data
         """
         try:
-            # 1. Apply high-pass filter to remove low-frequency noise (below 80Hz)
-            b, a = signal.butter(4, 80/(16000/2), 'highpass')
-            filtered_audio = signal.filtfilt(b, a, audio_data)
+            # 1. Apply high-pass filter to remove low-frequency noise (below 100Hz)
+            b, a = signal.butter(6, 100/(16000/2), 'highpass')
+            audio_data = signal.filtfilt(b, a, audio_data)
             
-            # 2. Simple noise gate (suppress very low amplitudes)
-            noise_gate_threshold = max(0.015, self.ambient_noise_level)
-            noise_gate = np.where(np.abs(filtered_audio) < noise_gate_threshold, 0, filtered_audio)
+            # 2. Apply band-pass filter for telephony frequency range (300-3400 Hz)
+            b, a = signal.butter(4, [300/(16000/2), 3400/(16000/2)], 'band')
+            audio_data = signal.filtfilt(b, a, audio_data)
             
-            # 3. Normalize audio to have consistent volume
-            if np.max(np.abs(noise_gate)) > 0:
-                normalized = noise_gate / np.max(np.abs(noise_gate)) * 0.95
-            else:
-                normalized = noise_gate
+            # 3. Apply spectral gating (simplified implementation)
+            if len(audio_data) >= 512:  # Enough samples for FFT
+                # Compute STFT
+                f, t, Zxx = signal.stft(audio_data, fs=16000, nperseg=512, noverlap=384)
                 
-            # Log stats about the audio
-            orig_energy = np.mean(np.abs(audio_data))
-            proc_energy = np.mean(np.abs(normalized))
-            logger.debug(f"Audio preprocessing: original energy={orig_energy:.4f}, processed energy={proc_energy:.4f}")
+                # Estimate noise spectrum from lowest 10% of magnitudes
+                magnitude = np.abs(Zxx)
+                noise_threshold = np.percentile(magnitude, 10, axis=1, keepdims=True)
+                
+                # Apply soft spectral gating
+                gain = 1.0 - np.exp(-magnitude**2 / (noise_threshold**2 + 1e-10))
+                Zxx_cleaned = Zxx * gain
+                
+                # Inverse STFT
+                _, audio_data = signal.istft(Zxx_cleaned, fs=16000, nperseg=512, noverlap=384)
+                
+                # Ensure same length as original
+                if len(audio_data) > len(audio_data):
+                    audio_data = audio_data[:len(audio_data)]
+                elif len(audio_data) < len(audio_data):
+                    padding = np.zeros(len(audio_data) - len(audio_data))
+                    audio_data = np.concatenate([audio_data, padding])
             
-            return normalized
+            # 4. Apply noise gate with adaptive threshold
+            threshold = max(0.015, self.ambient_noise_level)
+            audio_data = np.where(np.abs(audio_data) < threshold, 0, audio_data)
+            
+            # 5. Apply pre-emphasis to boost high frequencies (speech clarity)
+            audio_data = np.append(audio_data[0], audio_data[1:] - 0.97 * audio_data[:-1])
+            
+            # 6. Speech onset emphasis - boost sudden changes in energy
+            if len(audio_data) > 320:  # At least 20ms
+                # Calculate energy envelope
+                frame_size = 160  # 10ms
+                energy_envelope = np.array([
+                    np.mean(np.square(audio_data[i:i+frame_size]))
+                    for i in range(0, len(audio_data)-frame_size, frame_size)
+                ])
+                
+                # Compute derivative of energy
+                energy_derivative = np.diff(energy_envelope, prepend=energy_envelope[0])
+                
+                # Find regions of rising energy (speech onset)
+                rising_energy = energy_derivative > 0
+                
+                # Expand to full audio length
+                rising_energy_full = np.repeat(rising_energy, frame_size)
+                if len(rising_energy_full) < len(audio_data):
+                    rising_energy_full = np.pad(
+                        rising_energy_full,
+                        (0, len(audio_data) - len(rising_energy_full)),
+                        'edge'
+                    )
+                
+                # Apply gentle boost to regions of rising energy
+                boost_factor = np.ones_like(audio_data)
+                boost_factor[rising_energy_full] = 1.2  # 20% boost for speech onsets
+                audio_data = audio_data * boost_factor
+            
+            # 7. Normalize audio to have consistent volume
+            max_val = np.max(np.abs(audio_data))
+            if max_val > 0:
+                audio_data = audio_data * (0.9 / max_val)
+            
+            # Update ambient noise level (for future processing)
+            self._update_ambient_noise_level(audio_data)
+            
+            return audio_data
             
         except Exception as e:
             logger.error(f"Error in audio preprocessing: {e}", exc_info=True)
-            return audio_data  # Return original audio if preprocessing fails
+            return audio_data  # Return original if processing fails
     
     async def _process_audio(self, ws) -> None:
         """
-        Process accumulated audio data through the pipeline with Deepgram STT.
+        Process accumulated audio data through the pipeline with enhanced speech processing.
         
         Args:
             ws: WebSocket connection
@@ -539,6 +739,15 @@ class WebSocketHandler:
             # Add some checks for audio quality
             if len(pcm_audio) < 1000:  # Very small audio chunk
                 logger.warning(f"Audio chunk too small: {len(pcm_audio)} samples")
+                return
+            
+            # Check if audio contains actual speech using our enhanced detection
+            contains_speech = self._contains_speech(pcm_audio)
+            if not contains_speech:
+                logger.info("No speech detected in audio buffer, skipping processing")
+                # Reduce buffer size but keep some context
+                half_size = len(self.input_buffer) // 2
+                self.input_buffer = self.input_buffer[half_size:]
                 return
             
             # Create a list to collect transcription results
@@ -645,6 +854,11 @@ class WebSocketHandler:
                                     self.barge_in_detected = False
                                     self.speech_cancellation_event.clear()
                                     
+                                    # Reset speech state machine
+                                    self.speech_state = SpeechState.SILENCE
+                                    self.potential_speech_frames = 0
+                                    self.confirmed_speech_frames = 0
+                                    
                                     speech_audio = await self.pipeline.tts_integration.text_to_speech(response)
                                     
                                     # Convert to mulaw for Twilio
@@ -725,46 +939,91 @@ class WebSocketHandler:
         except Exception as e:
             logger.error(f"Error processing audio: {e}", exc_info=True)
     
-    def _contains_speech(self, audio_data: np.ndarray, threshold: float = None) -> bool:
+    def _contains_speech(self, audio_data: np.ndarray) -> bool:
         """
-        Enhanced speech detection with better noise filtering.
+        Enhanced speech detection with improved speech/noise discrimination.
         
         Args:
             audio_data: Audio data as numpy array
-            threshold: Custom threshold (defaults to instance threshold)
             
         Returns:
-            True if audio contains potential speech
+            True if audio contains speech
         """
-        if len(audio_data) < 100:
+        if len(audio_data) < 500:  # Need enough samples
             return False
-        
-        # Use provided threshold or instance default
-        detection_threshold = threshold if threshold is not None else (self.ambient_noise_level * 3.0)
             
-        # Calculate RMS energy
-        energy = np.sqrt(np.mean(np.square(audio_data)))
-        
-        # Calculate zero-crossing rate (helps distinguish speech from noise)
-        zero_crossings = np.sum(np.abs(np.diff(np.signbit(audio_data)))) / len(audio_data)
-        
-        # Calculate spectral centroid (speech typically has higher centroids than noise)
-        fft_data = np.abs(np.fft.rfft(audio_data))
-        freqs = np.fft.rfftfreq(len(audio_data), 1/16000)
-        spectral_centroid = np.sum(freqs * fft_data) / (np.sum(fft_data) + 1e-10)
-        
-        # Log values for debugging
-        logger.debug(f"Audio energy: {energy:.6f} (threshold: {detection_threshold:.6f}), "
-                    f"zero crossings: {zero_crossings:.6f}, "
-                    f"spectral centroid: {spectral_centroid:.2f}Hz")
-        
-        # Combined speech detection logic
-        is_speech = (energy > detection_threshold) and \
-                   (zero_crossings > 0.01) and \
-                   (zero_crossings < 0.15) and \
-                   (spectral_centroid > 500)  # Speech typically > 500Hz
-        
-        return is_speech
+        try:
+            # Calculate RMS energy
+            rms_energy = np.sqrt(np.mean(np.square(audio_data)))
+            
+            # Calculate zero-crossing rate (helps distinguish speech from noise)
+            zero_crossings = np.sum(np.abs(np.diff(np.signbit(audio_data)))) / len(audio_data)
+            
+            # Calculate frequency band energies
+            band_energies = self._calculate_speech_band_energy(audio_data)
+            speech_ratio = band_energies["speech_ratio"]
+            
+            # Calculate spectral flux - measure of how quickly spectrum changes
+            # (speech has rapid changes, background noise is more constant)
+            if len(audio_data) >= 512:
+                half_point = len(audio_data) // 2
+                first_half = audio_data[:half_point]
+                second_half = audio_data[half_point:2*half_point]
+                
+                # Calculate spectra
+                first_spectrum = np.abs(np.fft.rfft(first_half))
+                second_spectrum = np.abs(np.fft.rfft(second_half))
+                
+                # Calculate normalized spectral flux
+                if np.sum(first_spectrum) > 0 and np.sum(second_spectrum) > 0:
+                    # Normalize spectra
+                    first_spectrum = first_spectrum / np.sum(first_spectrum)
+                    second_spectrum = second_spectrum / np.sum(second_spectrum)
+                    
+                    # Calculate flux (sum of squared differences)
+                    spectral_flux = np.sum(np.square(second_spectrum - first_spectrum))
+                else:
+                    spectral_flux = 0.0
+            else:
+                spectral_flux = 0.0
+            
+            # Get adaptive thresholds
+            energy_threshold = max(0.015, self.ambient_noise_level * 3.0)
+            
+            # Calculate the average speech band ratio from history
+            avg_speech_ratio = 0.4  # Default
+            if self.speech_band_energies:
+                avg_speech_ratio = np.mean(self.speech_band_energies)
+            
+            # Log detailed values
+            logger.debug(f"Speech detection - "
+                         f"energy: {rms_energy:.4f} (threshold: {energy_threshold:.4f}), "
+                         f"ZCR: {zero_crossings:.4f}, speech_ratio: {speech_ratio:.2f}, "
+                         f"avg_speech_ratio: {avg_speech_ratio:.2f}, flux: {spectral_flux:.4f}")
+            
+            # Combined speech detection with weighting towards speech frequencies
+            is_speech = (
+                # Must have sufficient energy
+                (rms_energy > energy_threshold) and
+                
+                # Zero crossing rate criteria (avoids pure tones and white noise)
+                (zero_crossings > 0.01 and zero_crossings < 0.15) and
+                
+                # Must have significant energy in speech band or high spectral flux
+                ((speech_ratio > 0.5 and speech_ratio > avg_speech_ratio * 0.8) or
+                 spectral_flux > 0.2)
+            )
+            
+            if is_speech:
+                logger.debug("Speech detected in audio")
+            
+            return is_speech
+            
+        except Exception as e:
+            logger.error(f"Error in speech detection: {e}")
+            # Fall back to simple energy threshold
+            energy = np.mean(np.abs(audio_data))
+            return energy > max(0.015, self.ambient_noise_level * 3.0)
     
     async def _send_audio(self, audio_data: bytes, ws, is_interrupt: bool = False) -> None:
         """
@@ -873,6 +1132,11 @@ class WebSocketHandler:
                 self.is_agent_speaking = True
                 self.barge_in_detected = False
                 self.speech_cancellation_event.clear()
+                
+                # Reset speech state machine
+                self.speech_state = SpeechState.SILENCE
+                self.potential_speech_frames = 0
+                self.confirmed_speech_frames = 0
                 
                 speech_audio = await self.pipeline.tts_integration.text_to_speech(text)
                 

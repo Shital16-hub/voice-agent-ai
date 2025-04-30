@@ -1,5 +1,6 @@
 """
-Enhanced Speech-to-Text integration module for Voice AI Agent with improved noise handling.
+Enhanced Speech-to-Text integration module for Voice AI Agent with improved noise handling
+and foreground speech extraction.
 
 This module provides classes and functions for integrating Deepgram speech-to-text
 capabilities with the Voice AI Agent system.
@@ -11,13 +12,14 @@ import re
 import numpy as np
 from typing import Optional, Dict, Any, Callable, Awaitable, List, Tuple, Union, AsyncIterator
 from scipy import signal
+from collections import deque
 
 from speech_to_text.deepgram_stt import DeepgramStreamingSTT, StreamingTranscriptionResult
 from speech_to_text.utils.audio_utils import load_audio_file
 
 logger = logging.getLogger(__name__)
 
-# Define expanded patterns for non-speech annotations
+# Enhanced patterns for non-speech annotations
 NON_SPEECH_PATTERNS = [
     r'\[.*?\]',           # Anything in square brackets
     r'\(.*?\)',           # Anything in parentheses
@@ -26,14 +28,27 @@ NON_SPEECH_PATTERNS = [
     r'background noise',  # Common transcription
     r'static',            # Common transcription
     r'\b(um|uh|hmm|mmm)\b',  # Common filler words
+    # Add specific telephony noise patterns
+    r'phone ringing',     # Phone ringing sound
+    r'dial tone',         # Dial tone
+    r'busy signal',       # Busy signal
+    r'beep',              # Beep sounds
 ]
+
+# Speech state enum for state machine
+class SpeechState:
+    """Speech state for detection state machine"""
+    SILENCE = 0
+    POTENTIAL_SPEECH = 1
+    CONFIRMED_SPEECH = 2
+    SPEECH_ENDED = 3
 
 class STTIntegration:
     """
     Enhanced Speech-to-Text integration for Voice AI Agent with Deepgram.
     
     Provides an abstraction layer for speech recognition functionality,
-    handling audio processing and transcription.
+    handling audio processing and transcription with improved speech/noise discrimination.
     """
     
     def __init__(
@@ -55,11 +70,24 @@ class STTIntegration:
         # Compile the non-speech patterns for efficient use
         self.non_speech_pattern = re.compile('|'.join(NON_SPEECH_PATTERNS))
         
-        # Keep track of average audio levels for adaptive thresholding
+        # Enhanced adaptive noise floor tracking
         self.noise_samples = []
-        self.speech_samples = []
-        self.max_samples = 20
+        self.max_samples = 30  # Increased from 20 for better statistics
         self.ambient_noise_level = 0.01  # Starting threshold
+        self.min_noise_floor = 0.005  # Minimum noise floor
+        
+        # Enhanced speech detection with state machine
+        self.speech_state = SpeechState.SILENCE
+        self.potential_speech_frames = 0
+        self.confirmed_speech_frames = 0
+        self.speech_threshold = 0.015  # Initial threshold
+        
+        # Speech frequency band energy tracking
+        self.speech_band_energies = deque(maxlen=20)
+        
+        # Energy thresholds with hysteresis
+        self.low_threshold = self.ambient_noise_level * 2.0  # For detecting potential speech
+        self.high_threshold = self.ambient_noise_level * 3.5  # For confirming speech
     
     async def init(self, api_key: Optional[str] = None) -> None:
         """
@@ -90,7 +118,7 @@ class STTIntegration:
     
     def _update_ambient_noise_level(self, audio_data: np.ndarray) -> None:
         """
-        Update ambient noise level based on audio energy.
+        Update ambient noise level using adaptive statistics.
         
         Args:
             audio_data: Audio data as numpy array
@@ -107,16 +135,135 @@ class STTIntegration:
             
             # Update ambient noise level (with safety floor)
             if self.noise_samples:
-                # Use 95th percentile to avoid outliers
+                # Use 90th percentile to avoid outliers
                 self.ambient_noise_level = max(
-                    0.005,  # Minimum threshold
-                    np.percentile(self.noise_samples, 95) * 2.0  # Set threshold just above noise
+                    self.min_noise_floor,  # Minimum threshold
+                    np.percentile(self.noise_samples, 90) * 2.0  # Set threshold just above noise
                 )
                 logger.debug(f"Updated ambient noise level to {self.ambient_noise_level:.6f}")
+                
+                # Update derived thresholds
+                self.low_threshold = self.ambient_noise_level * 2.0
+                self.high_threshold = self.ambient_noise_level * 3.5
+    
+    def _apply_spectral_subtraction(self, audio_data: np.ndarray) -> np.ndarray:
+        """
+        Apply spectral subtraction to reduce background noise.
+        
+        Args:
+            audio_data: Audio data as numpy array
+            
+        Returns:
+            Enhanced audio data
+        """
+        if len(audio_data) < 512:  # Need enough samples for a good FFT
+            return audio_data
+            
+        try:
+            # Compute STFT
+            f, t, Zxx = signal.stft(audio_data, fs=16000, nperseg=512, noverlap=384)
+            
+            # Compute magnitude spectrum
+            magnitude = np.abs(Zxx)
+            phase = np.angle(Zxx)
+            
+            # Estimate noise spectrum from lowest 10% of frame energies
+            frame_energy = np.sum(magnitude**2, axis=0)
+            sorted_frames = np.argsort(frame_energy)
+            noise_frames = max(1, int(0.1 * len(sorted_frames)))
+            noise_indices = sorted_frames[:noise_frames]
+            
+            # Average noise spectrum over noise frames
+            noise_spectrum = np.mean(magnitude[:, noise_indices], axis=1, keepdims=True)
+            
+            # Apply spectral subtraction with flooring
+            # Use over-subtraction factor for better noise reduction
+            over_subtraction = 1.5
+            spectral_floor = 0.01
+            
+            # Apply subtraction with flooring
+            magnitude_enhanced = np.maximum(
+                magnitude - over_subtraction * noise_spectrum,
+                spectral_floor * magnitude
+            )
+            
+            # Reconstruct signal
+            Zxx_enhanced = magnitude_enhanced * np.exp(1j * phase)
+            _, audio_enhanced = signal.istft(Zxx_enhanced, fs=16000, nperseg=512, noverlap=384)
+            
+            # Ensure same length as original
+            if len(audio_enhanced) < len(audio_data):
+                audio_enhanced = np.pad(audio_enhanced, (0, len(audio_data) - len(audio_enhanced)))
+            elif len(audio_enhanced) > len(audio_data):
+                audio_enhanced = audio_enhanced[:len(audio_data)]
+            
+            return audio_enhanced
+            
+        except Exception as e:
+            logger.error(f"Error in spectral subtraction: {e}")
+            return audio_data  # Return original if processing fails
+    
+    def _calculate_speech_band_energy(self, audio_data: np.ndarray) -> Dict[str, float]:
+        """
+        Calculate energy in specific frequency bands relevant to speech.
+        
+        Args:
+            audio_data: Audio data as numpy array
+            
+        Returns:
+            Dictionary with energy in different frequency bands
+        """
+        if len(audio_data) < 256:  # Need enough samples for FFT
+            return {
+                "low_band": 0.0,
+                "speech_band": 0.0,
+                "high_band": 0.0,
+                "speech_ratio": 0.0
+            }
+            
+        try:
+            # Calculate FFT
+            fft_data = np.abs(np.fft.rfft(audio_data))
+            freqs = np.fft.rfftfreq(len(audio_data), 1/16000)
+            
+            # Define frequency bands
+            low_band_idx = (freqs < 300)
+            speech_band_idx = (freqs >= 300) & (freqs <= 3400)  # Primary speech frequencies
+            high_band_idx = (freqs > 3400)
+            
+            # Calculate energy in each band
+            low_energy = np.sum(fft_data[low_band_idx])
+            speech_energy = np.sum(fft_data[speech_band_idx])
+            high_energy = np.sum(fft_data[high_band_idx])
+            
+            total_energy = low_energy + speech_energy + high_energy + 1e-10
+            
+            # Calculate ratios
+            speech_ratio = speech_energy / total_energy
+            
+            result = {
+                "low_band": low_energy / total_energy,
+                "speech_band": speech_ratio,
+                "high_band": high_energy / total_energy,
+                "speech_ratio": speech_ratio
+            }
+            
+            # Store speech band energy for tracking
+            self.speech_band_energies.append(speech_ratio)
+            
+            return result
+        except Exception as e:
+            logger.error(f"Error calculating frequency bands: {e}")
+            return {
+                "low_band": 0.0,
+                "speech_band": 0.0,
+                "high_band": 0.0,
+                "speech_ratio": 0.0
+            }
     
     def _preprocess_audio(self, audio_data: np.ndarray) -> np.ndarray:
         """
-        Preprocess audio data to reduce noise.
+        Enhanced multi-stage audio preprocessing for better speech/noise discrimination.
         
         Args:
             audio_data: Audio data as numpy array
@@ -125,25 +272,66 @@ class STTIntegration:
             Preprocessed audio data
         """
         try:
-            # 1. Apply high-pass filter to remove low-frequency noise (below 80Hz)
-            b, a = signal.butter(4, 80/(16000/2), 'highpass')
+            # Update ambient noise level
+            self._update_ambient_noise_level(audio_data)
+            
+            # 1. Apply high-pass filter to remove low-frequency noise (below 100Hz)
+            b, a = signal.butter(6, 100/(16000/2), 'highpass')
             filtered_audio = signal.filtfilt(b, a, audio_data)
             
-            # 2. Simple noise gate (suppress very low amplitudes)
-            noise_gate_threshold = max(0.015, self.ambient_noise_level)
-            noise_gate = np.where(np.abs(filtered_audio) < noise_gate_threshold, 0, filtered_audio)
+            # 2. Apply band-pass filter for telephony frequency range (300-3400 Hz)
+            b, a = signal.butter(4, [300/(16000/2), 3400/(16000/2)], 'band')
+            band_limited = signal.filtfilt(b, a, filtered_audio)
             
-            # 3. Normalize audio to have consistent volume
-            if np.max(np.abs(noise_gate)) > 0:
-                normalized = noise_gate / np.max(np.abs(noise_gate)) * 0.95
+            # 3. Apply spectral subtraction for background noise reduction
+            if len(band_limited) >= 512:
+                noise_reduced = self._apply_spectral_subtraction(band_limited)
             else:
-                normalized = noise_gate
-                
-            # Log stats about the audio
-            orig_energy = np.mean(np.abs(audio_data))
-            proc_energy = np.mean(np.abs(normalized))
-            logger.debug(f"Audio preprocessing: original energy={orig_energy:.4f}, processed energy={proc_energy:.4f}")
+                noise_reduced = band_limited
             
+            # 4. Apply adaptive noise gate with threshold based on ambient noise
+            threshold = self.ambient_noise_level * 2.5
+            noise_gate = np.where(np.abs(noise_reduced) < threshold, 0, noise_reduced)
+            
+            # 5. Apply pre-emphasis filter to boost higher frequencies for speech clarity
+            pre_emphasis = np.append(noise_gate[0], noise_gate[1:] - 0.97 * noise_gate[:-1])
+            
+            # 6. Apply speech onset enhancement - boost sudden changes in energy
+            if len(pre_emphasis) > 320:  # At least 20ms
+                # Calculate energy envelope
+                frame_size = 160  # 10ms
+                energy_envelope = np.array([
+                    np.mean(np.square(pre_emphasis[i:i+frame_size]))
+                    for i in range(0, len(pre_emphasis)-frame_size, frame_size)
+                ])
+                
+                # Compute derivative of energy
+                energy_derivative = np.diff(energy_envelope, prepend=energy_envelope[0])
+                
+                # Find regions of rising energy (speech onset)
+                rising_energy = energy_derivative > 0
+                
+                # Expand to full audio length
+                rising_energy_full = np.repeat(rising_energy, frame_size)
+                if len(rising_energy_full) < len(pre_emphasis):
+                    rising_energy_full = np.pad(
+                        rising_energy_full,
+                        (0, len(pre_emphasis) - len(rising_energy_full)),
+                        'edge'
+                    )
+                
+                # Apply gentle boost to regions of rising energy
+                boost_factor = np.ones_like(pre_emphasis)
+                boost_factor[rising_energy_full] = 1.2  # 20% boost for speech onsets
+                pre_emphasis = pre_emphasis * boost_factor
+            
+            # 7. Normalize audio level for consistent volume
+            max_val = np.max(np.abs(pre_emphasis))
+            if max_val > 0:
+                normalized = pre_emphasis * (0.9 / max_val)
+            else:
+                normalized = pre_emphasis
+                
             return normalized
             
         except Exception as e:
@@ -186,7 +374,7 @@ class STTIntegration:
     
     def is_valid_transcription(self, text: str, min_words: int = 2) -> bool:
         """
-        Check if a transcription is valid and worth processing.
+        Check if a transcription is valid and worth processing with enhanced criteria.
         
         Args:
             text: Transcription text
@@ -203,13 +391,16 @@ class STTIntegration:
             logger.info("Transcription contains only non-speech annotations")
             return False
         
-        # Estimate confidence based on presence of uncertainty markers
+        # Be more lenient with question marks and punctuation in confidence calculation
         confidence_estimate = 1.0
-        if "?" in text or "[" in text or "(" in text or "<" in text:
-            confidence_estimate = 0.6  # Lower confidence if it contains uncertainty markers
+        if "?" in text:
+            # Questions are important in conversations - don't penalize them
+            pass
+        elif "[" in text or "(" in text or "<" in text:
+            confidence_estimate = 0.7  # Only reduce for annotation markers
             logger.info(f"Reduced confidence due to uncertainty markers: {text}")
             
-        if confidence_estimate < 0.7:
+        if confidence_estimate < 0.65:
             logger.info(f"Transcription confidence too low: {confidence_estimate}")
             return False
             
@@ -221,13 +412,142 @@ class STTIntegration:
             
         return True
     
+    def _contains_speech(self, audio_data: np.ndarray) -> bool:
+        """
+        Enhanced speech detection with state machine for better noise discrimination.
+        
+        Args:
+            audio_data: Audio data as numpy array
+            
+        Returns:
+            True if the audio contains speech
+        """
+        if len(audio_data) < 500:  # Need enough samples
+            return False
+            
+        try:
+            # Calculate RMS energy
+            rms_energy = np.sqrt(np.mean(np.square(audio_data)))
+            
+            # Calculate zero-crossing rate
+            zero_crossings = np.sum(np.abs(np.diff(np.signbit(audio_data)))) / len(audio_data)
+            
+            # Calculate frequency band energies
+            band_energies = self._calculate_speech_band_energy(audio_data)
+            speech_ratio = band_energies["speech_ratio"]
+            
+            # Calculate spectral flux - measure of how quickly spectrum changes
+            if len(audio_data) >= 512:
+                half_point = len(audio_data) // 2
+                first_half = audio_data[:half_point]
+                second_half = audio_data[half_point:2*half_point]
+                
+                # Calculate spectra
+                first_spectrum = np.abs(np.fft.rfft(first_half))
+                second_spectrum = np.abs(np.fft.rfft(second_half))
+                
+                # Calculate normalized spectral flux
+                if np.sum(first_spectrum) > 0 and np.sum(second_spectrum) > 0:
+                    # Normalize spectra
+                    first_spectrum = first_spectrum / np.sum(first_spectrum)
+                    second_spectrum = second_spectrum / np.sum(second_spectrum)
+                    
+                    # Calculate flux (sum of squared differences)
+                    spectral_flux = np.sum(np.square(second_spectrum - first_spectrum))
+                else:
+                    spectral_flux = 0.0
+            else:
+                spectral_flux = 0.0
+            
+            # Get adaptive thresholds
+            energy_threshold = self.high_threshold
+            low_energy_threshold = self.low_threshold
+            
+            # Calculate the average speech band ratio from history
+            avg_speech_ratio = 0.4  # Default
+            if self.speech_band_energies:
+                avg_speech_ratio = np.mean(self.speech_band_energies)
+            
+            # State machine for more robust speech detection
+            if self.speech_state == SpeechState.SILENCE:
+                # Check if potential speech detected
+                if rms_energy > low_energy_threshold and speech_ratio > 0.5:
+                    self.speech_state = SpeechState.POTENTIAL_SPEECH
+                    self.potential_speech_frames = 1
+                    logger.debug(f"Potential speech detected: energy={rms_energy:.4f}, speech_ratio={speech_ratio:.2f}")
+                    return False  # Not confirmed yet
+                return False  # Still silence
+                
+            elif self.speech_state == SpeechState.POTENTIAL_SPEECH:
+                # Check if still potential speech
+                if rms_energy > low_energy_threshold and speech_ratio > 0.5:
+                    self.potential_speech_frames += 1
+                    # Check if we have enough frames to move to confirmed speech
+                    if self.potential_speech_frames >= 3:  # Need 3 consecutive frames
+                        # Check against higher threshold for confirmation
+                        if rms_energy > energy_threshold and speech_ratio > 0.6:
+                            self.speech_state = SpeechState.CONFIRMED_SPEECH
+                            logger.info(f"Speech confirmed: energy={rms_energy:.4f}, speech_ratio={speech_ratio:.2f}")
+                            return True
+                    return False  # Not confirmed yet
+                else:
+                    # Go back to silence
+                    self.speech_state = SpeechState.SILENCE
+                    self.potential_speech_frames = 0
+                    return False
+                    
+            elif self.speech_state == SpeechState.CONFIRMED_SPEECH:
+                # Check if still speech
+                if rms_energy > energy_threshold * 0.8 or speech_ratio > 0.4:
+                    # Still speech, maintain state
+                    return True
+                else:
+                    # Potential end of speech
+                    self.speech_state = SpeechState.SPEECH_ENDED
+                    self.confirmed_speech_frames = 1
+                    return True  # Still report as speech
+                    
+            elif self.speech_state == SpeechState.SPEECH_ENDED:
+                # Check if silence is confirmed
+                if rms_energy < energy_threshold or speech_ratio < 0.4:
+                    self.confirmed_speech_frames += 1
+                    # Check if we have enough frames to confirm end of speech
+                    if self.confirmed_speech_frames >= 3:  # Need 3 consecutive frames
+                        self.speech_state = SpeechState.SILENCE
+                        self.confirmed_speech_frames = 0
+                        return False
+                    return True  # Still report as speech until confirmed end
+                else:
+                    # Speech resumed
+                    self.speech_state = SpeechState.CONFIRMED_SPEECH
+                    self.confirmed_speech_frames = 0
+                    return True
+                    
+            # Default fallback - use direct detection
+            is_speech = (
+                (rms_energy > energy_threshold) and 
+                (zero_crossings > 0.01 and zero_crossings < 0.15) and
+                ((speech_ratio > 0.5 and speech_ratio > avg_speech_ratio * 0.8) or spectral_flux > 0.2)
+            )
+            
+            if is_speech:
+                logger.debug("Speech detected through direct conditions")
+            
+            return is_speech
+            
+        except Exception as e:
+            logger.error(f"Error in speech detection: {e}")
+            # Fall back to simple energy threshold
+            energy = np.mean(np.abs(audio_data))
+            return energy > self.high_threshold
+    
     async def transcribe_audio_file(
         self,
         audio_file_path: str,
         callback: Optional[Callable[[StreamingTranscriptionResult], Awaitable[None]]] = None
     ) -> Dict[str, Any]:
         """
-        Transcribe an audio file with improved noise handling.
+        Transcribe an audio file with enhanced speech processing.
         
         Args:
             audio_file_path: Path to audio file
@@ -248,13 +568,23 @@ class STTIntegration:
             audio, sample_rate = load_audio_file(audio_file_path, target_sr=16000)
             audio_duration = len(audio) / sample_rate
             
-            # Update ambient noise level
-            self._update_ambient_noise_level(audio)
-            
-            # Apply audio preprocessing for noise reduction
+            # Apply enhanced preprocessing
             audio = self._preprocess_audio(audio)
             
-            # Convert to bytes
+            # Check if audio contains speech
+            contains_speech = self._contains_speech(audio)
+            if not contains_speech:
+                logger.info(f"No speech detected in audio file: {audio_file_path}")
+                return {
+                    "transcription": "",
+                    "confidence": 0.0,
+                    "duration": audio_duration,
+                    "processing_time": time.time() - start_time,
+                    "is_final": True,
+                    "is_valid": False
+                }
+            
+            # Convert to bytes (16-bit PCM)
             audio_bytes = (audio * 32767).astype(np.int16).tobytes()
             
             # Get results
@@ -323,7 +653,7 @@ class STTIntegration:
         callback: Optional[Callable[[StreamingTranscriptionResult], Awaitable[None]]] = None
     ) -> Dict[str, Any]:
         """
-        Transcribe audio data with improved noise handling.
+        Transcribe audio data with enhanced speech processing.
         
         Args:
             audio_data: Audio data as bytes or numpy array
@@ -350,11 +680,21 @@ class STTIntegration:
             else:
                 audio = audio_data
             
-            # Update ambient noise level
-            self._update_ambient_noise_level(audio)
-            
-            # Apply audio preprocessing for noise reduction
+            # Apply enhanced processing
             audio = self._preprocess_audio(audio)
+            
+            # Check if audio contains speech
+            contains_speech = self._contains_speech(audio)
+            if not contains_speech:
+                logger.info("No speech detected in audio data")
+                return {
+                    "transcription": "",
+                    "confidence": 0.0,
+                    "duration": len(audio) / 16000,  # Assuming 16kHz
+                    "processing_time": time.time() - start_time,
+                    "is_final": True,
+                    "is_valid": False
+                }
             
             # Convert to bytes (16-bit PCM)
             audio_bytes = (audio * 32767).astype(np.int16).tobytes()
@@ -426,6 +766,11 @@ class STTIntegration:
         
         await self.speech_recognizer.start_streaming()
         logger.debug("Started streaming transcription session")
+        
+        # Reset speech detection state
+        self.speech_state = SpeechState.SILENCE
+        self.potential_speech_frames = 0
+        self.confirmed_speech_frames = 0
     
     async def process_stream_chunk(
         self,
@@ -433,7 +778,7 @@ class STTIntegration:
         callback: Optional[Callable[[StreamingTranscriptionResult], Awaitable[None]]] = None
     ) -> Optional[StreamingTranscriptionResult]:
         """
-        Process a chunk of streaming audio with improved noise handling.
+        Process a chunk of streaming audio with enhanced speech processing.
         
         Args:
             audio_chunk: Audio chunk data
@@ -455,11 +800,15 @@ class STTIntegration:
         else:
             audio_data = audio_chunk
         
-        # Update ambient noise level
-        self._update_ambient_noise_level(audio_data)
-        
-        # Apply audio preprocessing for noise reduction
+        # Apply enhanced processing
         audio_data = self._preprocess_audio(audio_data)
+        
+        # Only process further if speech is detected
+        # Use a lightweight check for streaming to reduce latency
+        if not self._contains_speech(audio_data) and self.speech_state == SpeechState.SILENCE:
+            # Skip processing if no speech detected in silence state
+            # Still allow processing in other states to continue tracking ongoing speech
+            return None
         
         # Convert to bytes (16-bit PCM)
         audio_bytes = (audio_data * 32767).astype(np.int16).tobytes()
@@ -501,6 +850,11 @@ class STTIntegration:
         # Stop streaming session
         await self.speech_recognizer.stop_streaming()
         
+        # Reset speech detection state
+        self.speech_state = SpeechState.SILENCE
+        self.potential_speech_frames = 0
+        self.confirmed_speech_frames = 0
+        
         # Check if we have a last result
         if hasattr(self.speech_recognizer, 'last_result') and self.speech_recognizer.last_result:
             result = self.speech_recognizer.last_result
@@ -526,7 +880,7 @@ class STTIntegration:
         silence_frames_threshold: int = 30
     ) -> AsyncIterator[Dict[str, Any]]:
         """
-        Process real-time audio stream and detect utterances with improved noise handling.
+        Process real-time audio stream and detect utterances with enhanced speech processing.
         
         Args:
             audio_stream: Async iterator yielding audio chunks
@@ -544,18 +898,22 @@ class STTIntegration:
         # Start streaming
         await self.speech_recognizer.start_streaming()
         
-        # Track state
-        is_speaking = False
+        # Reset speech detection state
+        self.speech_state = SpeechState.SILENCE
+        self.potential_speech_frames = 0
+        self.confirmed_speech_frames = 0
+        
+        # Track consecutive silence frames
         silence_frames = 0
         max_silence_frames = silence_frames_threshold
         
         try:
             async for audio_chunk in audio_stream:
-                # Update ambient noise level
-                self._update_ambient_noise_level(audio_chunk)
-                
-                # Apply audio preprocessing for noise reduction
+                # Apply enhanced processing
                 processed_chunk = self._preprocess_audio(audio_chunk)
+                
+                # Check for speech presence
+                contains_speech = self._contains_speech(processed_chunk)
                 
                 # Convert to bytes (16-bit PCM)
                 audio_bytes = (processed_chunk * 32767).astype(np.int16).tobytes()
@@ -567,8 +925,12 @@ class STTIntegration:
                     # Store the result
                     results.append(result)
                     
-                    # Call the original callback if provided
-                    if callback:
+                    # Clean up the text
+                    if hasattr(result, 'text') and result.text:
+                        result.text = self.cleanup_transcription(result.text)
+                    
+                    # Call the original callback if provided and valid
+                    if callback and result.text and self.is_valid_transcription(result.text):
                         await callback(result)
                 
                 # Process the audio chunk
@@ -577,27 +939,18 @@ class STTIntegration:
                     callback=process_result
                 )
                 
-                # Check for speech activity
-                if not is_speaking:
-                    # Detect start of speech from any results
-                    has_speech = any(result.text.strip() for result in results)
-                    
-                    if has_speech:
-                        is_speaking = True
-                        silence_frames = 0
-                        logger.info("Speech detected, beginning transcription")
+                # Update silence frame tracking based on speech detection
+                if not contains_speech or self.speech_state == SpeechState.SILENCE:
+                    silence_frames += 1
                 else:
-                    # Check for end of utterance (silence after speech)
-                    has_speech = any(result.text.strip() for result in results)
-                    
-                    if not has_speech:
-                        silence_frames += 1
-                    else:
-                        silence_frames = 0
+                    silence_frames = 0
                 
                 # If we've detected enough silence after speech, process the utterance
-                if is_speaking and silence_frames >= max_silence_frames:
-                    is_speaking = False
+                if (self.speech_state != SpeechState.SILENCE and silence_frames >= max_silence_frames):
+                    # Reset speech state
+                    self.speech_state = SpeechState.SILENCE
+                    self.potential_speech_frames = 0
+                    self.confirmed_speech_frames = 0
                     
                     # Get final transcription
                     final_text, duration = await self.end_streaming()
