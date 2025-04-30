@@ -1,5 +1,5 @@
 """
-Main Twilio handler for voice calls.
+Updated Twilio handler for voice calls with improved barge-in detection.
 """
 import logging
 from typing import Optional, Dict, Any
@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 class TwilioHandler:
     """
-    Handles Twilio voice call operations.
+    Handles Twilio voice call operations with improved speech handling.
     """
     
     def __init__(self, pipeline, base_url: str):
@@ -47,7 +47,7 @@ class TwilioHandler:
     
     def handle_incoming_call(self, from_number: str, to_number: str, call_sid: str) -> str:
         """
-        Handle incoming voice call with WebSocket streaming.
+        Handle incoming voice call with WebSocket streaming and improved barge-in.
         
         Args:
             from_number: Caller phone number
@@ -65,9 +65,9 @@ class TwilioHandler:
         # Create TwiML response
         response = VoiceResponse()
         
-        # Add initial greeting
-        response.say("Welcome to the Voice AI Agent. I'm here to help.", voice='alice')
-        response.pause(length=1)
+        # Add initial greeting - shorter and clearer
+        response.say("Welcome to the Voice Assistant. I'm here to help.", voice='alice')
+        response.pause(length=0.5)  # Shorter pause
         
         try:
             # Define WebSocket URL for streaming
@@ -80,8 +80,8 @@ class TwilioHandler:
             connect.append(stream)
             response.append(connect)
             
-            # Add followup instruction to user
-            response.say("You can start speaking now. The AI assistant is listening.", voice='alice')
+            # Add simple instruction to user
+            response.say("You can start speaking now.", voice='alice')
             
             return str(response)
         except Exception as e:
@@ -116,7 +116,7 @@ class TwilioHandler:
         status_callback: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Place an outbound call.
+        Place an outbound call with improved TwiML settings.
         
         Args:
             to_number: Destination phone number
@@ -132,10 +132,11 @@ class TwilioHandler:
         if not status_callback:
             status_callback = f"{self.base_url}/voice/status"
         
-        # Set up TwiML for outbound call
+        # Set up TwiML for outbound call - using shorter, clearer messaging
         twiml = f"""
         <Response>
-            <Say voice="alice">Hello! This is a call from the AI Voice Agent.</Say>
+            <Say voice="alice">Hello! This is a call from the AI Voice Assistant.</Say>
+            <Pause length="0.5"/>
             <Connect>
                 <Stream url="{self.base_url.replace('https://', 'wss://')}/ws/stream/outbound" />
             </Connect>

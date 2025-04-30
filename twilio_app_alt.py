@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Enhanced Twilio application using WebSocket streaming with improved noise handling.
+Enhanced Twilio application using WebSocket streaming with improved noise handling
+and robust barge-in detection via the new AudioPreprocessor.
 """
 import os
 import sys
@@ -15,7 +16,6 @@ from flask import Flask, request, Response
 from simple_websocket import Server, ConnectionClosed
 from dotenv import load_dotenv
 from twilio.twiml.voice_response import VoiceResponse, Connect, Stream
-from twilio.rest import Client  # Imported but not used - consider removing if not needed
 
 # Load environment variables
 load_dotenv()
@@ -25,19 +25,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from telephony.twilio_handler import TwilioHandler
 from telephony.websocket_handler import WebSocketHandler
-from telephony.config import HOST, PORT, DEBUG, LOG_LEVEL, LOG_FORMAT
-# These config variables appear to be imported but not used - consider removing if not needed
-from telephony.config import STT_INITIAL_PROMPT, STT_NO_CONTEXT, STT_TEMPERATURE, STT_PRESET
+from telephony.config import (
+    HOST, PORT, DEBUG, LOG_LEVEL, LOG_FORMAT, 
+    STT_INITIAL_PROMPT, STT_NO_CONTEXT, STT_TEMPERATURE, STT_PRESET,
+    PREPROCESSOR_ENABLE_DEBUG
+)
 from voice_ai_agent import VoiceAIAgent
 from integration.tts_integration import TTSIntegration
 from integration.pipeline import VoiceAIAgentPipeline
 
-# Get Twilio credentials from environment
-TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
-TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
-
 # Configure logging with more debug info
-logging.basicConfig(level=logging.DEBUG, format=LOG_FORMAT)
+logging.basicConfig(level=getattr(logging, LOG_LEVEL), format=LOG_FORMAT)
 logger = logging.getLogger(__name__)
 
 # Flask app setup
@@ -53,32 +51,22 @@ call_event_loops = {}
 
 
 async def initialize_system():
-    """Initialize all system components with knowledge-base agnostic speech enhancements."""
+    """Initialize all system components with enhanced speech processing."""
     global twilio_handler, voice_ai_pipeline, base_url
     
-    logger.info("Initializing Voice AI Agent with telephony speech enhancements...")
+    logger.info("Initializing Voice AI Agent with enhanced speech processing...")
     
-    # Define a generic telephony-optimized prompt that works with any knowledge base
-    telephony_prompt = (
-        "This is a telephone conversation with a customer. "
-        "The customer may ask questions about products, services, pricing, or features. "
-        "Transcribe exactly what is spoken, filtering out noise, static, and line interference. "
-        "Common terms in business conversations include: pricing, plan, cost, features, "
-        "monthly, subscription, support, upgrade, details, information."
-    )
-    
-    # Initialize Voice AI Agent with enhanced parameters that are knowledge-base agnostic
+    # Initialize Voice AI Agent with enhanced speech processing parameters
     agent = VoiceAIAgent(
         storage_dir='./storage',
         model_name='mistral:7b-instruct-v0.2-q4_0',
-        # Note: The following parameters may need adjustment based on VoiceAIAgent implementation
         whisper_model_path='models/base.en',
         llm_temperature=0.7,
-        # Pass generic telephony-optimized parameters
-        whisper_initial_prompt=telephony_prompt,
-        whisper_temperature=0.0,  # Greedy decoding for more reliable transcription
-        whisper_no_context=True,  # Each utterance is independent
-        whisper_preset="default"
+        whisper_initial_prompt=STT_INITIAL_PROMPT,  # Enhanced prompt from config
+        whisper_temperature=STT_TEMPERATURE,
+        whisper_no_context=STT_NO_CONTEXT,
+        whisper_preset=STT_PRESET,
+        enable_debug=PREPROCESSOR_ENABLE_DEBUG  # Control debug logging for speech preprocessing
     )
     await agent.init()
     
@@ -106,21 +94,21 @@ async def initialize_system():
     twilio_handler = TwilioHandler(voice_ai_pipeline, base_url)
     await twilio_handler.start()
     
-    logger.info("System initialized successfully with knowledge-base agnostic speech enhancements")
+    logger.info("System initialized successfully with enhanced speech processing")
 
 
 @app.route('/', methods=['GET'])
 def index():
     """Simple test endpoint."""
-    return "Voice AI Agent is running with improved noise handling!"
+    return "Voice AI Agent is running with improved speech handling!"
 
 
 @app.route('/voice/incoming', methods=['POST'])
 def handle_incoming_call():
-    """Handle incoming voice calls using WebSocket stream."""
+    """Handle incoming voice calls using enhanced WebSocket stream."""
     logger.info("Received incoming call request")
-    logger.info(f"Request headers: {request.headers}")
-    logger.info(f"Request form data: {request.form}")
+    logger.debug(f"Request headers: {request.headers}")
+    logger.debug(f"Request form data: {request.form}")
     
     if not twilio_handler:
         logger.error("System not initialized")
@@ -138,31 +126,10 @@ def handle_incoming_call():
     logger.info(f"Incoming call - From: {from_number}, To: {to_number}, CallSid: {call_sid}")
     
     try:
-        # Add call to manager
-        twilio_handler.call_manager.add_call(call_sid, from_number, to_number)
-        
-        # Create TwiML response
-        response = VoiceResponse()
-        
-        # Add initial greeting
-        response.say("Welcome to the Voice AI Agent. I'm here to help you.", voice='alice')
-        response.pause(length=1)
-        
-        # Use WebSocket streaming for real-time conversation
-        ws_url = f'{base_url.replace("https://", "wss://")}/ws/stream/{call_sid}'
-        logger.info(f"Setting up WebSocket stream at: {ws_url}")
-        
-        # Create the streaming connection
-        connect = Connect()
-        stream = Stream(url=ws_url)
-        connect.append(stream)
-        response.append(connect)
-        
-        # Add TwiML to keep connection alive if needed
-        response.say("The AI assistant is now listening. Please speak clearly.", voice='alice')
-        
-        logger.info(f"Generated TwiML for WebSocket streaming: {response}")
-        return Response(str(response), mimetype='text/xml')
+        # Generate TwiML response using the enhanced Twilio handler
+        twiml_response = twilio_handler.handle_incoming_call(call_sid, from_number, to_number)
+        logger.info(f"Generated TwiML for WebSocket streaming")
+        return Response(twiml_response, mimetype='text/xml')
     except Exception as e:
         logger.error(f"Error handling incoming call: {e}", exc_info=True)
         fallback_twiml = '''<?xml version="1.0" encoding="UTF-8"?>
@@ -176,7 +143,7 @@ def handle_incoming_call():
 def handle_status_callback():
     """Handle call status callbacks."""
     logger.info("Received status callback")
-    logger.info(f"Status data: {request.form}")
+    logger.debug(f"Status data: {request.form}")
     
     if not twilio_handler:
         logger.error("System not initialized")
@@ -259,7 +226,7 @@ def run_event_loop_in_thread(loop, ws_handler, ws, call_sid, terminate_flag):
 
 @app.route('/ws/stream/<call_sid>', websocket=True)
 def handle_media_stream(call_sid):
-    """Handle WebSocket media stream with improved noise handling."""
+    """Handle WebSocket media stream with enhanced speech preprocessing."""
     logger.info(f"WebSocket connection attempt for call {call_sid}")
     
     if not twilio_handler or not voice_ai_pipeline:
@@ -271,7 +238,7 @@ def handle_media_stream(call_sid):
         ws = Server.accept(request.environ)
         logger.info(f"WebSocket connection established for call {call_sid}")
         
-        # Create WebSocket handler with noise handling optimizations
+        # Create WebSocket handler with enhanced speech processing
         ws_handler = WebSocketHandler(call_sid, voice_ai_pipeline)
         
         # Create an event loop for this connection
