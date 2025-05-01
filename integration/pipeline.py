@@ -1,8 +1,5 @@
 """
-End-to-end pipeline orchestration for Voice AI Agent.
-
-This module provides high-level functions for running the complete
-STT -> Knowledge Base -> TTS pipeline with Deepgram STT integration.
+End-to-end pipeline orchestration for Voice AI Agent with streaming response generation.
 """
 import os
 import asyncio
@@ -16,7 +13,6 @@ from speech_to_text.deepgram_stt import DeepgramStreamingSTT
 from speech_to_text.stt_integration import STTIntegration
 from knowledge_base.conversation_manager import ConversationManager
 from knowledge_base.llama_index.query_engine import QueryEngine
-
 from integration.tts_integration import TTSIntegration
 
 # Minimum word count for a valid user query
@@ -140,65 +136,72 @@ class VoiceAIAgentPipeline:
         timings["stt"] = time.time() - stt_start
         logger.info(f"Transcription completed in {timings['stt']:.2f}s: {transcription}")
         
-        # STAGE 2: Knowledge Base Query
-        logger.info("STAGE 2: Knowledge Base Query")
+        # STAGE 2 & 3: Knowledge Base Query & TTS (now with streaming)
+        logger.info("STAGE 2 & 3: Knowledge Base Query with Streaming TTS")
         kb_start = time.time()
         
         try:
-            # Retrieve context and generate response
-            retrieval_results = await self.query_engine.retrieve_with_sources(transcription)
-            query_result = await self.query_engine.query(transcription)
-            response = query_result.get("response", "")
+            # Create an output audio buffer to combine chunks
+            output_audio = bytearray()
             
-            if not response:
-                return {"error": "No response generated from knowledge base"}
+            # Define TTS callback to handle audio as it's generated
+            async def handle_tts_chunk(audio_chunk: bytes):
+                nonlocal output_audio
+                output_audio.extend(audio_chunk)
                 
-            timings["kb"] = time.time() - kb_start
-            logger.info(f"Response generated: {response[:50]}...")
+                # Write to file if specified
+                if output_speech_file:
+                    with open(output_speech_file, "wb") as f:
+                        f.write(output_audio)
             
-        except Exception as e:
-            logger.error(f"Error in KB stage: {e}")
-            return {"error": f"Knowledge base error: {str(e)}"}
-        
-        # STAGE 3: Text-to-Speech
-        logger.info("STAGE 3: Text-to-Speech")
-        tts_start = time.time()
-        
-        try:
-            # Convert response to speech
-            speech_audio = await self.tts_integration.text_to_speech(response)
+            # Use streaming query with TTS
+            logger.info("Starting streaming query and TTS...")
+            async for chunk in self.query_engine.query_with_streaming(transcription):
+                # Process each text chunk
+                chunk_text = chunk.get("chunk", "")
+                
+                if "error" in chunk:
+                    logger.error(f"Error in streaming query: {chunk['error']}")
+                    return {"error": chunk["error"], "transcription": transcription}
+                
+                # End of stream
+                if chunk.get("done", False):
+                    full_response = chunk.get("full_response", "")
+                    logger.info(f"Completed response: {full_response}")
+                    break
+                
+                # Skip empty chunks
+                if not chunk_text:
+                    continue
+                
+                # Generate speech for this chunk and process immediately
+                logger.info(f"Converting chunk to speech: {chunk_text}")
+                speech_audio = await self.tts_integration.text_to_speech(chunk_text)
+                await handle_tts_chunk(speech_audio)
             
-            # Save speech audio if output file specified
-            if output_speech_file:
-                os.makedirs(os.path.dirname(os.path.abspath(output_speech_file)), exist_ok=True)
-                with open(output_speech_file, "wb") as f:
-                    f.write(speech_audio)
-                logger.info(f"Saved speech audio to {output_speech_file}")
+            timings["kb_tts"] = time.time() - kb_start
+            logger.info(f"Streaming KB+TTS completed in {timings['kb_tts']:.2f}s")
             
-            timings["tts"] = time.time() - tts_start
-            logger.info(f"TTS completed in {timings['tts']:.2f}s, generated {len(speech_audio)} bytes")
+            # Calculate total time
+            total_time = time.time() - start_time
+            logger.info(f"End-to-end pipeline completed in {total_time:.2f}s")
             
-        except Exception as e:
-            logger.error(f"Error in TTS stage: {e}")
+            # Final results include the combined audio
             return {
-                "error": f"TTS error: {str(e)}",
                 "transcription": transcription,
-                "response": response
+                "response": chunk.get("full_response", ""),
+                "speech_audio_size": len(output_audio),
+                "speech_audio": bytes(output_audio) if not output_speech_file else None,
+                "timings": timings,
+                "total_time": total_time
             }
-        
-        # Calculate total time
-        total_time = time.time() - start_time
-        logger.info(f"End-to-end pipeline completed in {total_time:.2f}s")
-        
-        # Compile results
-        return {
-            "transcription": transcription,
-            "response": response,
-            "speech_audio_size": len(speech_audio),
-            "speech_audio": None if output_speech_file else speech_audio,
-            "timings": timings,
-            "total_time": total_time
-        }
+            
+        except Exception as e:
+            logger.error(f"Error in streaming KB/TTS: {e}", exc_info=True)
+            return {
+                "error": f"Streaming error: {str(e)}",
+                "transcription": transcription
+            }
     
     async def process_audio_streaming(
         self,
@@ -249,13 +252,14 @@ class VoiceAIAgentPipeline:
         
         # Stream the response with TTS
         try:
-            # Stream the response directly to TTS
+            # Track stats
             total_chunks = 0
             total_audio_bytes = 0
             response_start_time = time.time()
             full_response = ""
             
-            # Use the query engine's streaming method
+            # Use the query engine's streaming method directly connected to TTS
+            # This is the key change - directly streaming chunks to TTS and audio output
             async for chunk in self.query_engine.query_with_streaming(transcription):
                 chunk_text = chunk.get("chunk", "")
                 
@@ -263,13 +267,21 @@ class VoiceAIAgentPipeline:
                     # Add to full response
                     full_response += chunk_text
                     
-                    # Convert to speech and send to callback
+                    # Log the chunk
+                    logger.info(f"Processing response chunk: {chunk_text}")
+                    
+                    # Convert to speech and send to callback immediately
                     audio_data = await self.tts_integration.text_to_speech(chunk_text)
                     await audio_callback(audio_data)
                     
                     # Update stats
                     total_chunks += 1
                     total_audio_bytes += len(audio_data)
+                    
+                    # If large chunks, break them up for more natural speech
+                    if len(chunk_text) > 100:
+                        # Add a small pause between long chunks
+                        await asyncio.sleep(0.05)
             
             # Calculate stats
             response_time = time.time() - response_start_time
@@ -299,7 +311,7 @@ class VoiceAIAgentPipeline:
         speech_output_path: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Process audio data through the complete pipeline.
+        Process audio data through the complete pipeline with streaming.
         
         Args:
             audio_data: Audio data as bytes or numpy array
@@ -339,43 +351,41 @@ class VoiceAIAgentPipeline:
         timings = {"stt": time.time() - stt_start}
         logger.info(f"Transcription completed in {timings['stt']:.2f}s: {transcription}")
         
-        # STAGE 2: Knowledge Base Query
-        logger.info("STAGE 2: Knowledge Base Query")
+        # STAGE 2 & 3: Knowledge Base Query with streaming TTS
+        logger.info("STAGE 2 & 3: Knowledge Base Query with Streaming TTS")
         kb_start = time.time()
         
         try:
-            # Retrieve context and generate response
-            retrieval_results = await self.query_engine.retrieve_with_sources(transcription)
-            query_result = await self.query_engine.query(transcription)
-            response = query_result.get("response", "")
+            # Buffer for collecting audio
+            speech_audio_buffer = bytearray()
             
-            if not response:
-                return {"error": "No response generated from knowledge base"}
+            # Define callback to collect audio chunks
+            async def collect_audio(audio_chunk: bytes):
+                nonlocal speech_audio_buffer
+                speech_audio_buffer.extend(audio_chunk)
+            
+            # Stream response directly to TTS and audio output
+            async for chunk in self.query_engine.query_with_streaming(transcription):
+                chunk_text = chunk.get("chunk", "")
                 
-            timings["kb"] = time.time() - kb_start
-            logger.info(f"Response generated: {response[:50]}...")
+                # Skip empty chunks
+                if not chunk_text:
+                    continue
+                
+                # Get and process speech audio
+                audio_chunk = await self.tts_integration.text_to_speech(chunk_text)
+                await collect_audio(audio_chunk)
             
-        except Exception as e:
-            logger.error(f"Error in KB stage: {e}")
-            return {"error": f"Knowledge base error: {str(e)}"}
-        
-        # STAGE 3: Text-to-Speech
-        logger.info("STAGE 3: Text-to-Speech")
-        tts_start = time.time()
-        
-        try:
-            # Convert response to speech
-            speech_audio = await self.tts_integration.text_to_speech(response)
+            # Finalize TTS processing
+            timings["kb_tts"] = time.time() - kb_start
+            logger.info(f"KB+TTS completed in {timings['kb_tts']:.2f}s, generated {len(speech_audio_buffer)} bytes")
             
             # Save speech audio if output file specified
-            if speech_output_path:
+            if speech_output_path and speech_audio_buffer:
                 os.makedirs(os.path.dirname(os.path.abspath(speech_output_path)), exist_ok=True)
                 with open(speech_output_path, "wb") as f:
-                    f.write(speech_audio)
+                    f.write(speech_audio_buffer)
                 logger.info(f"Saved speech audio to {speech_output_path}")
-            
-            timings["tts"] = time.time() - tts_start
-            logger.info(f"TTS completed in {timings['tts']:.2f}s, generated {len(speech_audio)} bytes")
             
             # Calculate total time
             total_time = time.time() - start_time
@@ -383,19 +393,18 @@ class VoiceAIAgentPipeline:
             # Compile results
             return {
                 "transcription": transcription,
-                "response": response,
-                "speech_audio_size": len(speech_audio),
-                "speech_audio": speech_audio,
+                "response": chunk.get("full_response", ""),
+                "speech_audio_size": len(speech_audio_buffer),
+                "speech_audio": bytes(speech_audio_buffer) if not speech_output_path else None,
                 "timings": timings,
                 "total_time": total_time
             }
             
         except Exception as e:
-            logger.error(f"Error in TTS stage: {e}")
+            logger.error(f"Error in KB/TTS stage: {e}")
             return {
-                "error": f"TTS error: {str(e)}",
-                "transcription": transcription,
-                "response": response
+                "error": f"Processing error: {str(e)}",
+                "transcription": transcription
             }
     
     async def _transcribe_audio(self, audio: np.ndarray) -> tuple[str, float]:
@@ -570,7 +579,7 @@ class VoiceAIAgentPipeline:
         audio_output_callback: Callable[[bytes], Awaitable[None]]
     ) -> AsyncIterator[Dict[str, Any]]:
         """
-        Process a real-time audio stream with immediate response.
+        Process a real-time audio stream with immediate streaming response.
         
         This method is designed for WebSocket-based streaming where audio chunks
         are continuously arriving and responses should be sent back as soon as possible.
@@ -618,17 +627,27 @@ class VoiceAIAgentPipeline:
             
             # Process incoming audio chunks
             async for audio_chunk in audio_chunk_generator:
-                # Add to accumulated audio
-                if isinstance(audio_chunk, bytes):
-                    audio_chunk = np.frombuffer(audio_chunk, dtype=np.float32)
+                # Convert to float32 if needed
+                if audio_chunk.dtype != np.float32:
+                    # Try converting common types
+                    if audio_chunk.dtype == np.int16:
+                        audio_chunk = audio_chunk.astype(np.float32) / 32768.0
+                    elif audio_chunk.dtype == np.int32:
+                        audio_chunk = audio_chunk.astype(np.float32) / 2147483648.0
+                    elif audio_chunk.dtype == np.uint8: # Assuming unsigned 8-bit PCM
+                         audio_chunk = (audio_chunk.astype(np.float32) - 128.0) / 128.0
+                    else:
+                         # Fallback conversion, might not be correct range
+                         logger.warning(f"Unsupported audio dtype {audio_chunk.dtype}, attempting direct conversion to float32.")
+                         audio_chunk = audio_chunk.astype(np.float32)
                 
-                # Check for speech activity
-                is_silence = np.mean(np.abs(audio_chunk)) < silence_threshold
+                # Check for speech activity - simplified
+                is_speech = np.mean(np.abs(audio_chunk)) > silence_threshold
                 
-                if is_silence:
-                    silence_frames += 1
-                else:
+                if is_speech:
                     silence_frames = 0
+                else:
+                    silence_frames += 1
                 
                 # Process the audio chunk through appropriate STT
                 if self.using_deepgram:
@@ -654,31 +673,40 @@ class VoiceAIAgentPipeline:
                                 "transcription": transcription
                             }
                             
-                            # Generate response if not already processing
+                            # Generate streaming response if not already processing
                             if not processing:
                                 processing = True
                                 try:
-                                    # Query knowledge base
-                                    query_result = await self.query_engine.query(transcription)
-                                    response = query_result.get("response", "")
+                                    # Start streaming response directly
+                                    logger.info(f"Streaming response for: {transcription}")
                                     
-                                    if response:
-                                        # Convert to speech
-                                        speech_audio = await self.tts_integration.text_to_speech(response)
+                                    # Stream each chunk directly to audio output
+                                    async for chunk in self.query_engine.query_with_streaming(transcription):
+                                        chunk_text = chunk.get("chunk", "")
                                         
-                                        # Send through callback
-                                        await audio_output_callback(speech_audio)
-                                        
-                                        # Yield response
-                                        yield {
-                                            "status": "response",
-                                            "transcription": transcription,
-                                            "response": response,
-                                            "audio_size": len(speech_audio)
-                                        }
-                                        
-                                        # Update last transcription
-                                        last_transcription = transcription
+                                        if chunk_text:
+                                            # Convert chunk to speech immediately
+                                            speech_audio = await self.tts_integration.text_to_speech(chunk_text)
+                                            
+                                            # Send through callback
+                                            await audio_output_callback(speech_audio)
+                                            
+                                            # Yield chunk response
+                                            yield {
+                                                "status": "chunk",
+                                                "chunk": chunk_text
+                                            }
+                                    
+                                    # Final response notification
+                                    yield {
+                                        "status": "response",
+                                        "transcription": transcription,
+                                        "response_complete": True
+                                    }
+                                    
+                                    # Update last transcription
+                                    last_transcription = transcription
+                                    
                                 finally:
                                     processing = False
                 else:
@@ -710,27 +738,42 @@ class VoiceAIAgentPipeline:
                             # Process response
                             processing = True
                             try:
-                                # Query knowledge base
-                                query_result = await self.query_engine.query(transcription)
-                                response = query_result.get("response", "")
+                                # Yield transcription update
+                                yield {
+                                    "status": "transcribed",
+                                    "transcription": transcription
+                                }
                                 
-                                if response:
-                                    # Convert to speech
-                                    speech_audio = await self.tts_integration.text_to_speech(response)
+                                # Stream directly to TTS and audio output
+                                logger.info(f"Streaming response for: {transcription}")
+                                
+                                # Stream each chunk directly to audio output
+                                async for chunk in self.query_engine.query_with_streaming(transcription):
+                                    chunk_text = chunk.get("chunk", "")
                                     
-                                    # Send through callback
-                                    await audio_output_callback(speech_audio)
-                                    
-                                    # Yield response
-                                    yield {
-                                        "status": "response",
-                                        "transcription": transcription,
-                                        "response": response,
-                                        "audio_size": len(speech_audio)
-                                    }
-                                    
-                                    # Update last transcription
-                                    last_transcription = transcription
+                                    if chunk_text:
+                                        # Convert chunk to speech immediately
+                                        speech_audio = await self.tts_integration.text_to_speech(chunk_text)
+                                        
+                                        # Send through callback
+                                        await audio_output_callback(speech_audio)
+                                        
+                                        # Yield chunk response
+                                        yield {
+                                            "status": "chunk",
+                                            "chunk": chunk_text
+                                        }
+                                
+                                # Final response notification
+                                yield {
+                                    "status": "response",
+                                    "transcription": transcription,
+                                    "response_complete": True
+                                }
+                                
+                                # Update last transcription
+                                last_transcription = transcription
+                                
                             finally:
                                 processing = False
                         
@@ -758,25 +801,38 @@ class VoiceAIAgentPipeline:
             if (final_transcription and 
                 len(final_transcription.split()) >= MIN_VALID_WORDS and 
                 final_transcription != last_transcription):
-                # Generate final response
-                query_result = await self.query_engine.query(final_transcription)
-                final_response = query_result.get("response", "")
+                # Generate final streaming response
+                logger.info(f"Processing final transcription: {final_transcription}")
                 
-                if final_response:
-                    # Convert to speech
-                    final_speech = await self.tts_integration.text_to_speech(final_response)
+                # Yield transcription update
+                yield {
+                    "status": "transcribed",
+                    "transcription": final_transcription
+                }
+                
+                # Stream directly to TTS and audio output
+                async for chunk in self.query_engine.query_with_streaming(final_transcription):
+                    chunk_text = chunk.get("chunk", "")
                     
-                    # Send through callback
-                    await audio_output_callback(final_speech)
-                    
-                    # Yield final response
-                    yield {
-                        "status": "final",
-                        "transcription": final_transcription,
-                        "response": final_response,
-                        "audio_size": len(final_speech),
-                        "total_time": time.time() - start_time
-                    }
+                    if chunk_text:
+                        # Convert chunk to speech immediately
+                        final_speech = await self.tts_integration.text_to_speech(chunk_text)
+                        
+                        # Send through callback
+                        await audio_output_callback(final_speech)
+                        
+                        # Yield chunk response
+                        yield {
+                            "status": "chunk",
+                            "chunk": chunk_text
+                        }
+                
+                # Final complete response
+                yield {
+                    "status": "final",
+                    "transcription": final_transcription,
+                    "total_time": time.time() - start_time
+                }
             
             # Yield completion
             yield {

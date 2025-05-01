@@ -251,7 +251,7 @@ class AudioProcessor:
         Returns:
             True if barge-in is detected
         """
-        # Use the dedicated preprocessor for barge-in detection
+        # Use the dedicated preprocessor for barge-in detection - now more responsive
         return self.preprocessor.check_for_barge_in(audio_data)
     
     def set_agent_speaking(self, is_speaking: bool) -> None:
