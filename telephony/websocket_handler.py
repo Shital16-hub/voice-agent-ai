@@ -620,22 +620,26 @@ class WebSocketHandler:
     async def _process_audio(self, ws) -> None:
         """
         Process accumulated audio data through the pipeline with Google Cloud Speech-to-Text.
-        Also handles short commands and improves barge-in detection.
+        Simplified to bypass excessive preprocessing.
         
         Args:
             ws: WebSocket connection
         """
         try:
-            # Convert buffer to PCM with enhanced processing
+            # Convert mulaw buffer to PCM, but with minimal preprocessing
             try:
                 mulaw_bytes = bytes(self.input_buffer)
                 
-                # Convert using the enhanced audio processing
-                pcm_audio = self.audio_processor.mulaw_to_pcm(mulaw_bytes)
+                # Basic conversion without extensive preprocessing
+                pcm_audio = np.frombuffer(audioop.ulaw2lin(mulaw_bytes, 2), dtype=np.int16).astype(np.float32) / 32768.0
                 
-                # Ensure float32 format
-                if pcm_audio.dtype != np.float32:
-                    pcm_audio = pcm_audio.astype(np.float32)
+                # Simple normalization and noise-gating
+                if np.max(np.abs(pcm_audio)) > 0:
+                    pcm_audio = pcm_audio / np.max(np.abs(pcm_audio)) * 0.95
+                    
+                # Basic noise gate - very mild
+                noise_threshold = 0.01
+                pcm_audio = np.where(np.abs(pcm_audio) < noise_threshold, 0, pcm_audio)
                 
             except Exception as e:
                 logger.error(f"Error converting audio: {e}")
@@ -644,32 +648,19 @@ class WebSocketHandler:
                 self.input_buffer = self.input_buffer[half_size:]
                 return
                     
-            # Add checks for audio quality
+            # Add basic check for audio quality
             if len(pcm_audio) < 1000:  # Very small audio chunk
                 logger.warning(f"Audio chunk too small: {len(pcm_audio)} samples")
                 return
             
-            # Use enhanced preprocessor to check if audio contains actual speech
-            contains_speech = self.audio_processor.contains_speech(pcm_audio)
-            if not contains_speech:
-                logger.info("No speech detected in audio buffer, skipping processing")
-                
-                # Increment silent frame counter
-                self.consecutive_silent_frames += 1
-                
-                # Only reduce buffer if we've confirmed it's truly silence
-                # (multiple consecutive silent frames)
-                if self.consecutive_silent_frames >= self.min_silent_frames_for_silence:
-                    # Reduce buffer size but keep some context
-                    half_size = len(self.input_buffer) // 2
-                    self.input_buffer = self.input_buffer[half_size:]
-                    logger.debug(f"Confirmed silence, reduced buffer to {len(self.input_buffer)} bytes")
-                    self.consecutive_silent_frames = 0  # Reset counter
-                
+            # Simple energy check instead of complex speech detection
+            audio_energy = np.mean(np.abs(pcm_audio))
+            if audio_energy < 0.01:  # Very simple and lenient energy threshold
+                logger.info(f"Audio energy too low: {audio_energy:.4f}, skipping processing")
+                # Reduce buffer size but keep some context
+                half_size = len(self.input_buffer) // 2
+                self.input_buffer = self.input_buffer[half_size:]
                 return
-            
-            # If we get here, we have speech - reset silent frame counter
-            self.consecutive_silent_frames = 0
             
             # Create a list to collect transcription results
             transcription_results = []
@@ -757,50 +748,12 @@ class WebSocketHandler:
                     # Log before cleanup for debugging
                     logger.info(f"RAW TRANSCRIPTION: '{transcription}'")
                     
-                    # Clean up transcription
-                    transcription = self.cleanup_transcription(transcription)
+                    # Simple cleanup - less aggressive
+                    transcription = re.sub(r'\[.*?\]|\(.*?\)', '', transcription).strip()
                     logger.info(f"CLEANED TRANSCRIPTION: '{transcription}'")
                     
-                    # Check for noise keywords - skip knowledge base query for noise
-                    noise_keywords = ["click", "keyboard", "tongue", "scoff", "static", "*", "(", ")"]
-                    if any(keyword in transcription.lower() for keyword in noise_keywords):
-                        logger.info(f"Detected noise keywords in transcription, skipping: '{transcription}'")
-                        # Clear part of buffer and continue
-                        half_size = len(self.input_buffer) // 2
-                        self.input_buffer = self.input_buffer[half_size:]
-                        return
-                    
-                    # Check if this is a simple command before applying minimum word filter
-                    is_command, command_type = self._is_simple_command(transcription)
-                    if is_command:
-                        logger.info(f"Detected command: '{transcription}' -> {command_type}")
-                        
-                        # Clear input buffer since we recognized a command
-                        self.input_buffer.clear()
-                        
-                        # Handle the command
-                        command_handled = self._handle_command(command_type, ws)
-                        if command_handled:
-                            return
-                    
-                    # Check for empty transcriptions (if not a command)
-                    if not transcription:
-                        logger.info("Empty transcription, skipping")
-                        # Clear part of buffer and continue
-                        half_size = len(self.input_buffer) // 2
-                        self.input_buffer = self.input_buffer[half_size:]
-                        return
-                    
-                    # Check minimum word count for regular queries (not commands)
-                    if not is_command and len(transcription.split()) < self.min_words_for_valid_query:
-                        logger.info(f"Transcription too short, skipping: '{transcription}'")
-                        # Clear part of buffer and continue
-                        half_size = len(self.input_buffer) // 2
-                        self.input_buffer = self.input_buffer[half_size:]
-                        return
-                    
-                    # Process if it's a valid transcription or recognized command
-                    if transcription:
+                    # Process if it's a valid transcription with minimal filtering
+                    if transcription and len(transcription.split()) >= 1:  # Accept even single words
                         logger.info(f"Complete transcription: {transcription}")
                         
                         # Now clear the input buffer since we have a valid transcription
@@ -817,21 +770,14 @@ class WebSocketHandler:
                                 query_result = await self.pipeline.query_engine.query(transcription)
                                 response = query_result.get("response", "")
                                 
-                                # Make responses more concise for telephony
-                                if len(response.split()) > 100:  # Long response
-                                    paragraphs = response.split("\n\n")
-                                    if len(paragraphs) > 2:
-                                        # Keep first two paragraphs and summarize
-                                        response = "\n\n".join(paragraphs[:2])
-                                        response += "\n\nI have more details if you'd like me to continue."
-                                
                                 logger.info(f"Generated response: {response}")
                                 
                                 # Convert to speech
                                 if response and hasattr(self.pipeline, 'tts_integration'):
                                     try:
                                         # Set agent speaking state before sending audio
-                                        self.audio_processor.set_agent_speaking(True)
+                                        if hasattr(self.audio_processor, 'set_agent_speaking'):
+                                            self.audio_processor.set_agent_speaking(True)
                                         self.speech_cancellation_event.clear()
                                         
                                         speech_audio = await self.pipeline.tts_integration.text_to_speech(response)
@@ -844,51 +790,29 @@ class WebSocketHandler:
                                         await self._send_audio(mulaw_audio, ws)
                                         
                                     except Exception as tts_error:
-                                        logger.error(f"TTS Error: {tts_error}. Sending fallback response.", exc_info=True)
-                                        
+                                        logger.error(f"TTS Error: {tts_error}", exc_info=True)
                                         # Try to send a text-based fallback response
-                                        fallback_message = "I'm having trouble generating speech at the moment. Let me try again in a moment."
+                                        fallback_message = "I'm having trouble generating speech right now."
                                         
                                         try:
-                                            # Try to use a simple SSML template that works with all voices
+                                            # Use a simple message
                                             simple_audio = await self.pipeline.tts_integration.tts_client.synthesize(
-                                                "<speak>" + fallback_message + "</speak>", 
-                                                is_ssml=True
+                                                fallback_message, is_ssml=False
                                             )
                                             fallback_mulaw = self.audio_processor.pcm_to_mulaw(simple_audio)
                                             await self._send_audio(fallback_mulaw, ws)
                                         except Exception as fallback_error:
-                                            logger.error(f"Failed to generate fallback response: {fallback_error}")
-                                            
-                                            # Use a pre-recorded or simple beep as last resort
-                                            silence_duration = 0.5  # seconds
-                                            silence_size = int(8000 * silence_duration)
-                                            fallback_audio = bytes([0x7f] * silence_size)  # Simple audio
-                                            await self._send_audio(fallback_audio, ws)
-                                    
+                                            logger.error(f"Failed to generate fallback: {fallback_error}")
                                     finally:
                                         # Reset agent speaking state
-                                        self.audio_processor.set_agent_speaking(False)
+                                        if hasattr(self.audio_processor, 'set_agent_speaking'):
+                                            self.audio_processor.set_agent_speaking(False)
                                     
                                     # Update state
                                     self.last_transcription = transcription
                                     self.last_response_time = time.time()
                         except Exception as e:
                             logger.error(f"Error processing through knowledge base: {e}", exc_info=True)
-                            
-                            # Try to send a fallback response
-                            fallback_message = "I'm sorry, I'm having trouble understanding. Could you try again?"
-                            try:
-                                # Use simple SSML template
-                                fallback_audio = await self.pipeline.tts_integration.tts_client.synthesize(
-                                    "<speak>" + fallback_message + "</speak>",
-                                    is_ssml=True
-                                )
-                                mulaw_fallback = self.audio_processor.pcm_to_mulaw(fallback_audio)
-                                await self._send_audio(mulaw_fallback, ws)
-                                self.last_response_time = time.time()
-                            except Exception as e2:
-                                logger.error(f"Failed to send fallback response: {e2}")
                     else:
                         # If no valid transcription, reduce buffer size but keep some for context
                         half_size = len(self.input_buffer) // 2

@@ -23,6 +23,7 @@ class SpeechState:
     SPEECH_ENDED = 3
 
 class AudioPreprocessor:
+    
     """
     Advanced audio preprocessing with telephony optimization and superior
     speech/noise discrimination for Voice AI Agent applications.
@@ -35,18 +36,23 @@ class AudioPreprocessor:
     - Improved barge-in detection with cooldown periods
     """
     
+    """
+Modified section of AudioPreprocessor class to make speech detection less aggressive
+"""
+
     def __init__(
         self,
         sample_rate: int = 16000,
         enable_barge_in: bool = True,
-        barge_in_threshold: float = 0.055,  # Increased from 0.045
-        min_speech_frames_for_barge_in: int = 12,  # Increased from 10
-        barge_in_cooldown_ms: int = 2000,  # 2 second cooldown after agent speaks
-        speech_timeout_ms: int = 5000,  # 5 second speech timeout
+        barge_in_threshold: float = 0.045,  # Decreased from 0.055
+        min_speech_frames_for_barge_in: int = 8,  # Decreased from 12
+        barge_in_cooldown_ms: int = 1500,  # Decreased from 2000
+        speech_timeout_ms: int = 5000,
         enable_debug: bool = False
     ):
+        
         """
-        Initialize the AudioPreprocessor.
+        Initialize the AudioPreprocessor with less aggressive thresholds.
         
         Args:
             sample_rate: Audio sample rate (default 16kHz)
@@ -65,27 +71,27 @@ class AudioPreprocessor:
         self.speech_timeout_ms = speech_timeout_ms
         self.enable_debug = enable_debug
         
-        # Enhanced adaptive noise tracking
+        # Enhanced adaptive noise tracking with lower thresholds
         self.noise_samples = []
-        self.max_samples = 50  # Increased for better statistics
-        self.ambient_noise_level = 0.015  # Increased from 0.01 for better noise rejection
-        self.min_noise_floor = 0.008  # Increased from 0.005
+        self.max_samples = 50
+        self.ambient_noise_level = 0.008  # Decreased from 0.015 for less aggressive filtering
+        self.min_noise_floor = 0.004  # Decreased from 0.008
         
-        # Enhanced energy thresholds with hysteresis
-        self.low_threshold = self.ambient_noise_level * 2.0  # For detecting potential speech
-        self.high_threshold = self.ambient_noise_level * 4.5  # Increased from 3.5 for better noise rejection
+        # Enhanced energy thresholds with less aggressive hysteresis
+        self.low_threshold = self.ambient_noise_level * 1.5  # Decreased from 2.0
+        self.high_threshold = self.ambient_noise_level * 3.0  # Decreased from 4.5
         
         # Speech frequency band energy tracking
-        self.speech_band_energies: Deque[float] = deque(maxlen=30)
+        self.speech_band_energies = deque(maxlen=30)
         
         # Speech detection state machine
         self.speech_state = SpeechState.SILENCE
-        self.potential_speech_frames = 0  # Count of consecutive potential speech frames
-        self.confirmed_speech_frames = 0  # Count of consecutive confirmed speech frames
-        self.silence_frames = 0  # Count of consecutive silence frames
+        self.potential_speech_frames = 0
+        self.confirmed_speech_frames = 0
+        self.silence_frames = 0
         
         # Maintain enhanced audio buffer for improved detection
-        self.recent_audio_buffer: Deque[np.ndarray] = deque(maxlen=20)  # Buffer for analysis
+        self.recent_audio_buffer = deque(maxlen=20)
         
         # Barge-in state tracking
         self.agent_speaking = False
@@ -93,17 +99,17 @@ class AudioPreprocessor:
         self.barge_in_detected = False
         self.last_barge_in_time = 0.0
         
-        # Enable VAD warmup period - don't make decisions until we have enough data
-        self.vad_warmup_frames = 15
+        # Enable VAD warmup period - reduced
+        self.vad_warmup_frames = 10  # Decreased from 15
         self.frame_count = 0
         
         # Spectral history for better noise estimation
-        self.spectral_history: List[np.ndarray] = []
+        self.spectral_history = []
         self.max_spectral_history = 10
         
-        # Time-domain filters states - no longer used with simplified approach
-        self.hp_filter_state = None  # For high-pass filter
-        self.bp_filter_state = None  # For band-pass filter
+        # Time-domain filters states
+        self.hp_filter_state = None
+        self.bp_filter_state = None
         
         # Log initialization
         logger.info(f"AudioPreprocessor initialized with barge_in_threshold={barge_in_threshold}, "
@@ -469,8 +475,8 @@ class AudioPreprocessor:
     
     def contains_speech(self, audio_data: np.ndarray) -> bool:
         """
-        Enhanced speech detection with state machine for better noise discrimination.
-        Specifically optimized for telephony applications.
+        Enhanced speech detection with more lenient thresholds for better
+        detection in telephony applications.
         
         Args:
             audio_data: Audio data as numpy array
@@ -528,6 +534,7 @@ class AudioPreprocessor:
             if self.frame_count < self.vad_warmup_frames:
                 if self.enable_debug:
                     logger.debug(f"In warmup period, frame {self.frame_count}/{self.vad_warmup_frames}")
+                self.frame_count += 1  # Make sure to increment the frame count
                 return False
             
             # Log detailed VAD metrics for debugging
@@ -537,10 +544,10 @@ class AudioPreprocessor:
                            f"Flux: {spectral_flux:.4f}, Low threshold: {self.low_threshold:.4f}, "
                            f"High threshold: {self.high_threshold:.4f}")
             
-            # State machine for more robust speech detection
+            # State machine for more robust speech detection with more lenient thresholds
             if self.speech_state == SpeechState.SILENCE:
-                # Check if potential speech detected - more strict criteria
-                if rms_energy > self.low_threshold and speech_ratio > 0.6:  # Increased from 0.5
+                # Check if potential speech detected - more lenient criteria
+                if rms_energy > self.low_threshold and speech_ratio > 0.45:  # Decreased from 0.6
                     self.speech_state = SpeechState.POTENTIAL_SPEECH
                     self.potential_speech_frames = 1
                     if self.enable_debug:
@@ -550,12 +557,12 @@ class AudioPreprocessor:
                 
             elif self.speech_state == SpeechState.POTENTIAL_SPEECH:
                 # Check if still potential speech
-                if rms_energy > self.low_threshold and speech_ratio > 0.6:  # Increased from 0.5
+                if rms_energy > self.low_threshold and speech_ratio > 0.45:  # Decreased from 0.6
                     self.potential_speech_frames += 1
-                    # Check if we have enough frames to move to confirmed speech - more frames required
-                    if self.potential_speech_frames >= 4:  # Increased from 3 for better confidence
-                        # Check against higher threshold for confirmation - stricter criteria
-                        if rms_energy > self.high_threshold and speech_ratio > 0.65:  # Increased from 0.6
+                    # Check if we have enough frames to move to confirmed speech - fewer frames required
+                    if self.potential_speech_frames >= 3:  # Decreased from 4
+                        # Check against higher threshold for confirmation - more lenient criteria
+                        if rms_energy > self.high_threshold * 0.7 or speech_ratio > 0.5:  # Decreased from 0.65
                             self.speech_state = SpeechState.CONFIRMED_SPEECH
                             self.confirmed_speech_frames = 1
                             logger.info(f"Speech confirmed: energy={rms_energy:.4f}, speech_ratio={speech_ratio:.2f}")
@@ -568,8 +575,8 @@ class AudioPreprocessor:
                     return False
                     
             elif self.speech_state == SpeechState.CONFIRMED_SPEECH:
-                # Check if still speech
-                if rms_energy > self.high_threshold * 0.7 or speech_ratio > 0.5:
+                # Check if still speech with more lenient conditions
+                if rms_energy > self.high_threshold * 0.6 or speech_ratio > 0.4:  # Decreased from 0.7/0.5
                     # Still speech, maintain state
                     self.confirmed_speech_frames += 1
                     self.silence_frames = 0
@@ -581,11 +588,11 @@ class AudioPreprocessor:
                     return True  # Still report as speech
                     
             elif self.speech_state == SpeechState.SPEECH_ENDED:
-                # Check if silence is confirmed
-                if rms_energy < self.high_threshold * 0.7 or speech_ratio < 0.4:
+                # Check if silence is confirmed - more lenient to avoid cutting off speech too early
+                if rms_energy < self.high_threshold * 0.6 or speech_ratio < 0.35:  # Decreased from 0.7/0.4
                     self.silence_frames += 1
-                    # Check if we have enough frames to confirm end of speech
-                    if self.silence_frames >= 6:  # Increased from 5 for more robust speech end detection
+                    # Check if we have enough frames to confirm end of speech - require more frames
+                    if self.silence_frames >= 8:  # Increased from 6 for more tolerance of pauses
                         self.speech_state = SpeechState.SILENCE
                         self.silence_frames = 0
                         return False
@@ -597,11 +604,11 @@ class AudioPreprocessor:
                     self.silence_frames = 0
                     return True
                     
-            # Default fallback - use direct detection
+            # Default fallback - use more lenient direct detection
             is_speech = (
-                (rms_energy > self.high_threshold) and 
-                (zero_crossings > 0.01 and zero_crossings < 0.15) and
-                ((speech_ratio > 0.6 and speech_ratio > avg_speech_ratio * 0.8) or spectral_flux > 0.2)  # Increased threshold
+                (rms_energy > self.high_threshold * 0.7) or 
+                (zero_crossings > 0.01 and zero_crossings < 0.15 and rms_energy > self.high_threshold * 0.5) or
+                ((speech_ratio > 0.5 and speech_ratio > avg_speech_ratio * 0.7) or spectral_flux > 0.15)  # Decreased
             )
             
             if is_speech and self.enable_debug:
@@ -611,9 +618,9 @@ class AudioPreprocessor:
             
         except Exception as e:
             logger.error(f"Error in speech detection: {e}")
-            # Fall back to simple energy threshold
+            # Fall back to simple energy threshold with more lenient value
             energy = np.mean(np.abs(audio_data))
-            return energy > max(0.025, self.ambient_noise_level * 4.0)  # Higher threshold
+            return energy > max(0.015, self.ambient_noise_level * 3.0)  # Decreased from 0.025/4.0
     
     def check_for_barge_in(self, audio_data: np.ndarray) -> bool:
         """

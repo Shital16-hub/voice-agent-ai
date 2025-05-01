@@ -207,30 +207,23 @@ class GoogleCloudStreamingSTT:
             # Create the recognition config
             rec_config = speech.RecognitionConfig(**self.streaming_config["config"])
             
-            # Create the streaming config
+            # Create the streaming config - this is what we'll pass as the config parameter
             streaming_config = speech.StreamingRecognitionConfig(
                 config=rec_config,
                 interim_results=self.streaming_config["interim_results"]
             )
             
-            # Define an explicit stream generator function for more control
-            def generate_requests():
-                # First request must only contain config
-                initial_request = speech.StreamingRecognizeRequest(
-                    streaming_config=streaming_config
-                )
-                yield initial_request
-                
-                # Process audio chunks from queue
+            # Create an audio generator that yields requests with ONLY audio content
+            # The config will be passed separately
+            def request_generator():
+                # Process audio chunks from queue - no config in these requests
                 while not self.stop_event.is_set():
                     # Get audio chunk from queue with timeout
                     try:
                         audio_chunk = self.audio_queue.get(timeout=0.5)
                         if audio_chunk:
-                            request = speech.StreamingRecognizeRequest(
-                                audio_content=audio_chunk
-                            )
-                            yield request
+                            # All requests contain only audio
+                            yield speech.StreamingRecognizeRequest(audio_content=audio_chunk)
                         self.audio_queue.task_done()
                     except queue.Empty:
                         # No audio available yet
@@ -239,9 +232,12 @@ class GoogleCloudStreamingSTT:
                         logger.error(f"Error processing audio chunk: {e}")
                         break
             
-            # Call streaming_recognize with the correct method signature for v2.32.0
+            # Call streaming_recognize with BOTH required parameters:
+            # 1. config - The streaming config
+            # 2. requests - The generator that produces only audio content requests
             response_stream = client.streaming_recognize(
-                requests=generate_requests()
+                config=streaming_config,
+                requests=request_generator()
             )
             
             # Process responses
@@ -287,7 +283,7 @@ class GoogleCloudStreamingSTT:
                     # Store as last result if final
                     if result.is_final:
                         self.last_result = transcription_result
-                        
+                    
         except Exception as e:
             logger.error(f"Error in streaming thread: {e}", exc_info=True)
             # Add error to result queue
