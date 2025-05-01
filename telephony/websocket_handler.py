@@ -1,7 +1,6 @@
 """
 Enhanced WebSocket handler for Twilio media streams with improved speech/noise
-discrimination and barge-in detection using the simplified AudioProcessor.
-This version has optimized Alexa-like conversation flow and improved barge-in functionality.
+discrimination and barge-in detection using the new AudioPreprocessor.
 """
 import json
 import base64
@@ -10,14 +9,11 @@ import logging
 import time
 import numpy as np
 import re
-import audioop
-import queue
-import threading
+import audioop  # Add this import
 from typing import Dict, Any, Callable, Awaitable, Optional, List, Union, Tuple
 from collections import deque
-from enum import Enum
 
-
+from telephony.audio_preprocessor import AudioPreprocessor, SpeechState
 from telephony.config import (
     CHUNK_SIZE, AUDIO_BUFFER_SIZE, SILENCE_THRESHOLD, SILENCE_DURATION, 
     MAX_BUFFER_SIZE, ENABLE_BARGE_IN, BARGE_IN_THRESHOLD, BARGE_IN_DETECTION_WINDOW
@@ -30,47 +26,69 @@ logger = logging.getLogger(__name__)
 
 # Enhanced patterns for non-speech annotations
 NON_SPEECH_PATTERNS = [
-    r'\[.*?\]',           # Anything in square brackets
-    r'\(.*?\)',           # Anything in parentheses
-    r'\<.*?\>',           # Anything in angle brackets
-    r'music playing',     # Common transcription
-    r'background noise',  # Common transcription
-    r'static',            # Common transcription
-    r'\b(um|uh|hmm|mmm)\b',  # Common filler words
+    r'\(.*?music.*?\)',         # (music), (tense music), etc.
+    r'\(.*?wind.*?\)',          # (wind), (wind blowing), etc.
+    r'\(.*?engine.*?\)',        # (engine), (engine revving), etc.
+    r'\(.*?noise.*?\)',         # (noise), (background noise), etc.
+    r'\(.*?sound.*?\)',         # (sound), (sounds), etc.
+    r'\(.*?silence.*?\)',       # (silence), etc.
+    r'\[.*?silence.*?\]',       # [silence], etc.
+    r'\[.*?BLANK.*?\]',         # [BLANK_AUDIO], etc.
+    r'\(.*?applause.*?\)',      # (applause), etc.
+    r'\(.*?laughter.*?\)',      # (laughter), etc.
+    r'\(.*?footsteps.*?\)',     # (footsteps), etc.
+    r'\(.*?breathing.*?\)',     # (breathing), etc.
+    r'\(.*?growling.*?\)',      # (growling), etc.
+    r'\(.*?coughing.*?\)',      # (coughing), etc.
+    r'\(.*?clap.*?\)',          # (clap), etc.
+    r'\(.*?laugh.*?\)',         # (laughing), etc.
+    # Additional noise patterns
+    r'\[.*?noise.*?\]',         # [noise], etc.
+    r'\(.*?background.*?\)',    # (background), etc.
+    r'\[.*?music.*?\]',         # [music], etc.
+    r'\(.*?static.*?\)',        # (static), etc.
+    r'\[.*?unclear.*?\]',       # [unclear], etc.
+    r'\(.*?inaudible.*?\)',     # (inaudible), etc.
+    r'<.*?noise.*?>',           # <noise>, etc.
+    r'music playing',           # Common transcription
+    r'background noise',        # Common transcription
+    r'static',                  # Common transcription
+    r'\*.*?\*',                 # *any text* (scoff, etc.)
+    r'^\(.*?\)$',               # Entire text is (in parentheses)
+    r'clicking',                # keyboard/tongue clicking
+    r'clacking',                # keyboard clacking
+    r'tongue',                  # tongue clicks
+    r'keyboard',                # keyboard noises
 ]
-
-class ConversationState(Enum):
-    IDLE = "idle"  # Not actively engaged
-    LISTENING = "listening"  # Listening for user input
-    PROCESSING = "processing"  # Processing user input
-    RESPONDING = "responding"  # Agent is speaking
-    PAUSED = "paused"  # Conversation paused
 
 class WebSocketHandler:
     """
-    Enhanced WebSocket handler for Twilio media streams with improved barge-in detection
-    and Alexa-like conversation flow.
+    Handles WebSocket connections for Twilio media streams with enhanced speech/noise discrimination.
+    Integrates the new AudioPreprocessor via the updated AudioProcessor.
     """
     
-    # Enhanced command lists
-    STOP_COMMANDS = [
-        "stop", "stop speaking", "stop talking", "be quiet", "shut up", "quiet", 
-        "enough", "halt", "pause", "quit", "exit", "bye", "end", "silence"
-    ]
-
-    CONTINUE_COMMANDS = [
-        "continue", "go on", "proceed", "resume", "keep going", "carry on", "go ahead"
-    ]
-
-    REPEAT_COMMANDS = [
-        "repeat", "say again", "repeat that", "what did you say", "say that again", 
-        "can you repeat", "again", "what was that"
-    ]
-
-    HELP_COMMANDS = [
-        "help", "help me", "what can you do", "how does this work", "instructions", 
-        "commands", "options"
-    ]
+    # Add these constants for command recognition
+    STOP_COMMANDS = ["stop", "okay", "ok", "enough", "halt", "pause", "quit", "exit", "bye", "end"]
+    SIMPLE_COMMANDS = {
+        "stop": "stop",
+        "okay": "stop",
+        "ok": "stop",
+        "enough": "stop",
+        "halt": "stop",
+        "pause": "stop",
+        "quit": "stop",
+        "exit": "stop",
+        "bye": "stop",
+        "end": "stop",
+        "continue": "continue",
+        "go on": "continue",
+        "proceed": "continue",
+        "yes": "continue",
+        "help": "help",
+        "repeat": "repeat",
+        "again": "repeat",
+        "what": "repeat"
+    }
     
     def __init__(self, call_sid: str, pipeline):
         """
@@ -83,13 +101,9 @@ class WebSocketHandler:
         self.call_sid = call_sid
         self.stream_sid = None
         self.pipeline = pipeline
+        self.audio_processor = pipeline.speech_recognizer.audio_processor if hasattr(pipeline.speech_recognizer, 'audio_processor') else None
         
-        # Get or create AudioProcessor - simplified approach that doesn't use AudioPreprocessor
-        self.audio_processor = None
-        if hasattr(pipeline, 'speech_recognizer') and hasattr(pipeline.speech_recognizer, 'audio_processor'):
-            self.audio_processor = pipeline.speech_recognizer.audio_processor
-        
-        # If no audio processor available, create one
+        # Initialize audio processor if not already present
         if not self.audio_processor:
             from telephony.audio_processor import AudioProcessor
             self.audio_processor = AudioProcessor()
@@ -103,7 +117,7 @@ class WebSocketHandler:
         self.silence_start_time = None
         self.is_processing = False
         self.conversation_active = True
-        self.sequence_number = 0
+        self.sequence_number = 0  # For Twilio media sequence tracking
         
         # Connection state tracking
         self.connected = False
@@ -116,444 +130,40 @@ class WebSocketHandler:
         self.processing_lock = asyncio.Lock()
         self.keep_alive_task = None
         
-        # Add variables for echo detection
-        self.agent_last_response = ""
-        self.echo_detection_window = 3.0
-        self.similarity_threshold = 0.5
-        self.last_agent_speech_time = 0.0
-        self.is_processing_self_echo = False
-        
-        # Conversation state management
-        self.conversation_state = ConversationState.IDLE
-        self.last_state_change_time = time.time()
-        self.max_state_duration = {
-            ConversationState.IDLE: 30.0,
-            ConversationState.LISTENING: 5.0,
-            ConversationState.PROCESSING: 3.0,
-            ConversationState.RESPONDING: 15.0,
-            ConversationState.PAUSED: 15.0
-        }
-        
-        # Track state timeout tasks
-        self.state_timeout_task = None
-        
-        # Create speech cancellation event for barge-in
-        self.speech_cancellation_event = asyncio.Event()
-        self.speech_cancellation_event.clear()
-        
-        # Create an event to signal when we should stop processing
-        self.stop_event = asyncio.Event()
-        
         # Compile the non-speech patterns for efficient use
         self.non_speech_pattern = re.compile('|'.join(NON_SPEECH_PATTERNS))
         
         # Conversation flow management with increased pause
-        self.pause_after_response = 0.8
-        self.min_words_for_valid_query = 1
+        self.pause_after_response = 4.0  # Increased from 3.0 seconds - wait 4 seconds after response
+        self.min_words_for_valid_query = 3  # Increased from 2 - minimum 3 words for a valid query
+        
+        # Create an event to signal when we should stop processing
+        self.stop_event = asyncio.Event()
+        
+        # Barge-in handling
+        self.speech_cancellation_event = asyncio.Event()
+        self.speech_cancellation_event.clear()
         
         # New: Add startup delay before processing audio (prevents false triggers at start)
         self.startup_time = time.time()
-        self.startup_delay_sec = 0.5
+        self.startup_delay_sec = 2.0  # 2 second delay before processing audio
         
         # New: Track consecutive silent frames for better silence detection
         self.consecutive_silent_frames = 0
-        self.min_silent_frames_for_silence = 3
+        self.min_silent_frames_for_silence = 10  # Increased from 5 - minimum 10 frames to be considered silence
         
         # New: Add a flag to prevent multiple barge-in detections in quick succession
         self.last_barge_in_time = 0
-        self.barge_in_cooldown_sec = 0.3
+        self.barge_in_cooldown_sec = 1.5  # 1.5 second cooldown between barge-ins
         
         # Track chunks processed since last processing 
         self.chunks_since_last_process = 0
         
-        # Reduced buffer size for lower latency
-        self.buffer_size_minimum = 4096  # Significantly reduced size for faster response
-        
-        # Conversation manager reference
-        if hasattr(self.pipeline, 'conversation_manager'):
-            self.conversation_manager = self.pipeline.conversation_manager
-        else:
-            self.conversation_manager = None
-        
-        # Add flag for "Alexa-like" wait indicator
-        self.has_played_listening_indicator = False
-        
-        # Add flag to track first interaction to avoid command detection
-        self.first_interaction = True
-        
-        # Add confidence threshold for command detection
-        self.min_command_confidence = 0.8
-        
-        # CRITICAL FIX: Add flag for barge-in recovery
-        self.barge_in_recovery_active = False
-        self.barge_in_recovery_time = 0
-        self.barge_in_recovery_timeout = 3.0  # 3 seconds
-        
-        # CRITICAL FIX: Add lock for STT reset operations
-        self.stt_reset_lock = asyncio.Lock()
-        
-        # CRITICAL FIX: Flag to track if we need to completely restart STT
-        self.needs_stt_restart = False
-        
-        # CRITICAL FIX: Save the voice response while we reset STT
-        self.pending_response = None
-        
-        # CRITICAL FIX: Add counter for failed STT operations
-        self.stt_reset_attempts = 0
-        self.max_stt_reset_attempts = 3
-        
-        # CRITICAL FIX: STT heartbeat task reference
-        self.stt_heartbeat_task = None
-        
-        logger.info(f"Enhanced WebSocketHandler initialized for call {call_sid} with simplified audio processing")
-    
-    # CRITICAL FIX: Add heartbeat mechanism to keep STT alive during responses
-    async def _start_stt_heartbeat(self):
-        """Send periodic small audio chunks to keep STT session alive."""
-        if not hasattr(self, 'stt_heartbeat_task') or self.stt_heartbeat_task is None:
-            self.stt_heartbeat_task = asyncio.create_task(self._stt_heartbeat_loop())
-
-    async def _stop_stt_heartbeat(self):
-        """Stop the STT heartbeat task."""
-        if hasattr(self, 'stt_heartbeat_task') and self.stt_heartbeat_task is not None:
-            self.stt_heartbeat_task.cancel()
-            try:
-                await self.stt_heartbeat_task
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.warning(f"Error cancelling STT heartbeat task: {e}")
-            self.stt_heartbeat_task = None
-
-    async def _stt_heartbeat_loop(self):
-        """Send silent audio chunks periodically to keep STT session alive."""
-        try:
-            while self.conversation_active:
-                # Only send heartbeat when agent is speaking (to prevent Audio Timeout errors)
-                if self.audio_processor.agent_speaking:
-                    try:
-                        speech_recognizer = self.pipeline.speech_recognizer
-                        if (hasattr(speech_recognizer, 'process_audio_chunk') and 
-                            hasattr(speech_recognizer, 'is_streaming') and 
-                            speech_recognizer.is_streaming):
-                            # Create a small silence audio chunk (50ms of silence at 16kHz)
-                            silence_chunk = bytes([0] * 1600)
-                            await speech_recognizer.process_audio_chunk(silence_chunk, callback=None)
-                            logger.debug("Sent STT heartbeat")
-                    except Exception as e:
-                        logger.warning(f"Error sending STT heartbeat: {e}")
-                
-                # Wait before next heartbeat
-                await asyncio.sleep(5.0)  # Send heartbeat every 5 seconds
-                
-        except asyncio.CancelledError:
-            logger.debug("STT heartbeat task cancelled")
-        except Exception as e:
-            logger.error(f"Error in STT heartbeat loop: {e}")
-    
-    def _set_conversation_state(self, new_state: ConversationState) -> None:
-        """
-        Set conversation state with enhanced conversational flow.
-        
-        Args:
-            new_state: New conversation state
-        """
-        old_state = self.conversation_state
-        if old_state == new_state:
-            return  # No change
-        
-        # Update state
-        self.conversation_state = new_state
-        self.last_state_change_time = time.time()
-        
-        # Log state change
-        logger.info(f"Conversation state change: {old_state.value} -> {new_state.value}")
-        
-        # Cancel existing timeout task
-        if self.state_timeout_task:
-            self.state_timeout_task.cancel()
-        
-        # Create new timeout task
-        max_duration = self.max_state_duration.get(new_state, 30.0)
-        self.state_timeout_task = asyncio.create_task(self._handle_state_timeout(new_state, max_duration))
-        
-        # Perform state-specific actions
-        if new_state == ConversationState.LISTENING:
-            # Reset listening indicator flag
-            self.has_played_listening_indicator = False
-            
-            # CRITICAL FIX: If we need STT restart, trigger it
-            if self.needs_stt_restart:
-                self.needs_stt_restart = False
-                asyncio.create_task(self._restart_google_stt())
-            
-            # Add a subtle audio indicator for listening state
-            if old_state == ConversationState.RESPONDING:
-                # Play a very short "ready" tone if we just finished speaking
-                asyncio.create_task(self._play_listening_indicator())
-                
-            # Mark barge-in recovery as complete when transitioning to listening
-            if self.barge_in_recovery_active:
-                logger.info("Barge-in recovery complete")
-                self.barge_in_recovery_active = False
-        
-        elif new_state == ConversationState.RESPONDING:
-            # Set agent speaking flag
-            if hasattr(self.audio_processor, 'set_agent_speaking'):
-                self.audio_processor.set_agent_speaking(True)
-                
-        elif new_state == ConversationState.IDLE or new_state == ConversationState.LISTENING:
-            # Clear agent speaking flag if transitioning from RESPONDING
-            if old_state == ConversationState.RESPONDING and hasattr(self.audio_processor, 'set_agent_speaking'):
-                self.audio_processor.set_agent_speaking(False)
-
-    # CRITICAL FIX: Complete restart of Google STT
-    async def _restart_google_stt(self):
-        """
-        Completely restart the Google STT system.
-        This is more aggressive than just stopping and starting the stream.
-        """
-        async with self.stt_reset_lock:
-            try:
-                speech_recognizer = self.pipeline.speech_recognizer
-                
-                logger.info("Performing complete Google STT restart")
-                
-                # First, try to stop any existing streaming session
-                if hasattr(speech_recognizer, 'stop_streaming'):
-                    try:
-                        await speech_recognizer.stop_streaming()
-                        await asyncio.sleep(0.3)  # Give it time to clean up
-                    except Exception as e:
-                        logger.warning(f"Error stopping STT: {e}")
-                
-                # CRITICAL FIX: Ensure streaming thread is properly cleaned up
-                if hasattr(speech_recognizer, 'streaming_thread'):
-                    try:
-                        if (speech_recognizer.streaming_thread and 
-                            hasattr(speech_recognizer.streaming_thread, 'is_alive') and 
-                            speech_recognizer.streaming_thread.is_alive()):
-                            # Set stop event if it exists
-                            if hasattr(speech_recognizer, 'stop_event') and speech_recognizer.stop_event:
-                                speech_recognizer.stop_event.set()
-                            
-                            # Wait for thread to join with timeout
-                            speech_recognizer.streaming_thread.join(timeout=0.5)
-                    except Exception as e:
-                        logger.warning(f"Error cleaning up STT thread: {e}")
-                    
-                    # Ensure thread reference is cleared
-                    speech_recognizer.streaming_thread = None
-                
-                # Ensure stop_event is reset
-                if hasattr(speech_recognizer, 'stop_event'):
-                    speech_recognizer.stop_event = None
-                
-                # Force reinitialization of client
-                if hasattr(speech_recognizer, 'client'):
-                    try:
-                        # Close the client if it has a close method
-                        if hasattr(speech_recognizer.client, 'close'):
-                            await speech_recognizer.client.close()
-                        
-                        # Reinitialize the client if it has an initialization method
-                        if hasattr(speech_recognizer, 'initialize_client'):
-                            await speech_recognizer.initialize_client()
-                            logger.info("Reinitialized Google Cloud STT client")
-                    except Exception as e:
-                        logger.error(f"Error reinitializing STT client: {e}")
-                
-                # Start a new streaming session after a delay
-                await asyncio.sleep(0.5)
-                
-                # Create new stop event before starting
-                if hasattr(speech_recognizer, 'stop_event') and speech_recognizer.stop_event is None:
-                    speech_recognizer.stop_event = threading.Event()
-                    speech_recognizer.stop_event.clear()
-                
-                if hasattr(speech_recognizer, 'start_streaming'):
-                    await speech_recognizer.start_streaming()
-                    logger.info("Started Google Cloud STT streaming session")
-                
-                # Reset state variables
-                self.stt_reset_attempts = 0
-                
-                # Send heartbeat audio to prevent timeout
-                if hasattr(speech_recognizer, 'process_audio_chunk'):
-                    # Create a small silence audio chunk to keep the session alive
-                    silence_chunk = bytes([0] * 1600)  # 0.1 seconds of silence at 16kHz
-                    try:
-                        await speech_recognizer.process_audio_chunk(silence_chunk, callback=None)
-                        logger.debug("Sent heartbeat audio to STT")
-                    except Exception as e:
-                        logger.warning(f"Error sending heartbeat audio: {e}")
-                
-                # If there was a pending response, try to send it now
-                if self.pending_response and self.ws:
-                    await self._send_audio(self.pending_response, self.ws)
-                    self.pending_response = None
-                
-            except Exception as e:
-                logger.error(f"Critical error during STT restart: {e}")
-                self.stt_reset_attempts += 1
-                
-                # If we've tried too many times, give up
-                if self.stt_reset_attempts >= self.max_stt_reset_attempts:
-                    logger.error("Maximum STT reset attempts reached, giving up")
-                    # Maybe try to send a message to the user that we're having technical difficulties
-                else:
-                    # Try again after a delay
-                    self.needs_stt_restart = True
-
-    async def _handle_state_timeout(self, expected_state: ConversationState, timeout: float) -> None:
-        """
-        Handle timeout for a conversation state.
-        
-        Args:
-            expected_state: The state that should timeout
-            timeout: Timeout duration in seconds
-        """
-        try:
-            await asyncio.sleep(timeout)
-            
-            # Only act if we're still in the same state
-            if self.conversation_state == expected_state:
-                logger.warning(f"Conversation state {expected_state.value} timed out after {timeout}s")
-                
-                # Handle timeout based on state
-                if expected_state == ConversationState.RESPONDING:
-                    # Force stop speaking
-                    self.speech_cancellation_event.set()
-                    self._set_conversation_state(ConversationState.LISTENING)
-                    
-                elif expected_state == ConversationState.PROCESSING:
-                    # Reset processing state
-                    self.is_processing = False
-                    self._set_conversation_state(ConversationState.LISTENING)
-                    
-                elif expected_state == ConversationState.LISTENING:
-                    # If listening too long without input, go to idle
-                    self._set_conversation_state(ConversationState.IDLE)
-                    
-                elif expected_state == ConversationState.PAUSED:
-                    # Resume from pause after timeout
-                    self._set_conversation_state(ConversationState.LISTENING)
-                
-                # Check if we're stuck in barge-in recovery
-                if self.barge_in_recovery_active:
-                    current_time = time.time()
-                    time_in_recovery = current_time - self.barge_in_recovery_time
-                    
-                    if time_in_recovery > self.barge_in_recovery_timeout:
-                        logger.warning(f"Stuck in barge-in recovery for {time_in_recovery:.1f}s, forcing reset")
-                        self.barge_in_recovery_active = False
-                        
-                        # Force STT restart
-                        self.needs_stt_restart = True
-                        asyncio.create_task(self._restart_google_stt())
-                        
-                        # Reset state
-                        self._set_conversation_state(ConversationState.LISTENING)
-                    
-        except asyncio.CancelledError:
-            # Task was cancelled, this is expected when state changes
-            pass
-        except Exception as e:
-            logger.error(f"Error in state timeout handler: {e}")
-
-    def _detect_barge_in(self, audio_data: np.ndarray) -> bool:
-        """
-        Enhanced barge-in detection that works directly with audio data.
-        
-        Args:
-            audio_data: Audio data as numpy array
-            
-        Returns:
-            True if barge-in is detected
-        """
-        if not self.audio_processor.agent_speaking:
-            return False  # Only check for barge-in when agent is speaking
-        
-        # Calculate energy of the audio
-        energy = np.mean(np.abs(audio_data))
-        
-        # Use a more sensitive threshold for barge-in detection
-        barge_in_threshold = 0.02  # Decreased for better sensitivity
-        
-        # Check for current time since agent started speaking
-        current_time = time.time()
-        time_since_agent_started = (current_time - self.audio_processor.agent_speaking_start_time) * 1000  # ms
-        
-        # Reduced delay before allowing barge-in
-        if time_since_agent_started < 500:  # Reduced to 500ms
-            return False
-        
-        # Check time since last barge-in to avoid multiple triggers
-        time_since_last_barge_in = (current_time - self.last_barge_in_time) * 1000  # ms
-        if time_since_last_barge_in < 300:  # Reduced to 300ms
-            return False
-        
-        # Check energy threshold
-        if energy > barge_in_threshold:
-            # Update last barge-in time
-            self.last_barge_in_time = current_time
-            logger.info(f"Barge-in detected! Energy: {energy:.4f}, Threshold: {barge_in_threshold:.4f}")
-            return True
-        
-        return False
-    
-    def _is_similar_to_last_response(self, transcription: str) -> bool:
-        """
-        Check if a transcription is similar to the agent's last response (indicating echo).
-        
-        Args:
-            transcription: Transcription text to check
-            
-        Returns:
-            True if transcription is likely an echo of agent's speech
-        """
-        if not self.agent_last_response or not transcription:
-            return False
-        
-        # Simple word-overlap similarity check
-        last_response_words = set(self.agent_last_response.lower().split())
-        transcription_words = set(transcription.lower().split())
-        
-        # If too few words to check meaningfully, be conservative
-        if len(transcription_words) < 2:
-            return False
-        
-        # Calculate overlap
-        intersection = last_response_words.intersection(transcription_words)
-        
-        if len(transcription_words) == 0:
-            return False
-            
-        # Calculate Jaccard similarity
-        similarity = len(intersection) / len(transcription_words)
-        
-        # Time-based factor - more strict just after agent spoke, more lenient as time passes
-        time_since_agent_speech = time.time() - self.last_agent_speech_time
-        time_factor = max(0.5, min(1.0, time_since_agent_speech / self.echo_detection_window))
-        
-        # Adjust threshold based on time
-        effective_threshold = self.similarity_threshold * time_factor
-        
-        # Log for debugging
-        if similarity > 0.3:  # Only log potentially problematic cases
-            logger.debug(f"Echo check: Similarity {similarity:.2f}, Time factor {time_factor:.2f}, " 
-                        f"Effective threshold {effective_threshold:.2f}")
-        
-        # Short transcriptions with high word match are likely echoes
-        if similarity > effective_threshold:
-            logger.info(f"Detected potential echo: '{transcription}' (similarity: {similarity:.2f})")
-            return True
-        
-        return False
+        logger.info(f"WebSocketHandler initialized for call {call_sid} with enhanced audio preprocessing")
     
     def _is_simple_command(self, text: str) -> Tuple[bool, str]:
         """
-        Improved method to check if text is a command with better matching for stop commands.
+        Check if text is a simple command like "stop", "okay", etc.
         
         Args:
             text: Text to check
@@ -563,63 +173,24 @@ class WebSocketHandler:
         """
         if not text:
             return False, ""
-        
+            
         # Clean and lowercase the text
         clean_text = text.lower().strip().rstrip('.!?')
         
-        # Special check for stop command with higher priority
-        stop_commands = ["stop", "stop speaking", "stop talking", "be quiet", "shut up", "quiet", 
-                        "enough", "halt", "pause", "quit", "exit", "bye", "end", "silence"]
+        # Direct matches
+        if clean_text in self.SIMPLE_COMMANDS:
+            return True, self.SIMPLE_COMMANDS[clean_text]
         
-        # Check if any word in the text matches stop commands exactly
-        words = clean_text.split()
-        for word in words:
-            if word in ["stop", "quiet", "silence", "halt", "pause"]:
-                logger.info(f"Detected stop command: '{clean_text}' -> stop")
-                return True, "stop"
-        
-        # Define all command categories
-        command_categories = {
-            "stop": self.STOP_COMMANDS,
-            "continue": self.CONTINUE_COMMANDS,
-            "repeat": self.REPEAT_COMMANDS,
-            "help": self.HELP_COMMANDS
-        }
-        
-        # Check each category
-        for command_type, commands in command_categories.items():
-            # Direct exact matches
-            if clean_text in commands:
-                logger.info(f"Detected exact command: '{clean_text}' -> {command_type}")
-                return True, command_type
-            
-            # Check if any command is a substring of the text
-            for cmd in commands:
-                if f" {cmd} " in f" {clean_text} " or clean_text.startswith(cmd + " ") or clean_text.endswith(" " + cmd):
-                    logger.info(f"Detected command in phrase: '{clean_text}' -> {command_type}")
-                    return True, command_type
-            
-            # Check for partial word matches with higher threshold for shorter commands
-            for cmd in commands:
-                cmd_tokens = cmd.split()
+        # Check for commands embedded in longer phrases
+        for command, action in self.SIMPLE_COMMANDS.items():
+            if f" {command} " in f" {clean_text} ":
+                return True, action
                 
-                # Skip short commands like "stop" for partial matching to avoid false positives
-                if len(cmd) < 5 and len(cmd_tokens) == 1:
-                    continue
-                    
-                # For multi-word commands, check if most words match
-                if len(cmd_tokens) > 1 and len(words) >= len(cmd_tokens):
-                    # FIXED: Use exact word matching instead of substring matching
-                    matches = sum(1 for cmd_token in cmd_tokens if cmd_token in words)
-                    if matches >= len(cmd_tokens) * 0.7:  # 70% of words match
-                        logger.info(f"Detected partial command match: '{clean_text}' -> {command_type}")
-                        return True, command_type
-        
         return False, ""
     
     def _handle_command(self, command_type: str, ws) -> bool:
         """
-        Improved command handling with better user feedback.
+        Handle a recognized command.
         
         Args:
             command_type: Type of command
@@ -633,40 +204,32 @@ class WebSocketHandler:
             logger.info("Stop command detected, interrupting speech")
             self.speech_cancellation_event.set()
             
-            # Set to paused state
-            self._set_conversation_state(ConversationState.PAUSED)
-            
-            # Send confirmation to user - shorter acknowledgment
-            asyncio.create_task(self.send_text_response("Okay, stopping.", ws))
+            # Send confirmation to user
+            asyncio.create_task(self.send_text_response("Okay, I'll stop.", ws))
             
             # Reset buffer
             self.input_buffer.clear()
             return True
             
         elif command_type == "continue":
-            # Acknowledge continue command and resume listening
+            # Acknowledge continue command
             logger.info("Continue command detected")
-            self._set_conversation_state(ConversationState.LISTENING)
             asyncio.create_task(self.send_text_response("I'll continue.", ws))
             return True
             
         elif command_type == "help":
-            # Provide help - more concise and informative
+            # Provide help
             logger.info("Help command detected")
-            help_text = ("You can ask me questions about VoiceAI and its features. "
-                        "You can also say 'stop' to interrupt me, 'repeat' to hear something again, "
-                        "or 'continue' to resume.")
+            help_text = "You can say things like 'stop', 'repeat', or ask me questions about our services."
             asyncio.create_task(self.send_text_response(help_text, ws))
             return True
             
         elif command_type == "repeat":
-            # Repeat last response with clear acknowledgment
+            # Repeat last response
             logger.info("Repeat command detected")
             if hasattr(self, 'last_transcription') and hasattr(self, 'last_response_time'):
                 if self.last_transcription:
-                    # First acknowledge
-                    asyncio.create_task(self.send_text_response("Sure, I'll repeat that.", ws))
-                    # Add a small delay before repeating
+                    # Reprocess the last query
                     asyncio.create_task(self._process_last_query(ws))
                     return True
             
@@ -675,16 +238,17 @@ class WebSocketHandler:
             return True
             
         return False
-    
+        
     async def _process_last_query(self, ws):
         """Reprocess the last valid query."""
         try:
             if hasattr(self, 'last_transcription') and self.last_transcription:
                 # Process through knowledge base
                 if hasattr(self.pipeline, 'query_engine'):
-                    logger.info(f"Repeating response for: {self.last_transcription}")
                     query_result = await self.pipeline.query_engine.query(self.last_transcription)
                     response = query_result.get("response", "")
+                    
+                    logger.info(f"Repeating response for: {self.last_transcription}")
                     
                     # Convert to speech
                     if response and hasattr(self.pipeline, 'tts_integration'):
@@ -712,7 +276,7 @@ class WebSocketHandler:
     
     def cleanup_transcription(self, text: str) -> str:
         """
-        More lenient cleanup of transcription text.
+        Enhanced cleanup of transcription text by removing non-speech annotations and filler words.
         
         Args:
             text: Original transcription text
@@ -722,12 +286,27 @@ class WebSocketHandler:
         """
         if not text:
             return ""
-            
-        # Keep simple cleanup but reduce filtering
-        cleaned_text = text
         
-        # Only remove obvious noise markers
-        cleaned_text = re.sub(r'\[.*?\]|\(.*?\)', '', cleaned_text)
+        # Add stronger filter for non-speech annotations - complete filter on noise-only transcriptions
+        if re.search(r'^\(.*?\)$', text) or text.startswith('*') or text.endswith('*'):
+            logger.info(f"Detected non-speech annotation, ignoring: '{text}'")
+            return ""  # Return empty for parenthesized content
+        
+        # Remove noise keywords
+        noise_keywords = ["click", "keyboard", "tongue", "scoff", "static", "clacking"]
+        for keyword in noise_keywords:
+            if keyword in text.lower():
+                logger.info(f"Detected noise keyword '{keyword}', ignoring: '{text}'")
+                return ""  # Return empty for noise content
+        
+        # Remove non-speech annotations
+        cleaned_text = self.non_speech_pattern.sub('', text)
+        
+        # Remove common filler words at beginning of sentences
+        cleaned_text = re.sub(r'^(um|uh|er|ah|like|so)\s+', '', cleaned_text, flags=re.IGNORECASE)
+        
+        # Remove repeated words (stuttering)
+        cleaned_text = re.sub(r'\b(\w+)( \1\b)+', r'\1', cleaned_text)
         
         # Clean up punctuation
         cleaned_text = re.sub(r'\s+([.,!?])', r'\1', cleaned_text)
@@ -741,30 +320,47 @@ class WebSocketHandler:
             
         return cleaned_text
     
-    async def _play_listening_indicator(self):
-        """Play a subtle audio indicator when the system is ready to listen."""
-        if self.has_played_listening_indicator:
-            return  # Don't play multiple times
+    def is_valid_transcription(self, text: str) -> bool:
+        """
+        Check if a transcription is valid and worth processing with enhanced criteria.
+        
+        Args:
+            text: Transcription text
             
-        try:
-            # Create a very short, subtle "ready" tone using mulaw encoding
-            # Generate a short beep using simple synthesis
-            ready_tone = bytes([0x7f, 0x8f, 0x9f, 0xaf, 0xbf, 0xcf, 0xdf, 0xef, 0xff,
-                            0xef, 0xdf, 0xcf, 0xbf, 0xaf, 0x9f, 0x8f, 0x7f]) * 2
-            
-            # Pad with silence
-            silence = bytes([0x7f] * 10)
-            ready_signal = silence + ready_tone + silence
-            
-            # Send the tone if we have an active WebSocket connection
-            if hasattr(self, 'connected') and self.connected and hasattr(self, 'stream_sid') and self.stream_sid:
-                # Find the active WebSocket
-                if hasattr(self, 'ws') and self.ws:
-                    await self._send_audio(ready_signal, self.ws, is_indicator=True)
-                    self.has_played_listening_indicator = True
-                    logger.info("Played listening indicator sound")
-        except Exception as e:
-            logger.error(f"Error playing listening indicator: {e}")
+        Returns:
+            True if the transcription is valid
+        """
+        # Clean up the text first
+        cleaned_text = self.cleanup_transcription(text)
+        
+        # Check if it's empty after cleaning
+        if not cleaned_text:
+            logger.info("Transcription contains only non-speech annotations")
+            return False
+        
+        # Add noise keyword filtering
+        noise_keywords = ["click", "keyboard", "tongue", "scoff", "static", "*"]
+        if any(keyword in text.lower() for keyword in noise_keywords):
+            logger.info(f"Transcription contains noise keywords: {text}")
+            return False
+        
+        # Be more lenient with question marks and punctuation in confidence calculation
+        confidence_estimate = 1.0
+        if ("[" in text or "(" in text or "<" in text) and not "?" in text:
+            confidence_estimate = 0.7  # Only reduce for annotation markers, not question marks
+            logger.info(f"Reduced confidence due to uncertainty markers: {text}")
+        
+        if confidence_estimate < 0.65:
+            logger.info(f"Transcription confidence too low: {confidence_estimate}")
+            return False
+        
+        # Check word count - increased minimum requirement
+        word_count = len(cleaned_text.split())
+        if word_count < self.min_words_for_valid_query:
+            logger.info(f"Transcription too short: {word_count} words")
+            return False
+        
+        return True
     
     async def handle_message(self, message: str, ws) -> None:
         """
@@ -783,9 +379,6 @@ class WebSocketHandler:
             event_type = data.get('event')
             
             logger.debug(f"Received WebSocket event: {event_type}")
-            
-            # Store the WebSocket connection for use in _play_listening_indicator
-            self.ws = ws
             
             # Handle different event types
             if event_type == 'connected':
@@ -856,43 +449,28 @@ class WebSocketHandler:
         self.consecutive_silent_frames = 0
         self.last_barge_in_time = 0
         self.chunks_since_last_process = 0
-        self.has_played_listening_indicator = False
-        self.first_interaction = True  # Reset first interaction flag
-        self.barge_in_recovery_active = False
-        self.needs_stt_restart = False
-        self.stt_reset_attempts = 0
-        self.pending_response = None
-        self.stt_heartbeat_task = None  # Reset heartbeat task
         
         # Reset the audio processor
         self.audio_processor.reset()
         
-        # Initialize conversation state
-        self._set_conversation_state(ConversationState.IDLE)
+        # Send a welcome message with slight delay to give the client time to connect fully
+        await asyncio.sleep(0.5)  # Small delay for connection setup
+        await self.send_text_response("I'm listening. How can I help you today?", ws)
         
         # Initialize STT for streaming if available
         if hasattr(self.pipeline, 'speech_recognizer'):
             try:
-                # Stop any existing session 
-                if hasattr(self.pipeline.speech_recognizer, 'stop_streaming'):
-                    try:
-                        await self.pipeline.speech_recognizer.stop_streaming()
-                        await asyncio.sleep(0.2)  # Wait for cleanup
-                    except Exception as e:
-                        logger.warning(f"Error stopping STT session: {e}")
-                
-                # Start a new streaming session
+                # Check if the speech recognizer has start_streaming method
                 if hasattr(self.pipeline.speech_recognizer, 'start_streaming'):
-                    await self.pipeline.speech_recognizer.start_streaming()
+                    # Check if it's an async method
+                    if asyncio.iscoroutinefunction(self.pipeline.speech_recognizer.start_streaming):
+                        await self.pipeline.speech_recognizer.start_streaming()
+                    else:
+                        # Handle if it's a synchronous method
+                        self.pipeline.speech_recognizer.start_streaming()
                     logger.info("Started STT streaming session")
             except Exception as e:
                 logger.error(f"Error starting STT streaming session: {e}")
-                # Force restart later
-                self.needs_stt_restart = True
-        
-        # Send a welcome message with slight delay to give the client time to connect fully
-        await asyncio.sleep(0.5)  # Small delay for connection setup
-        await self.send_text_response("I'm listening. How can I help you today?", ws)
     
     async def _handle_media(self, data: Dict[str, Any], ws) -> None:
         """
@@ -905,15 +483,6 @@ class WebSocketHandler:
         if not self.conversation_active:
             logger.debug("Conversation not active, ignoring media")
             return
-        
-        # Only process media if in IDLE, LISTENING or RESPONDING states
-        if self.conversation_state not in [ConversationState.IDLE, ConversationState.LISTENING, ConversationState.RESPONDING]:
-            logger.debug(f"Not processing media in {self.conversation_state.value} state")
-            return
-        
-        # If in IDLE, move to LISTENING when receiving media
-        if self.conversation_state == ConversationState.IDLE:
-            self._set_conversation_state(ConversationState.LISTENING)
             
         media = data.get('media', {})
         payload = media.get('payload')
@@ -938,44 +507,41 @@ class WebSocketHandler:
                 logger.debug(f"In startup delay period ({time_since_startup:.1f}s < {self.startup_delay_sec:.1f}s)")
                 return
             
-            # Check for barge-in immediately if agent is speaking
-            if self.audio_processor.agent_speaking:
-                # Convert mulaw to PCM for energy detection
-                try:
-                    pcm_audio = self.audio_processor.mulaw_to_pcm(audio_data)
-                    if isinstance(pcm_audio, bytes):
-                        audio_array = np.frombuffer(pcm_audio, dtype=np.int16).astype(np.float32) / 32768.0
-                    else:
-                        audio_array = pcm_audio
+            # Check for barge-in if agent is speaking
+            if self.audio_processor.preprocessor.agent_speaking:
+                audio_array = self.audio_processor.mulaw_to_pcm(audio_data)
+                # Ensure float32 format
+                if audio_array.dtype != np.float32:
+                    audio_array = audio_array.astype(np.float32)
+                    
+                if self.audio_processor.check_for_barge_in(audio_array):
+                    # Enough time since last barge-in?
+                    current_time = time.time()
+                    if current_time - self.last_barge_in_time > self.barge_in_cooldown_sec:
+                        # Set the barge-in timestamp
+                        self.last_barge_in_time = current_time
                         
-                    # Check for barge-in with the simplified detector
-                    if self._detect_barge_in(audio_array):
-                        # Signal barge-in
+                        # Log and signal barge-in
+                        logger.info("Barge-in detected, interrupting agent speech")
                         self.speech_cancellation_event.set()
                         
-                        # Set barge-in recovery state
-                        self.barge_in_recovery_active = True
-                        self.barge_in_recovery_time = time.time()
-                        
-                        # Add some delay for natural interruption
-                        await asyncio.sleep(0.1)
+                        # Add some delay to make interruption sound natural
+                        await asyncio.sleep(0.3)  # 300ms debounce
                         
                         # Send silence to cut off current speech
                         silence_data = bytes([0x7f] * 320)  # 40ms of silence
                         await self._send_audio(silence_data, ws, is_interrupt=True)
                         
-                        # CRITICAL FIX: Force reset STT after barge-in
-                        asyncio.create_task(self._restart_google_stt())
-                        
-                        # Ensure agent speaking state is reset
-                        self.audio_processor.set_agent_speaking(False)
-                        
-                        # Set to listening state 
-                        self._set_conversation_state(ConversationState.LISTENING)
-                        
-                        return  # Skip further processing for this chunk
-                except Exception as e:
-                    logger.error(f"Error in barge-in detection: {e}")
+                        # Process new input immediately
+                        async with self.processing_lock:
+                            if not self.is_processing:
+                                self.is_processing = True
+                                try:
+                                    logger.info(f"Processing audio buffer after barge-in")
+                                    await self._process_audio(ws)
+                                finally:
+                                    self.is_processing = False
+                                    self.chunks_since_last_process = 0
             
             # Limit buffer size to prevent memory issues
             if len(self.input_buffer) > MAX_BUFFER_SIZE:
@@ -991,60 +557,21 @@ class WebSocketHandler:
                 logger.debug(f"In pause period after response ({time_since_last_response:.1f}s < {self.pause_after_response:.1f}s)")
                 return
             
-            # CRITICAL FIX: Check if STT needs restart
-            if self.needs_stt_restart:
-                # Don't process audio until STT is restarted
-                logger.debug("Waiting for STT restart")
-                return
-                
-            # Check if we're in barge-in recovery and it's taking too long
-            if self.barge_in_recovery_active:
-                time_in_recovery = time.time() - self.barge_in_recovery_time
-                if time_in_recovery > self.barge_in_recovery_timeout:
-                    logger.warning(f"Barge-in recovery taking too long ({time_in_recovery:.1f}s), forcing STT restart")
-                    self.barge_in_recovery_active = False
-                    
-                    # Force STT restart
-                    asyncio.create_task(self._restart_google_stt())
-                    return
-            
             # Process buffer when it's large enough and not already processing
-            # Use reduced buffer size for lower latency
-            if (len(self.input_buffer) >= self.buffer_size_minimum and 
-                not self.is_processing):
+            if (len(self.input_buffer) >= AUDIO_BUFFER_SIZE and 
+                not self.is_processing and 
+                (self.audio_processor.preprocessor.speech_state == SpeechState.CONFIRMED_SPEECH or 
+                 self.chunks_since_last_process >= 5)):  # Only process every 5 chunks if no speech
                 
-                # Check if speech detected or enough chunks have accumulated
-                process_now = False
-                
-                # Convert audio sample for speech detection
-                try:
-                    pcm_audio = self.audio_processor.mulaw_to_pcm(audio_data)
-                    if isinstance(pcm_audio, bytes):
-                        audio_array = np.frombuffer(pcm_audio, dtype=np.int16).astype(np.float32) / 32768.0
-                    else:
-                        audio_array = pcm_audio
-                        
-                    # Check if audio contains speech
-                    contains_speech = self.audio_processor.contains_speech(audio_array)
-                    if contains_speech:
-                        process_now = True
-                    elif self.chunks_since_last_process >= 3:  # Process every 3 chunks even if no obvious speech
-                        process_now = True
-                except Exception as e:
-                    logger.error(f"Error in speech detection: {e}")
-                    # If error in detection, process anyway
-                    process_now = True
-                
-                if process_now:
-                    async with self.processing_lock:
-                        if not self.is_processing:  # Double-check within lock
-                            self.is_processing = True
-                            try:
-                                logger.info(f"Processing audio buffer of size: {len(self.input_buffer)} bytes")
-                                await self._process_audio(ws)
-                                self.chunks_since_last_process = 0  # Reset counter
-                            finally:
-                                self.is_processing = False
+                async with self.processing_lock:
+                    if not self.is_processing:  # Double-check within lock
+                        self.is_processing = True
+                        try:
+                            logger.info(f"Processing audio buffer of size: {len(self.input_buffer)} bytes")
+                            await self._process_audio(ws)
+                            self.chunks_since_last_process = 0  # Reset counter
+                        finally:
+                            self.is_processing = False
             
         except Exception as e:
             logger.error(f"Error processing media payload: {e}", exc_info=True)
@@ -1062,9 +589,6 @@ class WebSocketHandler:
         self.connection_active.clear()
         self.stop_event.set()
         self.speech_cancellation_event.set()  # Cancel any ongoing speech
-        
-        # CRITICAL FIX: Stop STT heartbeat
-        await self._stop_stt_heartbeat()
         
         # Cancel keep-alive task
         if self.keep_alive_task:
@@ -1102,9 +626,6 @@ class WebSocketHandler:
         Args:
             ws: WebSocket connection
         """
-        # Set state to processing
-        self._set_conversation_state(ConversationState.PROCESSING)
-        
         try:
             # Basic conversion without extensive preprocessing
             mulaw_bytes = bytes(self.input_buffer)
@@ -1127,7 +648,6 @@ class WebSocketHandler:
                 # Clear part of buffer and try again next time
                 half_size = len(self.input_buffer) // 2
                 self.input_buffer = self.input_buffer[half_size:]
-                self._set_conversation_state(ConversationState.LISTENING)
                 return
                     
             # Create a list to collect transcription results
@@ -1141,72 +661,32 @@ class WebSocketHandler:
             
             # Process audio through STT
             try:
-                speech_recognizer = self.pipeline.speech_recognizer
-                
-                # CRITICAL FIX: Check if STT is ready
-                is_streaming = getattr(speech_recognizer, 'is_streaming', False)
-                
-                if not is_streaming:
-                    logger.warning("STT not in streaming mode, attempting to restart")
-                    # Try to reinitialize
-                    try:
-                        # First check if session needs shutdown
-                        if hasattr(speech_recognizer, 'stop_streaming'):
-                            try:
-                                await speech_recognizer.stop_streaming()
-                                await asyncio.sleep(0.2)
-                            except Exception as e:
-                                logger.warning(f"Error stopping STT: {e}")
-                        
-                        # Restart streaming
-                        if hasattr(speech_recognizer, 'start_streaming'):
-                            await speech_recognizer.start_streaming()
-                            await asyncio.sleep(0.2)
-                            logger.info("Restarted STT streaming")
-                            
-                            # Check again
-                            is_streaming = getattr(speech_recognizer, 'is_streaming', False)
-                            if not is_streaming:
-                                # Still not streaming, go for full restart
-                                self.needs_stt_restart = True
-                                self._set_conversation_state(ConversationState.LISTENING)
-                                return
-                    except Exception as restart_error:
-                        logger.error(f"Error restarting STT: {restart_error}")
-                        self.needs_stt_restart = True
-                        self._set_conversation_state(ConversationState.LISTENING)
-                        return
+                # Ensure STT is properly initialized and in streaming mode
+                if hasattr(self.pipeline, 'speech_recognizer'):
+                    # Make sure streaming is started
+                    if hasattr(self.pipeline.speech_recognizer, 'is_streaming'):
+                        if not getattr(self.pipeline.speech_recognizer, 'is_streaming', False):
+                            if hasattr(self.pipeline.speech_recognizer, 'start_streaming'):
+                                await self.pipeline.speech_recognizer.start_streaming()
+                                await asyncio.sleep(0.1)  # Small delay
                 
                 # Convert to bytes format for Google Cloud
                 audio_bytes = (pcm_audio * 32767).astype(np.int16).tobytes()
                 
-                # CRITICAL FIX: Use a timeout for the STT process
-                try:
-                    # Process with timeout
-                    await asyncio.wait_for(
-                        speech_recognizer.process_audio_chunk(
-                            audio_chunk=audio_bytes,
-                            callback=transcription_callback
-                        ),
-                        timeout=2.0  # 2 second timeout
-                    )
-                except asyncio.TimeoutError:
-                    logger.error("STT processing timed out")
-                    self._set_conversation_state(ConversationState.LISTENING)
-                    # Force STT restart
-                    self.needs_stt_restart = True
-                    return
+                # Process through Google Cloud Speech-to-Text
+                # Google Cloud expects 16-bit PCM audio
+                await self.pipeline.speech_recognizer.process_audio_chunk(
+                    audio_chunk=audio_bytes,
+                    callback=transcription_callback
+                )
                 
-                # Check for results in the queue with timeout
-                queue_timeout = time.time() + 1.0  # 1 second timeout
-                
-                # Check for results
-                while not speech_recognizer.result_queue.empty() and time.time() < queue_timeout:
+                # Check for results in the queue
+                while not self.pipeline.speech_recognizer.result_queue.empty():
                     try:
-                        result = speech_recognizer.result_queue.get_nowait()
+                        result = self.pipeline.speech_recognizer.result_queue.get_nowait()
                         if result and result not in transcription_results:
                             transcription_results.append(result)
-                            speech_recognizer.result_queue.task_done()
+                            self.pipeline.speech_recognizer.result_queue.task_done()
                     except Exception:
                         break
                 
@@ -1228,56 +708,18 @@ class WebSocketHandler:
                 # Get transcription from best result
                 transcription = best_result.text if best_result and hasattr(best_result, 'text') else ""
                 
-                # Check for commands first - do this before echo detection
+                # Log the transcription
                 if transcription:
                     logger.info(f"Transcription: '{transcription}'")
                     
-                    # Skip command detection on first interaction
-                    is_command, command_type = (False, "") if self.first_interaction else self._is_simple_command(transcription)
-                    if self.first_interaction:
-                        self.first_interaction = False
-                    
-                    if is_command:
-                        # Handle command and return early - don't process as regular query
-                        logger.info(f"Handling command: {command_type}")
-                        
-                        # Clear the input buffer since we're handling a command
-                        self.input_buffer.clear()
-                        
-                        # Handle the command
-                        if self._handle_command(command_type, ws):
-                            # Command was handled, update state and return early
-                            self.last_transcription = transcription
-                            self.last_response_time = time.time()
-                            
-                            # Reset barge-in recovery
-                            self.barge_in_recovery_active = False
-                            
-                            return
-                
-                    # Check for echo - if within time window and similar to last response
-                    time_since_agent_speech = time.time() - self.last_agent_speech_time
-                    if (time_since_agent_speech < self.echo_detection_window and 
-                        self._is_similar_to_last_response(transcription)):
-                        logger.info(f"Ignoring likely self-echo: '{transcription}'")
-                        # Reduce buffer but don't clear
-                        half_size = len(self.input_buffer) // 2
-                        self.input_buffer = self.input_buffer[half_size:]
-                        self._set_conversation_state(ConversationState.LISTENING)
-                        return  # Skip further processing
-                    
-                    # Process if it's a valid transcription - more lenient (1 word minimum)
-                    if len(transcription.split()) >= self.min_words_for_valid_query:
+                    # Process if it's a valid transcription
+                    if len(transcription.split()) >= 2:  # Only require 2 words minimum
                         # Now clear the input buffer since we have a valid transcription
                         self.input_buffer.clear()
-                        
-                        # End barge-in recovery
-                        self.barge_in_recovery_active = False
                         
                         # Don't process duplicate transcriptions
                         if transcription == self.last_transcription:
                             logger.info("Duplicate transcription, not processing again")
-                            self._set_conversation_state(ConversationState.LISTENING)
                             return
                         
                         # Process through knowledge base
@@ -1291,10 +733,9 @@ class WebSocketHandler:
                                 # Convert to speech
                                 if response and hasattr(self.pipeline, 'tts_integration'):
                                     try:
-                                        # Set state to responding before sending audio
-                                        self._set_conversation_state(ConversationState.RESPONDING)
-                                        
-                                        # Clear the speech cancellation event
+                                        # Set agent speaking state before sending audio
+                                        if hasattr(self.audio_processor, 'set_agent_speaking'):
+                                            self.audio_processor.set_agent_speaking(True)
                                         self.speech_cancellation_event.clear()
                                         
                                         speech_audio = await self.pipeline.tts_integration.text_to_speech(response)
@@ -1302,12 +743,6 @@ class WebSocketHandler:
                                         # Convert to mulaw for Twilio
                                         mulaw_audio = self.audio_processor.pcm_to_mulaw(speech_audio)
                                         
-                                        # CRITICAL FIX: Check if we need to save this for later
-                                        if self.needs_stt_restart:
-                                            logger.info("Saving response for after STT restart")
-                                            self.pending_response = mulaw_audio
-                                            return
-                                            
                                         # Send back to Twilio
                                         logger.info(f"Sending audio response ({len(mulaw_audio)} bytes)")
                                         await self._send_audio(mulaw_audio, ws)
@@ -1327,58 +762,59 @@ class WebSocketHandler:
                                         except Exception as fallback_error:
                                             logger.error(f"Failed to generate fallback: {fallback_error}")
                                     finally:
-                                        # Set back to listening
-                                        self._set_conversation_state(ConversationState.LISTENING)
+                                        # Reset agent speaking state
+                                        if hasattr(self.audio_processor, 'set_agent_speaking'):
+                                            self.audio_processor.set_agent_speaking(False)
                                     
                                     # Update state
                                     self.last_transcription = transcription
                                     self.last_response_time = time.time()
                         except Exception as e:
                             logger.error(f"Error processing through knowledge base: {e}", exc_info=True)
-                            # On error, go back to listening
-                            self._set_conversation_state(ConversationState.LISTENING)
                     else:
                         # If no valid transcription, reduce buffer size but keep some for context
                         half_size = len(self.input_buffer) // 2
                         self.input_buffer = self.input_buffer[half_size:]
                         logger.debug(f"Transcription too short, reduced buffer to {len(self.input_buffer)} bytes")
-                        self._set_conversation_state(ConversationState.LISTENING)
                 else:
                     # If no transcription at all, just reduce buffer size
                     half_size = len(self.input_buffer) // 2
                     self.input_buffer = self.input_buffer[half_size:]
                     logger.debug(f"No transcription found, reduced buffer to {len(self.input_buffer)} bytes")
-                    self._set_conversation_state(ConversationState.LISTENING)
                 
-                # CRITICAL FIX: Only restart STT if needed instead of every time
-                if transcription and len(transcription.split()) >= self.min_words_for_valid_query:
-                    # Signal that we want a clean STT session for next time
-                    self.needs_stt_restart = True
+                # Don't reset the STT session every time - only reset if we got a valid transcription
+                if transcription and len(transcription.split()) >= 2:
+                    try:
+                        if hasattr(self.pipeline.speech_recognizer, 'stop_streaming'):
+                            await self.pipeline.speech_recognizer.stop_streaming()
+                        
+                        await asyncio.sleep(0.2)  # Add delay between stop and start
+                        
+                        if hasattr(self.pipeline.speech_recognizer, 'start_streaming'):
+                            await self.pipeline.speech_recognizer.start_streaming()
+                            await asyncio.sleep(0.1)  # Add a small delay
+                        
+                        logger.info("Reset STT after successful transcription")
+                    except Exception as reset_error:
+                        logger.error(f"Error resetting STT: {reset_error}")
             
             except Exception as e:
                 logger.error(f"Error during STT processing: {e}", exc_info=True)
                 # If error, clear part of buffer and continue
                 half_size = len(self.input_buffer) // 2
                 self.input_buffer = self.input_buffer[half_size:]
-                self._set_conversation_state(ConversationState.LISTENING)
-                
-                # Mark STT for restart
-                self.needs_stt_restart = True
                 
         except Exception as e:
             logger.error(f"Error processing audio: {e}", exc_info=True)
-            # On error, go back to listening
-            self._set_conversation_state(ConversationState.LISTENING)
     
-    async def _send_audio(self, audio_data: bytes, ws, is_interrupt: bool = False, is_indicator: bool = False) -> None:
+    async def _send_audio(self, audio_data: bytes, ws, is_interrupt: bool = False) -> None:
         """
-        Send audio data to Twilio with immediate barge-in interruption support.
+        Send audio data to Twilio with improved barge-in support.
         
         Args:
             audio_data: Audio data as bytes
             ws: WebSocket connection
             is_interrupt: Whether this is a barge-in interruption
-            is_indicator: Whether this is a listening indicator sound
         """
         try:
             # Ensure the audio data is valid
@@ -1386,37 +822,14 @@ class WebSocketHandler:
                 logger.warning("Attempted to send empty audio data")
                 return
                 
-            # Skip very small chunks unless they're for interruption or indicator
-            if len(audio_data) < 320 and not (is_interrupt or is_indicator):
+            # Skip very small chunks unless they're for interruption
+            if len(audio_data) < 320 and not is_interrupt:
                 logger.debug(f"Skipping very small audio chunk: {len(audio_data)} bytes")
                 return
                 
             # Check connection status
             if not self.connected:
                 logger.warning("WebSocket connection is closed, cannot send audio")
-                return
-            
-            # CRITICAL FIX: Start STT heartbeat for regular audio responses
-            if not is_interrupt and not is_indicator:
-                # Start heartbeat when sending regular audio response
-                await self._start_stt_heartbeat()
-            
-            # Special handling for indicator sounds
-            if is_indicator:
-                # Use a shorter, simplified sending process for indicators
-                try:
-                    audio_base64 = base64.b64encode(audio_data).decode('utf-8')
-                    message = {
-                        "event": "media",
-                        "streamSid": self.stream_sid,
-                        "media": {
-                            "payload": audio_base64
-                        }
-                    }
-                    ws.send(json.dumps(message))
-                    logger.debug("Sent listening indicator sound")
-                except Exception as e:
-                    logger.error(f"Error sending indicator sound: {e}")
                 return
             
             # Get audio info for debugging
@@ -1431,81 +844,17 @@ class WebSocketHandler:
             logger.debug(f"Splitting {len(audio_data)} bytes into {len(chunks)} chunks")
             
             # Set agent speaking flag if this isn't an interrupt signal
-            if not is_interrupt and not self.audio_processor.agent_speaking:
+            if not is_interrupt and not self.audio_processor.preprocessor.agent_speaking:
                 self.audio_processor.set_agent_speaking(True)
-            
-            # Send a few chunks of silence first if this is an interruption
-            if is_interrupt:
-                # Send 5 chunks (100ms) of silence to stop current audio
-                silence_chunk = bytes([0x7f] * chunk_size)
-                for _ in range(5):
-                    try:
-                        audio_base64 = base64.b64encode(silence_chunk).decode('utf-8')
-                        message = {
-                            "event": "media",
-                            "streamSid": self.stream_sid,
-                            "media": {
-                                "payload": audio_base64
-                            }
-                        }
-                        ws.send(json.dumps(message))
-                    except Exception as e:
-                        logger.error(f"Error sending silence chunk: {e}")
-                
-                # Log the interruption
-                logger.info("Sent silence to interrupt current speech")
-                
-                # Reset agent speaking flag immediately
-                self.audio_processor.set_agent_speaking(False)
-                
-                # CRITICAL FIX: Stop heartbeat when speech is interrupted
-                await self._stop_stt_heartbeat()
-                
-                # CRITICAL FIX: Set the speech cancellation event
-                self.speech_cancellation_event.set()
-                
-                # CRITICAL FIX: Move to listening state
-                self._set_conversation_state(ConversationState.LISTENING)
-                
-                # CRITICAL FIX: Restart STT on barge-in
-                asyncio.create_task(self._restart_google_stt())
-                
-                return
             
             for i, chunk in enumerate(chunks):
                 # Check if we should cancel speech (barge-in detected)
                 if self.speech_cancellation_event.is_set():
                     logger.info(f"Cancelling speech output at chunk {i}/{len(chunks)} due to barge-in")
-                    # Send a few silence frames to clear the audio buffer
-                    silence_chunk = bytes([0x7f] * chunk_size)
-                    try:
-                        for _ in range(3):  # Send 3 chunks of silence
-                            audio_base64 = base64.b64encode(silence_chunk).decode('utf-8')
-                            message = {
-                                "event": "media",
-                                "streamSid": self.stream_sid,
-                                "media": {
-                                    "payload": audio_base64
-                                }
-                            }
-                            ws.send(json.dumps(message))
-                    except Exception as e:
-                        logger.error(f"Error sending silence on cancel: {e}")
-                    
-                    # CRITICAL FIX: Stop heartbeat when speech is cancelled
-                    await self._stop_stt_heartbeat()
-                    
-                    # CRITICAL FIX: Ensure agent speaking state is reset
-                    self.audio_processor.set_agent_speaking(False)
-                    
-                    # CRITICAL FIX: Force listening state
-                    self._set_conversation_state(ConversationState.LISTENING)
-                    
-                    # CRITICAL FIX: Force STT restart
-                    asyncio.create_task(self._restart_google_stt())
-                    
-                    # Important: stop sending immediately after silence
-                    break
+                    # Only send a few more chunks to avoid abrupt cutoff
+                    if i > 5:  # We've sent enough to avoid an abrupt stop
+                        break
+                    # Otherwise, continue with a few more chunks for a smoother transition
                 
                 try:
                     # Encode audio to base64
@@ -1525,17 +874,14 @@ class WebSocketHandler:
                     
                     # Add a small delay between chunks to prevent flooding and allow
                     # for barge-in detection during speech
-                    if i % 5 == 0:  # Every 5 chunks (increased frequency)
-                        await asyncio.sleep(0.005)  # 5ms delay
+                    if i < len(chunks) - 1 and i % 5 == 0:  # Every 5 chunks (~100ms)
+                        await asyncio.sleep(0.01)  # 10ms delay 
                     
                 except Exception as e:
                     if "Connection closed" in str(e):
                         logger.warning(f"WebSocket connection closed while sending chunk {i+1}/{len(chunks)}")
                         self.connected = False
                         self.connection_active.clear()
-                        
-                        # CRITICAL FIX: Stop heartbeat if connection closes
-                        await self._stop_stt_heartbeat()
                         return
                     else:
                         logger.error(f"Error sending audio chunk {i+1}/{len(chunks)}: {e}")
@@ -1544,35 +890,11 @@ class WebSocketHandler:
             logger.debug(f"Sent {len(chunks)} audio chunks ({len(audio_data)} bytes total)")
             
             # Reset speaking flag after sending all chunks
-            if not is_interrupt and self.audio_processor.agent_speaking:
+            if not is_interrupt and self.audio_processor.preprocessor.agent_speaking:
                 self.audio_processor.set_agent_speaking(False)
-                
-                # CRITICAL FIX: Stop heartbeat when done speaking
-                await self._stop_stt_heartbeat()
-                
-                # Update echo detection variables
-                if hasattr(self, 'last_transcription') and self.last_transcription:
-                    # Store the knowledge base response, not the transcription
-                    response_text = ""
-                    if self.conversation_manager and self.conversation_manager.history:
-                        response_text = self.conversation_manager.history[-1].response
-                    elif hasattr(self.pipeline, 'conversation_manager') and self.pipeline.conversation_manager.history:
-                        response_text = self.pipeline.conversation_manager.history[-1].response
-                    
-                    # If we can't get the exact response, fall back to last_transcription
-                    # This is still useful for echo detection
-                    if not response_text:
-                        response_text = self.last_transcription
-                    
-                    self.agent_last_response = response_text
-                self.last_agent_speech_time = time.time()
             
         except Exception as e:
             logger.error(f"Error sending audio: {e}", exc_info=True)
-            
-            # CRITICAL FIX: Stop heartbeat on error
-            await self._stop_stt_heartbeat()
-            
             if "Connection closed" in str(e):
                 self.connected = False
                 self.connection_active.clear()
@@ -1586,9 +908,6 @@ class WebSocketHandler:
             ws: WebSocket connection
         """
         try:
-            # Set state to responding
-            self._set_conversation_state(ConversationState.RESPONDING)
-            
             # Convert text to speech
             if hasattr(self.pipeline, 'tts_integration'):
                 # Set agent speaking state
@@ -1600,13 +919,6 @@ class WebSocketHandler:
                 # Convert to mulaw
                 mulaw_audio = self.audio_processor.pcm_to_mulaw(speech_audio)
                 
-                # CRITICAL FIX: Check if we need to save this for later
-                if self.needs_stt_restart:
-                    logger.info("Saving response for after STT restart")
-                    self.pending_response = mulaw_audio
-                    asyncio.create_task(self._restart_google_stt())
-                    return
-                
                 # Send audio
                 await self._send_audio(mulaw_audio, ws)
                 logger.info(f"Sent text response: '{text}'")
@@ -1616,17 +928,10 @@ class WebSocketHandler:
                 
                 # Update last response time to add pause
                 self.last_response_time = time.time()
-                
-                # After response completes, set back to listening
-                self._set_conversation_state(ConversationState.LISTENING)
             else:
                 logger.error("TTS integration not available")
-                # If error, go back to listening
-                self._set_conversation_state(ConversationState.LISTENING)
         except Exception as e:
             logger.error(f"Error sending text response: {e}", exc_info=True)
-            # On error, go back to listening
-            self._set_conversation_state(ConversationState.LISTENING)
     
     async def _keep_alive_loop(self, ws) -> None:
         """

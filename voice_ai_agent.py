@@ -1,6 +1,6 @@
 """
-Simplified Voice AI Agent main class that coordinates all components without 
-AudioPreprocessor dependency.
+Enhanced Voice AI Agent main class that coordinates all components with improved
+speech/noise discrimination and Google Cloud Speech-to-Text integration for telephony applications.
 """
 import os
 import logging
@@ -9,8 +9,8 @@ import time
 from typing import Optional, Dict, Any, Union, Callable, Awaitable
 import numpy as np
 
-# Import simplified audio processing
-from telephony.audio_processor import AudioProcessor
+# Import the enhanced audio preprocessor
+from telephony.audio_preprocessor import AudioPreprocessor
 
 # Google STT imports
 from speech_to_text.google_stt import GoogleCloudStreamingSTT
@@ -25,8 +25,8 @@ logger = logging.getLogger(__name__)
 
 class VoiceAIAgent:
     """
-    Simplified Voice AI Agent class that uses Google Cloud Speech-to-Text 
-    for superior speech recognition without AudioPreprocessor dependency.
+    Enhanced Voice AI Agent class that integrates the AudioPreprocessor component
+    and uses Google Cloud Speech-to-Text for superior speech/noise discrimination.
     """
     
     def __init__(
@@ -38,8 +38,9 @@ class VoiceAIAgent:
         enable_debug: bool = False,
         **kwargs
     ):
+        
         """
-        Initialize the Voice AI Agent with simplified speech processing.
+        Initialize the Voice AI Agent with minimal speech processing.
         
         Args:
             storage_dir: Directory for persistent storage
@@ -67,6 +68,17 @@ class VoiceAIAgent:
         # Additional STT parameters
         self.stt_model = kwargs.get('stt_model', 'phone_call')
         
+        # Skip using the enhanced audio preprocessor - use a minimal version
+        self.audio_preprocessor = AudioPreprocessor(
+            sample_rate=16000,
+            enable_barge_in=True,
+            # Set very lenient thresholds
+            barge_in_threshold=0.03,  # Decreased from 0.055
+            min_speech_frames_for_barge_in=6,  # Decreased from 12
+            barge_in_cooldown_ms=1000,  # Decreased from 2000
+            enable_debug=False  # Disable debug logging
+        )
+        
         # Component placeholders
         self.speech_recognizer = None
         self.stt_integration = None
@@ -74,20 +86,11 @@ class VoiceAIAgent:
         self.query_engine = None
         self.tts_client = None
         
-        # Create the simplified audio processor
-        self.audio_processor = AudioProcessor()
-        
-        # Store speech configuration parameters
-        self.whisper_initial_prompt = kwargs.get('whisper_initial_prompt', None)
-        self.whisper_temperature = kwargs.get('whisper_temperature', 0.0)
-        self.whisper_no_context = kwargs.get('whisper_no_context', True)
-        self.whisper_preset = kwargs.get('whisper_preset', None)
-        
-        logger.info("Initialized Voice AI Agent with simplified audio processing")
+        logger.info("Initialized Voice AI Agent with minimal audio preprocessing")
                 
     async def init(self):
-        """Initialize all components with simplified speech processing using Google Cloud."""
-        logger.info("Initializing Voice AI Agent components with simplified speech processing...")
+        """Initialize all components with enhanced speech processing using Google Cloud."""
+        logger.info("Initializing Voice AI Agent components with enhanced speech processing...")
         
         try:
             # Check if Google Cloud credentials are available
@@ -106,10 +109,6 @@ class VoiceAIAgent:
                     interim_results=True,  # Enable interim results for responsiveness
                     model=self.stt_model  # Use phone_call model
                 )
-                
-                # Add audio processor to speech recognizer for easier access
-                self.speech_recognizer.audio_processor = self.audio_processor
-                
                 logger.info("Successfully initialized Google Cloud Speech-to-Text")
                 
             except Exception as e:
@@ -148,15 +147,15 @@ class VoiceAIAgent:
             # Initialize TTS client
             self.tts_client = GoogleCloudTTS(credentials_path=self.credentials_path)
             
-            logger.info("Voice AI Agent initialization complete with simplified speech processing")
+            logger.info("Voice AI Agent initialization complete with enhanced speech processing")
             
         except Exception as e:
             logger.error(f"Error initializing Voice AI Agent: {e}", exc_info=True)
             raise
     
-    def process_audio(self, audio_data: np.ndarray) -> np.ndarray:
+    def process_audio_with_enhanced_preprocessing(self, audio_data: np.ndarray) -> np.ndarray:
         """
-        Process audio with the dedicated AudioProcessor.
+        Process audio with the dedicated AudioPreprocessor for superior speech/noise discrimination.
         
         Args:
             audio_data: Audio data as numpy array
@@ -168,25 +167,12 @@ class VoiceAIAgent:
         if audio_data.dtype != np.float32:
             audio_data = audio_data.astype(np.float32)
             
-        # Use direct processing
-        try:
-            # Simple noise gate
-            noise_threshold = 0.01
-            audio_data = np.where(np.abs(audio_data) < noise_threshold, 0, audio_data)
-            
-            # Simple normalization
-            max_val = np.max(np.abs(audio_data))
-            if max_val > 0:
-                audio_data = audio_data / max_val * 0.95
-                
-            return audio_data
-        except Exception as e:
-            logger.error(f"Error in audio processing: {e}")
-            return audio_data  # Return original if processing fails
+        # Use the dedicated audio preprocessor
+        return self.audio_preprocessor.process_audio(audio_data)
     
-    def detect_speech(self, audio_data: np.ndarray) -> bool:
+    def detect_speech_with_enhanced_processor(self, audio_data: np.ndarray) -> bool:
         """
-        Detect speech using direct method.
+        Detect speech using the enhanced AudioPreprocessor.
         
         Args:
             audio_data: Audio data as numpy array
@@ -198,26 +184,16 @@ class VoiceAIAgent:
         if audio_data.dtype != np.float32:
             audio_data = audio_data.astype(np.float32)
             
-        # Use simplified speech detection
-        try:
-            # Calculate energy of the audio
-            energy = np.mean(np.abs(audio_data))
-            
-            # Use a simple threshold
-            speech_threshold = 0.02  # Very low threshold to catch most speech
-            
-            return energy > speech_threshold
-        except Exception as e:
-            logger.error(f"Error in speech detection: {e}")
-            return True  # Default to assuming speech is present
+        # Use the dedicated audio preprocessor's speech detection
+        return self.audio_preprocessor.contains_speech(audio_data)
     
-    async def process_audio_chunk(
+    async def process_audio(
         self,
         audio_data: Union[bytes, np.ndarray],
         callback: Optional[Callable[[Any], Awaitable[None]]] = None
     ) -> Dict[str, Any]:
         """
-        Process audio data with simplified speech processing.
+        Process audio data with enhanced speech/noise discrimination.
         
         Args:
             audio_data: Audio data as numpy array or bytes
@@ -237,11 +213,11 @@ class VoiceAIAgent:
             if audio_data.dtype != np.float32:
                 audio_data = audio_data.astype(np.float32)
                 
-            # Apply simplified preprocessing
-            audio_data = self.process_audio(audio_data)
+            # Apply enhanced preprocessing
+            audio_data = self.process_audio_with_enhanced_preprocessing(audio_data)
             
             # Check if audio contains actual speech
-            contains_speech = self.detect_speech(audio_data)
+            contains_speech = self.detect_speech_with_enhanced_processor(audio_data)
             if not contains_speech:
                 logger.info("No speech detected in audio, skipping processing")
                 return {
@@ -251,16 +227,16 @@ class VoiceAIAgent:
                     "processing_time": time.time() - start_time
                 }
         
-        # Use STT integration for processing with more lenient validation
+        # Use STT integration for processing
         result = await self.stt_integration.transcribe_audio_data(audio_data, callback=callback)
         
-        # Add additional validation for noise filtering - reduced filtering
+        # Add additional validation for noise filtering
         transcription = result.get("transcription", "")
         
-        # Filter out only obviously noise-only transcriptions
-        extreme_noise_keywords = ["static", "(", ")", "[", "]"]
-        if any(keyword in transcription.lower() for keyword in extreme_noise_keywords) and len(transcription.split()) <= 1:
-            logger.info(f"Filtered out extreme noise transcription: '{transcription}'")
+        # Filter out noise-only transcriptions
+        noise_keywords = ["click", "keyboard", "tongue", "scoff", "static", "*", "(", ")"]
+        if any(keyword in transcription.lower() for keyword in noise_keywords):
+            logger.info(f"Filtered out noise transcription: '{transcription}'")
             return {
                 "status": "filtered_noise",
                 "transcription": transcription,
@@ -268,8 +244,8 @@ class VoiceAIAgent:
                 "processing_time": time.time() - start_time
             }
         
-        # More lenient processing - only require 2 words minimum
-        if result.get("is_valid", False) and transcription and len(transcription.split()) >= 2:
+        # Only process valid transcriptions
+        if result.get("is_valid", False) and transcription and len(transcription.split()) >= 3:
             logger.info(f"Valid transcription: {transcription}")
             
             # Process through conversation manager
@@ -282,11 +258,11 @@ class VoiceAIAgent:
                 "processing_time": time.time() - start_time
             }
         else:
-            logger.info(f"Transcription too short or invalid: '{transcription}'")
+            logger.info(f"Invalid or too short transcription: '{transcription}'")
             return {
                 "status": "invalid_transcription",
                 "transcription": transcription,
-                "error": "No valid speech detected or transcription too short",
+                "error": "No valid speech detected",
                 "processing_time": time.time() - start_time
             }
     
@@ -296,7 +272,7 @@ class VoiceAIAgent:
         result_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
     ) -> Dict[str, Any]:
         """
-        Process streaming audio with real-time response and simplified speech processing.
+        Process streaming audio with real-time response and enhanced speech processing.
         
         Args:
             audio_stream: Async iterator of audio chunks
@@ -328,12 +304,12 @@ class VoiceAIAgent:
                     if chunk.dtype != np.float32:
                         chunk = chunk.astype(np.float32)
                     
-                    # Apply simplified preprocessing
-                    chunk = self.process_audio(chunk)
+                    # Apply enhanced preprocessing
+                    chunk = self.process_audio_with_enhanced_preprocessing(chunk)
                     
-                    # Skip further processing if no speech detected - less strict now
-                    # Only skip every 5th chunk to ensure we don't miss speech onset
-                    if not self.detect_speech(chunk) and chunks_processed % 5 != 0:
+                    # Skip further processing if no speech detected
+                    if not self.detect_speech_with_enhanced_processor(chunk) and chunks_processed % 5 != 0:
+                        # Only skip some chunks to ensure we don't miss speech onset
                         continue
                 
                 # Convert to bytes for STT if needed
@@ -342,33 +318,38 @@ class VoiceAIAgent:
                 else:
                     audio_bytes = chunk
                     
-                # Process through STT with reduced filtering
+                # Process through STT with noise filtering
                 async def process_result(result):
-                    # Process all results, not just final ones
-                    is_final = getattr(result, 'is_final', True)
-                    
-                    # Clean up transcription more leniently
-                    transcription = self.stt_integration.cleanup_transcription(result.text)
-                    
-                    # Process all non-empty transcriptions that have at least 2 words
-                    if transcription and len(transcription.split()) >= 2:
-                        # Get response from conversation manager
-                        response = await self.conversation_manager.handle_user_input(transcription)
+                    # Only handle final results
+                    if getattr(result, 'is_final', True):
+                        # Clean up transcription
+                        transcription = self.stt_integration.cleanup_transcription(result.text)
                         
-                        # Format result
-                        result_data = {
-                            "transcription": transcription,
-                            "response": response.get("response", ""),
-                            "confidence": getattr(result, 'confidence', 1.0),
-                            "is_final": is_final
-                        }
+                        # Filter out noise transcriptions
+                        noise_keywords = ["click", "keyboard", "tongue", "scoff", "static", "*", "(", ")"]
+                        if any(keyword in transcription.lower() for keyword in noise_keywords):
+                            logger.info(f"Filtered out noise transcription: '{transcription}'")
+                            return
                         
-                        nonlocal results_count
-                        results_count += 1
-                        
-                        # Call callback if provided
-                        if result_callback:
-                            await result_callback(result_data)
+                        # Process if valid and has minimum words
+                        if transcription and self.stt_integration.is_valid_transcription(transcription) and len(transcription.split()) >= 3:
+                            # Get response from conversation manager
+                            response = await self.conversation_manager.handle_user_input(transcription)
+                            
+                            # Format result
+                            result_data = {
+                                "transcription": transcription,
+                                "response": response.get("response", ""),
+                                "confidence": getattr(result, 'confidence', 1.0),
+                                "is_final": True
+                            }
+                            
+                            nonlocal results_count
+                            results_count += 1
+                            
+                            # Call callback if provided
+                            if result_callback:
+                                await result_callback(result_data)
                 
                 # Process chunk
                 if hasattr(self.speech_recognizer, 'process_audio_chunk'):
@@ -422,6 +403,5 @@ class VoiceAIAgent:
         if self.conversation_manager:
             self.conversation_manager.reset()
             
-        # Reset audio processor state if it exists
-        if hasattr(self, 'audio_processor') and self.audio_processor:
-            self.audio_processor.reset()
+        # Reset audio preprocessor state
+        self.audio_preprocessor.reset()

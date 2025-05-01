@@ -21,7 +21,7 @@ SAMPLE_RATE_TWILIO = 8000  # Twilio's sample rate
 SAMPLE_RATE_AI = 16000     # Our AI system's sample rate
 CHUNK_SIZE = 320           # 20ms at 8kHz
 # Increased buffer size for better speech analysis
-AUDIO_BUFFER_SIZE = 24000  # 2.0 second buffer (reduced from 38400)
+AUDIO_BUFFER_SIZE = 32000  # 2.0 second buffer (reduced from 38400)
 MAX_BUFFER_SIZE = 48000    # 3.0 seconds maximum buffer (reduced from 57600)
 
 # WebSocket Configuration
