@@ -188,7 +188,7 @@ def handle_status_callback():
 
 
 def run_event_loop_in_thread(loop, ws_handler, ws, call_sid, terminate_flag):
-    """Run event loop in a separate thread."""
+    """Run event loop in a separate thread with improved handling."""
     try:
         # Set this loop as the event loop for this thread
         asyncio.set_event_loop(loop)
@@ -226,7 +226,7 @@ def run_event_loop_in_thread(loop, ws_handler, ws, call_sid, terminate_flag):
 
 @app.route('/ws/stream/<call_sid>', websocket=True)
 def handle_media_stream(call_sid):
-    """Handle WebSocket media stream with enhanced speech preprocessing."""
+    """Handle WebSocket media stream with simplified audio processing."""
     logger.info(f"WebSocket connection attempt for call {call_sid}")
     
     if not twilio_handler or not voice_ai_pipeline:
@@ -238,7 +238,7 @@ def handle_media_stream(call_sid):
         ws = Server.accept(request.environ)
         logger.info(f"WebSocket connection established for call {call_sid}")
         
-        # Create WebSocket handler with enhanced speech processing
+        # Create WebSocket handler with simplified audio processing
         ws_handler = WebSocketHandler(call_sid, voice_ai_pipeline)
         
         # Create an event loop for this connection
@@ -272,20 +272,42 @@ def handle_media_stream(call_sid):
             "version": "1.0.0"
         })
         
-        # Use asyncio.run_coroutine_threadsafe but without waiting for result
-        asyncio.run_coroutine_threadsafe(
+        # Process connected message
+        future = asyncio.run_coroutine_threadsafe(
             ws_handler.handle_message(connected_message, ws),
             loop
         )
         
+        # Wait for connected message to be processed
+        try:
+            future.result(timeout=5)
+            logger.info(f"Connected message processed for call {call_sid}")
+        except Exception as e:
+            logger.error(f"Error processing connected message for call {call_sid}: {e}")
+        
         # Process messages until connection closed
         while True:
             try:
-                # Use shorter timeout
-                message = ws.receive(timeout=5)
+                # Use shorter timeout and better error handling
+                message = ws.receive(timeout=2)
                 if message is None:
                     logger.warning(f"Received None message for call {call_sid}")
-                    break
+                    # Don't break immediately, give it another chance
+                    continue
+                
+                # Log message type for debugging
+                try:
+                    msg_data = json.loads(message)
+                    event_type = msg_data.get('event')
+                    logger.debug(f"Received WebSocket event: {event_type} for call {call_sid}")
+                    
+                    # Critical: Log 'media' events more verbosely to diagnose issues
+                    if event_type == 'media':
+                        payload = msg_data.get('media', {}).get('payload')
+                        if payload:
+                            logger.debug(f"Media payload size: {len(payload)}")
+                except Exception as parse_error:
+                    logger.warning(f"Could not parse message: {parse_error}")
                 
                 # Process the message in the dedicated event loop
                 # Don't wait for the result to avoid blocking

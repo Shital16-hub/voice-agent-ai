@@ -1,7 +1,6 @@
 """
-Enhanced audio processing utilities for telephony integration with improved
-speech/noise discrimination and barge-in detection. This version simplifies
-the audio processing to reduce dependency on AudioPreprocessor.
+Simplified audio processing utilities for telephony integration without 
+dependency on AudioPreprocessor.
 """
 import audioop
 import numpy as np
@@ -13,38 +12,32 @@ from typing import Tuple, Dict, Any, Optional
 from scipy import signal
 from collections import deque
 
-from telephony.audio_preprocessor import AudioPreprocessor
-from telephony.config import SAMPLE_RATE_TWILIO, SAMPLE_RATE_AI
-
 logger = logging.getLogger(__name__)
 
 class AudioProcessor:
     """
-    Handles audio conversion between Twilio and Voice AI formats with improved telephony performance.
-    Provides a simplified wrapper around AudioPreprocessor for barge-in detection
-    while using direct processing for most operations.
+    Handles audio conversion between Twilio and Voice AI formats with basic noise processing.
+    Provides a standalone implementation that doesn't require AudioPreprocessor.
     """
     
     def __init__(self):
         """Initialize the audio processor with minimal preprocessing."""
-        # Create a minimal audio preprocessor just for barge-in detection
-        # but don't use it for regular audio processing
-        self.preprocessor = AudioPreprocessor(
-            sample_rate=SAMPLE_RATE_AI,
-            enable_barge_in=True,
-            barge_in_threshold=0.03,  # Lower than default for better sensitivity
-            min_speech_frames_for_barge_in=6,  # Fewer than default for faster response
-            barge_in_cooldown_ms=1000,  # Shorter cooldown for more responsive barge-in
-            enable_debug=False  # Disable debug logging
-        )
-        
-        # Add direct barge-in detection without relying on complex preprocessing
-        self.direct_barge_in_threshold = 0.025  # Even lower threshold for direct detection
-        self.direct_barge_in_window_ms = 100  # Window size in ms for energy calculation
+        # Add direct barge-in detection properties
+        self.direct_barge_in_threshold = 0.025
+        self.direct_barge_in_window_ms = 100
         self.last_barge_in_time = 0.0
-        self.min_barge_in_interval = 0.5  # Minimum time between barge-in detections
+        self.min_barge_in_interval = 0.5
         
-        logger.info("Initialized AudioProcessor with enhanced speech preprocessing")
+        # Agent speaking state tracking - replacing AudioPreprocessor functionality
+        self.agent_speaking = False
+        self.agent_speaking_start_time = 0.0
+        
+        # Add noise tracking
+        self.noise_samples = []
+        self.max_samples = 20
+        self.ambient_noise_level = 0.015
+        
+        logger.info("Initialized AudioProcessor with minimal speech preprocessing")
     
     def mulaw_to_pcm(self, mulaw_data: bytes) -> np.ndarray:
         """
@@ -69,8 +62,8 @@ class AudioProcessor:
             # Resample from 8kHz to 16kHz
             pcm_data_16k, _ = audioop.ratecv(
                 pcm_data, 2, 1, 
-                SAMPLE_RATE_TWILIO, 
-                SAMPLE_RATE_AI, 
+                8000,  # Twilio sample rate
+                16000, # AI sample rate
                 None
             )
             
@@ -101,7 +94,7 @@ class AudioProcessor:
         
         Args:
             pcm_data: PCM audio data
-            source_sample_rate: Source sample rate (default: SAMPLE_RATE_AI)
+            source_sample_rate: Source sample rate (default: 16000)
             
         Returns:
             Mulaw audio data
@@ -115,7 +108,7 @@ class AudioProcessor:
                 logger.debug(f"Padded small audio chunk from {len(pcm_data)-padding_size} to {len(pcm_data)} bytes")
             
             # Try to detect input format and parameters
-            detected_sample_rate = source_sample_rate or SAMPLE_RATE_AI
+            detected_sample_rate = source_sample_rate or 16000
             
             # Convert to PCM if WAV
             if pcm_data[:4] == b'RIFF' and pcm_data[8:12] == b'WAVE':
@@ -143,12 +136,12 @@ class AudioProcessor:
                 pcm_data = (audio_array * 32767.0).astype(np.int16).tobytes()
             
             # Resample to 8kHz for Twilio
-            if detected_sample_rate != SAMPLE_RATE_TWILIO:
+            if detected_sample_rate != 8000:
                 try:
                     pcm_data_8k, _ = audioop.ratecv(
                         pcm_data, 2, 1, 
                         detected_sample_rate, 
-                        SAMPLE_RATE_TWILIO, 
+                        8000, 
                         None
                     )
                 except Exception as resample_error:
@@ -222,10 +215,7 @@ class AudioProcessor:
     
     def direct_check_for_barge_in(self, audio_data: np.ndarray) -> bool:
         """
-        Direct barge-in detection without relying on complex AudioPreprocessor.
-        
-        This method performs simple energy-based detection to identify
-        potential user speech during agent speech.
+        Direct barge-in detection without relying on AudioPreprocessor.
         
         Args:
             audio_data: Audio data as numpy array
@@ -234,7 +224,7 @@ class AudioProcessor:
             True if barge-in is detected
         """
         # Check if agent is speaking
-        if not self.preprocessor.agent_speaking:
+        if not self.agent_speaking:
             return False  # Only check for barge-in when agent is speaking
         
         try:
@@ -248,7 +238,7 @@ class AudioProcessor:
                 if (current_time - self.last_barge_in_time) > self.min_barge_in_interval:
                     # Check time since agent started speaking - add a short delay
                     # to avoid detecting the agent's own speech
-                    time_since_agent_started = (current_time - self.preprocessor.agent_speaking_start_time)
+                    time_since_agent_started = (current_time - self.agent_speaking_start_time)
                     if time_since_agent_started > 0.8:  # 800ms delay
                         # Update last barge-in time
                         self.last_barge_in_time = current_time
@@ -264,7 +254,7 @@ class AudioProcessor:
     
     def contains_speech(self, audio_data: np.ndarray) -> bool:
         """
-        Simplified speech detection that's more lenient.
+        Simplified speech detection.
         
         Args:
             audio_data: Audio data as numpy array
@@ -276,7 +266,7 @@ class AudioProcessor:
             # Calculate simple audio energy
             energy = np.mean(np.abs(audio_data))
             
-            # Use a simple threshold that's lenient
+            # Use a simple threshold
             speech_energy_threshold = 0.02  # Very low threshold to catch most speech
             
             # Check if enough energy is present
@@ -287,7 +277,7 @@ class AudioProcessor:
                 try:
                     # Calculate spectrum
                     fft_data = np.abs(np.fft.rfft(audio_data))
-                    freqs = np.fft.rfftfreq(len(audio_data), 1/SAMPLE_RATE_AI)
+                    freqs = np.fft.rfftfreq(len(audio_data), 1/16000)
                     
                     # Calculate energy in speech frequencies (300-3400 Hz for telephony)
                     speech_freq_mask = (freqs >= 300) & (freqs <= 3400)
@@ -312,7 +302,7 @@ class AudioProcessor:
     
     def check_for_barge_in(self, audio_data: np.ndarray) -> bool:
         """
-        Check for barge-in using both direct detection and AudioPreprocessor.
+        Check for barge-in using direct detection.
         
         Args:
             audio_data: Audio data as numpy array
@@ -320,12 +310,8 @@ class AudioProcessor:
         Returns:
             True if barge-in is detected
         """
-        # First try direct detection as it's faster
-        if self.direct_check_for_barge_in(audio_data):
-            return True
-            
-        # Fall back to the preprocessor's detection
-        return self.preprocessor.check_for_barge_in(audio_data)
+        # Use direct detection
+        return self.direct_check_for_barge_in(audio_data)
     
     def set_agent_speaking(self, is_speaking: bool) -> None:
         """
@@ -334,13 +320,12 @@ class AudioProcessor:
         Args:
             is_speaking: Whether the agent is currently speaking
         """
-        # Update the preprocessor's agent speaking state
-        self.preprocessor.set_agent_speaking(is_speaking)
+        # Update the agent speaking state
+        self.agent_speaking = is_speaking
         
-        # Also update local tracking for direct detection
+        # Update timestamp if agent started speaking
         if is_speaking:
-            # Agent started speaking - update the timestamp
-            self.preprocessor.agent_speaking_start_time = time.time()
+            self.agent_speaking_start_time = time.time()
     
     def get_audio_info(self, audio_data: bytes) -> Dict[str, Any]:
         """
@@ -384,7 +369,9 @@ class AudioProcessor:
         return info
     
     def reset(self) -> None:
-        """Reset all preprocessor state."""
-        self.preprocessor.reset()
+        """Reset all state."""
+        self.agent_speaking = False
+        self.agent_speaking_start_time = 0.0
         self.last_barge_in_time = 0.0
+        self.noise_samples = []
         logger.info("Audio processor state reset")

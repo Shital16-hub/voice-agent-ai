@@ -1,7 +1,6 @@
 """
-Enhanced Voice AI Agent main class that coordinates all components with improved
-speech/noise discrimination and Google Cloud Speech-to-Text integration for telephony applications.
-This version makes the AudioPreprocessor optional and uses direct processing methods.
+Simplified Voice AI Agent main class that coordinates all components without 
+AudioPreprocessor dependency.
 """
 import os
 import logging
@@ -10,8 +9,8 @@ import time
 from typing import Optional, Dict, Any, Union, Callable, Awaitable
 import numpy as np
 
-# Import the enhanced audio preprocessor
-from telephony.audio_preprocessor import AudioPreprocessor
+# Import simplified audio processing
+from telephony.audio_processor import AudioProcessor
 
 # Google STT imports
 from speech_to_text.google_stt import GoogleCloudStreamingSTT
@@ -26,8 +25,8 @@ logger = logging.getLogger(__name__)
 
 class VoiceAIAgent:
     """
-    Enhanced Voice AI Agent class with optional AudioPreprocessor component
-    that uses Google Cloud Speech-to-Text for superior speech recognition.
+    Simplified Voice AI Agent class that uses Google Cloud Speech-to-Text 
+    for superior speech recognition without AudioPreprocessor dependency.
     """
     
     def __init__(
@@ -37,11 +36,10 @@ class VoiceAIAgent:
         credentials_path: Optional[str] = None,
         llm_temperature: float = 0.7,
         enable_debug: bool = False,
-        skip_audio_preprocessor: bool = False,  # Add option to skip audio preprocessor
         **kwargs
     ):
         """
-        Initialize the Voice AI Agent with enhanced speech processing.
+        Initialize the Voice AI Agent with simplified speech processing.
         
         Args:
             storage_dir: Directory for persistent storage
@@ -49,7 +47,6 @@ class VoiceAIAgent:
             credentials_path: Path to Google Cloud credentials JSON
             llm_temperature: LLM temperature for response generation
             enable_debug: Enable detailed debug logging
-            skip_audio_preprocessor: Whether to skip the audio preprocessor
             **kwargs: Additional parameters for customization
         """
         self.storage_dir = storage_dir
@@ -57,7 +54,6 @@ class VoiceAIAgent:
         self.credentials_path = credentials_path or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
         self.llm_temperature = llm_temperature
         self.enable_debug = enable_debug
-        self.skip_audio_preprocessor = skip_audio_preprocessor
         
         # STT Parameters
         self.stt_language = kwargs.get('language', 'en-US')
@@ -78,24 +74,20 @@ class VoiceAIAgent:
         self.query_engine = None
         self.tts_client = None
         
-        # Create the dedicated audio preprocessor only if not skipped
-        if not skip_audio_preprocessor:
-            self.audio_preprocessor = AudioPreprocessor(
-                sample_rate=16000,
-                enable_barge_in=True,
-                barge_in_threshold=0.02,  # Decreased from 0.055
-                min_speech_frames_for_barge_in=4,  # Decreased from 12
-                barge_in_cooldown_ms=500,  # Decreased from 2000
-                enable_debug=self.enable_debug
-            )
-            logger.info("Initialized Voice AI Agent with audio preprocessor")
-        else:
-            self.audio_preprocessor = None
-            logger.info("Initialized Voice AI Agent without audio preprocessor")
+        # Create the simplified audio processor
+        self.audio_processor = AudioProcessor()
+        
+        # Store speech configuration parameters
+        self.whisper_initial_prompt = kwargs.get('whisper_initial_prompt', None)
+        self.whisper_temperature = kwargs.get('whisper_temperature', 0.0)
+        self.whisper_no_context = kwargs.get('whisper_no_context', True)
+        self.whisper_preset = kwargs.get('whisper_preset', None)
+        
+        logger.info("Initialized Voice AI Agent with simplified audio processing")
                 
     async def init(self):
-        """Initialize all components with enhanced speech processing using Google Cloud."""
-        logger.info("Initializing Voice AI Agent components with enhanced speech processing...")
+        """Initialize all components with simplified speech processing using Google Cloud."""
+        logger.info("Initializing Voice AI Agent components with simplified speech processing...")
         
         try:
             # Check if Google Cloud credentials are available
@@ -114,6 +106,10 @@ class VoiceAIAgent:
                     interim_results=True,  # Enable interim results for responsiveness
                     model=self.stt_model  # Use phone_call model
                 )
+                
+                # Add audio processor to speech recognizer for easier access
+                self.speech_recognizer.audio_processor = self.audio_processor
+                
                 logger.info("Successfully initialized Google Cloud Speech-to-Text")
                 
             except Exception as e:
@@ -152,15 +148,15 @@ class VoiceAIAgent:
             # Initialize TTS client
             self.tts_client = GoogleCloudTTS(credentials_path=self.credentials_path)
             
-            logger.info("Voice AI Agent initialization complete with enhanced speech processing")
+            logger.info("Voice AI Agent initialization complete with simplified speech processing")
             
         except Exception as e:
             logger.error(f"Error initializing Voice AI Agent: {e}", exc_info=True)
             raise
     
-    def process_audio_with_enhanced_preprocessing(self, audio_data: np.ndarray) -> np.ndarray:
+    def process_audio(self, audio_data: np.ndarray) -> np.ndarray:
         """
-        Process audio with the dedicated AudioPreprocessor or direct processing.
+        Process audio with the dedicated AudioProcessor.
         
         Args:
             audio_data: Audio data as numpy array
@@ -172,23 +168,7 @@ class VoiceAIAgent:
         if audio_data.dtype != np.float32:
             audio_data = audio_data.astype(np.float32)
             
-        if self.skip_audio_preprocessor or self.audio_preprocessor is None:
-            # Use direct processing instead of AudioPreprocessor
-            return self._direct_audio_processing(audio_data)
-        else:
-            # Use the dedicated audio preprocessor
-            return self.audio_preprocessor.process_audio(audio_data)
-    
-    def _direct_audio_processing(self, audio_data: np.ndarray) -> np.ndarray:
-        """
-        Direct audio processing without using AudioPreprocessor.
-        
-        Args:
-            audio_data: Audio data as numpy array
-            
-        Returns:
-            Processed audio data
-        """
+        # Use direct processing
         try:
             # Simple noise gate
             noise_threshold = 0.01
@@ -201,12 +181,12 @@ class VoiceAIAgent:
                 
             return audio_data
         except Exception as e:
-            logger.error(f"Error in direct audio processing: {e}")
+            logger.error(f"Error in audio processing: {e}")
             return audio_data  # Return original if processing fails
     
-    def detect_speech_with_enhanced_processor(self, audio_data: np.ndarray) -> bool:
+    def detect_speech(self, audio_data: np.ndarray) -> bool:
         """
-        Detect speech using either AudioPreprocessor or direct method.
+        Detect speech using direct method.
         
         Args:
             audio_data: Audio data as numpy array
@@ -218,23 +198,7 @@ class VoiceAIAgent:
         if audio_data.dtype != np.float32:
             audio_data = audio_data.astype(np.float32)
             
-        if self.skip_audio_preprocessor or self.audio_preprocessor is None:
-            # Use direct speech detection
-            return self._direct_speech_detection(audio_data)
-        else:
-            # Use the dedicated audio preprocessor's speech detection
-            return self.audio_preprocessor.contains_speech(audio_data)
-    
-    def _direct_speech_detection(self, audio_data: np.ndarray) -> bool:
-        """
-        Direct speech detection without AudioPreprocessor.
-        
-        Args:
-            audio_data: Audio data as numpy array
-            
-        Returns:
-            True if speech detected
-        """
+        # Use simplified speech detection
         try:
             # Calculate energy of the audio
             energy = np.mean(np.abs(audio_data))
@@ -244,16 +208,16 @@ class VoiceAIAgent:
             
             return energy > speech_threshold
         except Exception as e:
-            logger.error(f"Error in direct speech detection: {e}")
+            logger.error(f"Error in speech detection: {e}")
             return True  # Default to assuming speech is present
     
-    async def process_audio(
+    async def process_audio_chunk(
         self,
         audio_data: Union[bytes, np.ndarray],
         callback: Optional[Callable[[Any], Awaitable[None]]] = None
     ) -> Dict[str, Any]:
         """
-        Process audio data with improved speech/noise discrimination.
+        Process audio data with simplified speech processing.
         
         Args:
             audio_data: Audio data as numpy array or bytes
@@ -273,11 +237,11 @@ class VoiceAIAgent:
             if audio_data.dtype != np.float32:
                 audio_data = audio_data.astype(np.float32)
                 
-            # Apply enhanced preprocessing
-            audio_data = self.process_audio_with_enhanced_preprocessing(audio_data)
+            # Apply simplified preprocessing
+            audio_data = self.process_audio(audio_data)
             
             # Check if audio contains actual speech
-            contains_speech = self.detect_speech_with_enhanced_processor(audio_data)
+            contains_speech = self.detect_speech(audio_data)
             if not contains_speech:
                 logger.info("No speech detected in audio, skipping processing")
                 return {
@@ -332,7 +296,7 @@ class VoiceAIAgent:
         result_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
     ) -> Dict[str, Any]:
         """
-        Process streaming audio with real-time response and enhanced speech processing.
+        Process streaming audio with real-time response and simplified speech processing.
         
         Args:
             audio_stream: Async iterator of audio chunks
@@ -364,12 +328,12 @@ class VoiceAIAgent:
                     if chunk.dtype != np.float32:
                         chunk = chunk.astype(np.float32)
                     
-                    # Apply enhanced preprocessing with reduced complexity
-                    chunk = self.process_audio_with_enhanced_preprocessing(chunk)
+                    # Apply simplified preprocessing
+                    chunk = self.process_audio(chunk)
                     
                     # Skip further processing if no speech detected - less strict now
                     # Only skip every 5th chunk to ensure we don't miss speech onset
-                    if not self.detect_speech_with_enhanced_processor(chunk) and chunks_processed % 5 != 0:
+                    if not self.detect_speech(chunk) and chunks_processed % 5 != 0:
                         continue
                 
                 # Convert to bytes for STT if needed
@@ -458,6 +422,6 @@ class VoiceAIAgent:
         if self.conversation_manager:
             self.conversation_manager.reset()
             
-        # Reset audio preprocessor state if it exists
-        if self.audio_preprocessor:
-            self.audio_preprocessor.reset()
+        # Reset audio processor state if it exists
+        if hasattr(self, 'audio_processor') and self.audio_processor:
+            self.audio_processor.reset()

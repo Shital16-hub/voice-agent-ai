@@ -5,7 +5,7 @@ This package provides integration with Twilio for voice call handling,
 audio streaming, and telephony services with enhanced speech processing.
 """
 
-from telephony.audio_preprocessor import AudioPreprocessor, SpeechState
+
 from telephony.audio_processor import AudioProcessor
 from telephony.twilio_handler import TwilioHandler
 from telephony.websocket_handler import WebSocketHandler

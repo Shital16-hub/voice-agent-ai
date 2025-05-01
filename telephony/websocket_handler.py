@@ -15,7 +15,7 @@ from typing import Dict, Any, Callable, Awaitable, Optional, List, Union, Tuple
 from collections import deque
 from enum import Enum
 
-from telephony.audio_preprocessor import AudioPreprocessor, SpeechState
+
 from telephony.config import (
     CHUNK_SIZE, AUDIO_BUFFER_SIZE, SILENCE_THRESHOLD, SILENCE_DURATION, 
     MAX_BUFFER_SIZE, ENABLE_BARGE_IN, BARGE_IN_THRESHOLD, BARGE_IN_DETECTION_WINDOW
@@ -81,14 +81,18 @@ class WebSocketHandler:
         self.call_sid = call_sid
         self.stream_sid = None
         self.pipeline = pipeline
-        self.audio_processor = pipeline.speech_recognizer.audio_processor if hasattr(pipeline.speech_recognizer, 'audio_processor') else None
         
-        # Initialize audio processor if not already present
+        # Get or create AudioProcessor - simplified approach that doesn't use AudioPreprocessor
+        self.audio_processor = None
+        if hasattr(pipeline, 'speech_recognizer') and hasattr(pipeline.speech_recognizer, 'audio_processor'):
+            self.audio_processor = pipeline.speech_recognizer.audio_processor
+        
+        # If no audio processor available, create one
         if not self.audio_processor:
             from telephony.audio_processor import AudioProcessor
             self.audio_processor = AudioProcessor()
         
-        # Audio buffers - reduced size for lower latency
+        # Audio buffers
         self.input_buffer = bytearray()
         self.output_buffer = bytearray()
         
@@ -97,7 +101,7 @@ class WebSocketHandler:
         self.silence_start_time = None
         self.is_processing = False
         self.conversation_active = True
-        self.sequence_number = 0  # For Twilio media sequence tracking
+        self.sequence_number = 0
         
         # Connection state tracking
         self.connected = False
@@ -111,58 +115,58 @@ class WebSocketHandler:
         self.keep_alive_task = None
         
         # Add variables for echo detection
-        self.agent_last_response = ""  # Store the agent's last response text
-        self.echo_detection_window = 3.0  # Seconds to ignore similar utterances after agent speaks (reduced)
-        self.similarity_threshold = 0.5  # Threshold for considering text similar (reduced)
-        self.last_agent_speech_time = 0.0  # When the agent last finished speaking
-        self.is_processing_self_echo = False  # Flag to track potential self-echoes
+        self.agent_last_response = ""
+        self.echo_detection_window = 3.0
+        self.similarity_threshold = 0.5
+        self.last_agent_speech_time = 0.0
+        self.is_processing_self_echo = False
         
         # Conversation state management
         self.conversation_state = ConversationState.IDLE
         self.last_state_change_time = time.time()
         self.max_state_duration = {
-            ConversationState.IDLE: 30.0,  # 30 seconds max in idle (reduced)
-            ConversationState.LISTENING: 5.0,  # 5 seconds max listening (reduced)
-            ConversationState.PROCESSING: 3.0,  # 3 seconds max processing (reduced)
-            ConversationState.RESPONDING: 15.0,  # 15 seconds max responding (reduced)
-            ConversationState.PAUSED: 15.0  # 15 seconds max paused (reduced)
+            ConversationState.IDLE: 30.0,
+            ConversationState.LISTENING: 5.0,
+            ConversationState.PROCESSING: 3.0,
+            ConversationState.RESPONDING: 15.0,
+            ConversationState.PAUSED: 15.0
         }
         
         # Track state timeout tasks
         self.state_timeout_task = None
         
-        # Compile the non-speech patterns for efficient use
-        self.non_speech_pattern = re.compile('|'.join(NON_SPEECH_PATTERNS))
-        
-        # Conversation flow management with increased pause
-        self.pause_after_response = 0.8  # Reduced from 1.5 seconds for more responsive flow
-        self.min_words_for_valid_query = 1  # Reduced to 1 word minimum for higher responsiveness
+        # Create speech cancellation event for barge-in
+        self.speech_cancellation_event = asyncio.Event()
+        self.speech_cancellation_event.clear()
         
         # Create an event to signal when we should stop processing
         self.stop_event = asyncio.Event()
         
-        # Barge-in handling
-        self.speech_cancellation_event = asyncio.Event()
-        self.speech_cancellation_event.clear()
+        # Compile the non-speech patterns for efficient use
+        self.non_speech_pattern = re.compile('|'.join(NON_SPEECH_PATTERNS))
+        
+        # Conversation flow management with increased pause
+        self.pause_after_response = 0.8
+        self.min_words_for_valid_query = 1
         
         # New: Add startup delay before processing audio (prevents false triggers at start)
         self.startup_time = time.time()
-        self.startup_delay_sec = 0.5  # Reduced to 0.5 second for faster initial response
+        self.startup_delay_sec = 0.5
         
         # New: Track consecutive silent frames for better silence detection
         self.consecutive_silent_frames = 0
-        self.min_silent_frames_for_silence = 3  # Reduced for faster response
+        self.min_silent_frames_for_silence = 3
         
         # New: Add a flag to prevent multiple barge-in detections in quick succession
         self.last_barge_in_time = 0
-        self.barge_in_cooldown_sec = 0.3  # Reduced to 0.3 seconds for faster interruption
+        self.barge_in_cooldown_sec = 0.3
         
         # Track chunks processed since last processing 
         self.chunks_since_last_process = 0
         
         # Reduced buffer size for lower latency
-        self.buffer_size_minimum = AUDIO_BUFFER_SIZE // 4  # Quarter the original size
-
+        self.buffer_size_minimum = 4096  # Significantly reduced size for faster response
+        
         # Conversation manager reference
         if hasattr(self.pipeline, 'conversation_manager'):
             self.conversation_manager = self.pipeline.conversation_manager
@@ -178,7 +182,7 @@ class WebSocketHandler:
         # Add confidence threshold for command detection
         self.min_command_confidence = 0.8
         
-        logger.info(f"Enhanced WebSocketHandler initialized for call {call_sid} with improved barge-in")
+        logger.info(f"Enhanced WebSocketHandler initialized for call {call_sid} with simplified audio processing")
     
     def _set_conversation_state(self, new_state: ConversationState) -> None:
         """
@@ -282,26 +286,26 @@ class WebSocketHandler:
         Returns:
             True if barge-in is detected
         """
-        if not self.audio_processor.preprocessor.agent_speaking:
+        if not self.audio_processor.agent_speaking:
             return False  # Only check for barge-in when agent is speaking
         
         # Calculate energy of the audio
         energy = np.mean(np.abs(audio_data))
         
         # Use a more sensitive threshold for barge-in detection
-        barge_in_threshold = 0.02  # Decreased from 0.03 for better sensitivity
+        barge_in_threshold = 0.02  # Decreased for better sensitivity
         
         # Check for current time since agent started speaking
         current_time = time.time()
-        time_since_agent_started = (current_time - self.audio_processor.preprocessor.agent_speaking_start_time) * 1000  # ms
+        time_since_agent_started = (current_time - self.audio_processor.agent_speaking_start_time) * 1000  # ms
         
         # Reduced delay before allowing barge-in
-        if time_since_agent_started < 500:  # Reduced from 800ms to 500ms
+        if time_since_agent_started < 500:  # Reduced to 500ms
             return False
         
         # Check time since last barge-in to avoid multiple triggers
         time_since_last_barge_in = (current_time - self.last_barge_in_time) * 1000  # ms
-        if time_since_last_barge_in < 300:  # Reduced from 500ms to 300ms
+        if time_since_last_barge_in < 300:  # Reduced to 300ms
             return False
         
         # Check energy threshold
