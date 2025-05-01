@@ -98,7 +98,7 @@ class STTIntegration:
     
     def cleanup_transcription(self, text: str) -> str:
         """
-        Enhanced cleanup of transcription text by removing non-speech annotations and filler words.
+        More lenient cleanup of transcription text.
         
         Args:
             text: Original transcription text
@@ -109,14 +109,11 @@ class STTIntegration:
         if not text:
             return ""
             
-        # Remove non-speech annotations
-        cleaned_text = self.non_speech_pattern.sub('', text)
+        # Keep simple cleanup but reduce filtering
+        cleaned_text = text
         
-        # Remove common filler words at beginning of sentences
-        cleaned_text = re.sub(r'^(um|uh|er|ah|like|so)\s+', '', cleaned_text, flags=re.IGNORECASE)
-        
-        # Remove repeated words (stuttering)
-        cleaned_text = re.sub(r'\b(\w+)( \1\b)+', r'\1', cleaned_text)
+        # Only remove obvious noise markers
+        cleaned_text = re.sub(r'\[.*?\]|\(.*?\)', '', cleaned_text)
         
         # Clean up punctuation
         cleaned_text = re.sub(r'\s+([.,!?])', r'\1', cleaned_text)
@@ -132,7 +129,7 @@ class STTIntegration:
     
     def is_valid_transcription(self, text: str, min_words: int = None) -> bool:
         """
-        Check if a transcription is valid and worth processing with enhanced criteria.
+        More lenient check if a transcription is valid and worth processing.
         
         Args:
             text: Transcription text
@@ -142,7 +139,7 @@ class STTIntegration:
             True if the transcription is valid
         """
         if min_words is None:
-            min_words = self.min_words_for_valid_query
+            min_words = 2  # Reduced from 3
             
         # Clean up the text first
         cleaned_text = self.cleanup_transcription(text)
@@ -152,13 +149,13 @@ class STTIntegration:
             logger.info("Transcription contains only non-speech annotations")
             return False
         
-        # Add noise keyword filtering
-        noise_keywords = ["click", "keyboard", "tongue", "scoff", "static", "*", "(", ")"]
-        if any(keyword in text.lower() for keyword in noise_keywords):
-            logger.info(f"Transcription contains noise keywords: {text}")
+        # Reduced filtering - only filter extreme noise cases
+        extreme_noise_keywords = ["static", "(", ")", "[", "]"]
+        if any(keyword in text.lower() for keyword in extreme_noise_keywords) and len(cleaned_text.split()) <= 1:
+            logger.info(f"Filtered extreme noise transcription: '{text}'")
             return False
-            
-        # Check word count
+        
+        # Check word count - more lenient
         word_count = len(cleaned_text.split())
         if word_count < min_words:
             logger.info(f"Transcription too short: {word_count} words")

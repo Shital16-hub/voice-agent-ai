@@ -38,8 +38,9 @@ class VoiceAIAgent:
         enable_debug: bool = False,
         **kwargs
     ):
+        
         """
-        Initialize the Voice AI Agent with enhanced speech processing.
+        Initialize the Voice AI Agent with minimal speech processing.
         
         Args:
             storage_dir: Directory for persistent storage
@@ -67,6 +68,17 @@ class VoiceAIAgent:
         # Additional STT parameters
         self.stt_model = kwargs.get('stt_model', 'phone_call')
         
+        # Skip using the enhanced audio preprocessor - use a minimal version
+        self.audio_preprocessor = AudioPreprocessor(
+            sample_rate=16000,
+            enable_barge_in=True,
+            # Set very lenient thresholds
+            barge_in_threshold=0.03,  # Decreased from 0.055
+            min_speech_frames_for_barge_in=6,  # Decreased from 12
+            barge_in_cooldown_ms=1000,  # Decreased from 2000
+            enable_debug=False  # Disable debug logging
+        )
+        
         # Component placeholders
         self.speech_recognizer = None
         self.stt_integration = None
@@ -74,19 +86,7 @@ class VoiceAIAgent:
         self.query_engine = None
         self.tts_client = None
         
-        # Create the dedicated audio preprocessor with improved thresholds
-        self.audio_preprocessor = AudioPreprocessor(
-            # Continuing voice_ai_agent.py from where it was cut off
-
-            sample_rate=16000,
-            enable_barge_in=True,
-            barge_in_threshold=0.055,  # Increased from 0.045
-            min_speech_frames_for_barge_in=12,  # Increased from 10
-            barge_in_cooldown_ms=2000,
-            enable_debug=self.enable_debug
-        )
-        
-        logger.info("Initialized Voice AI Agent with enhanced audio preprocessor")
+        logger.info("Initialized Voice AI Agent with minimal audio preprocessing")
                 
     async def init(self):
         """Initialize all components with enhanced speech processing using Google Cloud."""

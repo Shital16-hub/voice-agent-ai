@@ -1,6 +1,7 @@
 """
 Google Cloud Speech-to-Text client for streaming transcription.
 """
+import datetime
 import os
 import logging
 import asyncio
@@ -262,7 +263,17 @@ class GoogleCloudStreamingSTT:
                     
                     # Capture end time if available
                     if hasattr(result, 'result_end_time') and result.result_end_time:
-                        end_time = result.result_end_time.seconds + result.result_end_time.nanos / 1e9
+                        # Fix for handling timedelta objects
+                        if isinstance(result.result_end_time, datetime.timedelta):
+                            # For timedelta objects, use total_seconds()
+                            end_time = result.result_end_time.total_seconds()
+                        else:
+                            # For the old format with seconds and nanos
+                            try:
+                                end_time = result.result_end_time.seconds + result.result_end_time.nanos / 1e9
+                            except AttributeError:
+                                # Fallback if neither format works
+                                end_time = time.time()
                     else:
                         end_time = time.time()
                     
