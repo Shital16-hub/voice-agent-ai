@@ -83,9 +83,9 @@ class VoiceAIAgent:
             self.audio_preprocessor = AudioPreprocessor(
                 sample_rate=16000,
                 enable_barge_in=True,
-                barge_in_threshold=0.03,  # Decreased from 0.055
-                min_speech_frames_for_barge_in=6,  # Decreased from 12
-                barge_in_cooldown_ms=1000,  # Decreased from 2000
+                barge_in_threshold=0.02,  # Decreased from 0.055
+                min_speech_frames_for_barge_in=4,  # Decreased from 12
+                barge_in_cooldown_ms=500,  # Decreased from 2000
                 enable_debug=self.enable_debug
             )
             logger.info("Initialized Voice AI Agent with audio preprocessor")

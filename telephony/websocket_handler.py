@@ -1,7 +1,7 @@
 """
 Enhanced WebSocket handler for Twilio media streams with improved speech/noise
 discrimination and barge-in detection using the new AudioPreprocessor.
-This version is optimized for low latency and better responsiveness.
+This version has optimized Alexa-like conversation flow and improved barge-in functionality.
 """
 import json
 import base64
@@ -46,8 +46,8 @@ class ConversationState(Enum):
 
 class WebSocketHandler:
     """
-    Handles WebSocket connections for Twilio media streams with enhanced speech/noise discrimination.
-    Integrates the new AudioPreprocessor via the updated AudioProcessor.
+    Enhanced WebSocket handler for Twilio media streams with improved barge-in detection
+    and Alexa-like conversation flow.
     """
     
     # Enhanced command lists
@@ -112,8 +112,8 @@ class WebSocketHandler:
         
         # Add variables for echo detection
         self.agent_last_response = ""  # Store the agent's last response text
-        self.echo_detection_window = 5.0  # Seconds to ignore similar utterances after agent speaks
-        self.similarity_threshold = 0.6  # Threshold for considering text similar
+        self.echo_detection_window = 3.0  # Seconds to ignore similar utterances after agent speaks (reduced)
+        self.similarity_threshold = 0.5  # Threshold for considering text similar (reduced)
         self.last_agent_speech_time = 0.0  # When the agent last finished speaking
         self.is_processing_self_echo = False  # Flag to track potential self-echoes
         
@@ -121,11 +121,11 @@ class WebSocketHandler:
         self.conversation_state = ConversationState.IDLE
         self.last_state_change_time = time.time()
         self.max_state_duration = {
-            ConversationState.IDLE: 60.0,  # 1 minute max in idle
-            ConversationState.LISTENING: 10.0,  # 10 seconds max listening
-            ConversationState.PROCESSING: 5.0,  # 5 seconds max processing (reduced)
-            ConversationState.RESPONDING: 20.0,  # 20 seconds max responding (reduced)
-            ConversationState.PAUSED: 30.0  # 30 seconds max paused
+            ConversationState.IDLE: 30.0,  # 30 seconds max in idle (reduced)
+            ConversationState.LISTENING: 5.0,  # 5 seconds max listening (reduced)
+            ConversationState.PROCESSING: 3.0,  # 3 seconds max processing (reduced)
+            ConversationState.RESPONDING: 15.0,  # 15 seconds max responding (reduced)
+            ConversationState.PAUSED: 15.0  # 15 seconds max paused (reduced)
         }
         
         # Track state timeout tasks
@@ -135,8 +135,8 @@ class WebSocketHandler:
         self.non_speech_pattern = re.compile('|'.join(NON_SPEECH_PATTERNS))
         
         # Conversation flow management with increased pause
-        self.pause_after_response = 1.5  # Reduced from 4.0 seconds for lower latency
-        self.min_words_for_valid_query = 2  # Reduced to 2 words minimum for higher responsiveness
+        self.pause_after_response = 0.8  # Reduced from 1.5 seconds for more responsive flow
+        self.min_words_for_valid_query = 1  # Reduced to 1 word minimum for higher responsiveness
         
         # Create an event to signal when we should stop processing
         self.stop_event = asyncio.Event()
@@ -147,21 +147,21 @@ class WebSocketHandler:
         
         # New: Add startup delay before processing audio (prevents false triggers at start)
         self.startup_time = time.time()
-        self.startup_delay_sec = 1.0  # Reduced to 1 second for faster initial response
+        self.startup_delay_sec = 0.5  # Reduced to 0.5 second for faster initial response
         
         # New: Track consecutive silent frames for better silence detection
         self.consecutive_silent_frames = 0
-        self.min_silent_frames_for_silence = 5  # Reduced for faster response
+        self.min_silent_frames_for_silence = 3  # Reduced for faster response
         
         # New: Add a flag to prevent multiple barge-in detections in quick succession
         self.last_barge_in_time = 0
-        self.barge_in_cooldown_sec = 0.5  # Reduced from 1.5 to 0.5 seconds for faster interruption
+        self.barge_in_cooldown_sec = 0.3  # Reduced to 0.3 seconds for faster interruption
         
         # Track chunks processed since last processing 
         self.chunks_since_last_process = 0
         
         # Reduced buffer size for lower latency
-        self.buffer_size_minimum = AUDIO_BUFFER_SIZE // 2  # Half the original size
+        self.buffer_size_minimum = AUDIO_BUFFER_SIZE // 4  # Quarter the original size
 
         # Conversation manager reference
         if hasattr(self.pipeline, 'conversation_manager'):
@@ -169,11 +169,14 @@ class WebSocketHandler:
         else:
             self.conversation_manager = None
         
-        logger.info(f"WebSocketHandler initialized for call {call_sid} with enhanced audio preprocessing")
+        # Add flag for "Alexa-like" wait indicator
+        self.has_played_listening_indicator = False
+        
+        logger.info(f"Enhanced WebSocketHandler initialized for call {call_sid} with improved barge-in")
     
     def _set_conversation_state(self, new_state: ConversationState) -> None:
         """
-        Set conversation state with timeout handling.
+        Set conversation state with enhanced conversational flow.
         
         Args:
             new_state: New conversation state
@@ -199,11 +202,19 @@ class WebSocketHandler:
         
         # Perform state-specific actions
         if new_state == ConversationState.LISTENING:
+            # Reset listening indicator flag
+            self.has_played_listening_indicator = False
+            
             # Ensure STT is ready
             if hasattr(self.pipeline, 'speech_recognizer'):
                 if hasattr(self.pipeline.speech_recognizer, 'start_streaming'):
                     if not getattr(self.pipeline.speech_recognizer, 'is_streaming', False):
                         asyncio.create_task(self.pipeline.speech_recognizer.start_streaming())
+            
+            # Add a subtle audio indicator for listening state
+            if old_state == ConversationState.RESPONDING:
+                # Play a very short "ready" tone if we just finished speaking
+                asyncio.create_task(self._play_listening_indicator())
         
         elif new_state == ConversationState.RESPONDING:
             # Set agent speaking flag
@@ -257,7 +268,7 @@ class WebSocketHandler:
 
     def _detect_barge_in(self, audio_data: np.ndarray) -> bool:
         """
-        Simplified barge-in detection that works directly with audio data.
+        Enhanced barge-in detection that works directly with audio data.
         
         Args:
             audio_data: Audio data as numpy array
@@ -271,20 +282,20 @@ class WebSocketHandler:
         # Calculate energy of the audio
         energy = np.mean(np.abs(audio_data))
         
-        # Use a simpler, more responsive threshold for barge-in
-        barge_in_threshold = 0.03  # Lower threshold makes it more sensitive
+        # Use a more sensitive threshold for barge-in detection
+        barge_in_threshold = 0.02  # Decreased from 0.03 for better sensitivity
         
         # Check for current time since agent started speaking
         current_time = time.time()
         time_since_agent_started = (current_time - self.audio_processor.preprocessor.agent_speaking_start_time) * 1000  # ms
         
-        # Only allow barge-in after a short delay (to avoid detecting echo)
-        if time_since_agent_started < 800:  # Reduced from 1500ms to 800ms
+        # Reduced delay before allowing barge-in
+        if time_since_agent_started < 500:  # Reduced from 800ms to 500ms
             return False
         
         # Check time since last barge-in to avoid multiple triggers
         time_since_last_barge_in = (current_time - self.last_barge_in_time) * 1000  # ms
-        if time_since_last_barge_in < 500:  # Reduced from 800ms
+        if time_since_last_barge_in < 300:  # Reduced from 500ms to 300ms
             return False
         
         # Check energy threshold
@@ -347,7 +358,7 @@ class WebSocketHandler:
     
     def _is_simple_command(self, text: str) -> Tuple[bool, str]:
         """
-        Enhanced method to check if text is a command with better fuzzy matching.
+        Improved method to check if text is a command with better matching for stop commands.
         
         Args:
             text: Text to check
@@ -360,6 +371,17 @@ class WebSocketHandler:
         
         # Clean and lowercase the text
         clean_text = text.lower().strip().rstrip('.!?')
+        
+        # Special check for stop command with higher priority
+        stop_commands = ["stop", "stop speaking", "stop talking", "be quiet", "shut up", "quiet", 
+                        "enough", "halt", "pause", "quit", "exit", "bye", "end", "silence"]
+        
+        # Check if any word in the text matches stop commands exactly
+        words = clean_text.split()
+        for word in words:
+            if word in ["stop", "quiet", "silence", "halt", "pause"]:
+                logger.info(f"Detected stop command: '{clean_text}' -> stop")
+                return True, "stop"
         
         # Define all command categories
         command_categories = {
@@ -383,7 +405,6 @@ class WebSocketHandler:
                     return True, command_type
             
             # Check for partial word matches with higher threshold for shorter commands
-            word_tokens = clean_text.split()
             for cmd in commands:
                 cmd_tokens = cmd.split()
                 
@@ -392,8 +413,8 @@ class WebSocketHandler:
                     continue
                     
                 # For multi-word commands, check if most words match
-                if len(cmd_tokens) > 1 and len(word_tokens) >= len(cmd_tokens):
-                    matches = sum(1 for cmd_token in cmd_tokens if any(cmd_token in word for word in word_tokens))
+                if len(cmd_tokens) > 1 and len(words) >= len(cmd_tokens):
+                    matches = sum(1 for cmd_token in cmd_tokens if any(cmd_token in word for word in words))
                     if matches >= len(cmd_tokens) * 0.7:  # 70% of words match
                         logger.info(f"Detected partial command match: '{clean_text}' -> {command_type}")
                         return True, command_type
@@ -524,6 +545,31 @@ class WebSocketHandler:
             
         return cleaned_text
     
+    async def _play_listening_indicator(self):
+        """Play a subtle audio indicator when the system is ready to listen."""
+        if self.has_played_listening_indicator:
+            return  # Don't play multiple times
+            
+        try:
+            # Create a very short, subtle "ready" tone using mulaw encoding
+            # Generate a short beep using simple synthesis
+            ready_tone = bytes([0x7f, 0x8f, 0x9f, 0xaf, 0xbf, 0xcf, 0xdf, 0xef, 0xff,
+                            0xef, 0xdf, 0xcf, 0xbf, 0xaf, 0x9f, 0x8f, 0x7f]) * 2
+            
+            # Pad with silence
+            silence = bytes([0x7f] * 10)
+            ready_signal = silence + ready_tone + silence
+            
+            # Send the tone if we have an active WebSocket connection
+            if hasattr(self, 'connected') and self.connected and hasattr(self, 'stream_sid') and self.stream_sid:
+                # Find the active WebSocket
+                if hasattr(self, 'ws') and self.ws:
+                    await self._send_audio(ready_signal, self.ws, is_indicator=True)
+                    self.has_played_listening_indicator = True
+                    logger.info("Played listening indicator sound")
+        except Exception as e:
+            logger.error(f"Error playing listening indicator: {e}")
+    
     async def handle_message(self, message: str, ws) -> None:
         """
         Handle incoming WebSocket message.
@@ -541,6 +587,9 @@ class WebSocketHandler:
             event_type = data.get('event')
             
             logger.debug(f"Received WebSocket event: {event_type}")
+            
+            # Store the WebSocket connection for use in _play_listening_indicator
+            self.ws = ws
             
             # Handle different event types
             if event_type == 'connected':
@@ -611,6 +660,7 @@ class WebSocketHandler:
         self.consecutive_silent_frames = 0
         self.last_barge_in_time = 0
         self.chunks_since_last_process = 0
+        self.has_played_listening_indicator = False
         
         # Reset the audio processor
         self.audio_processor.reset()
@@ -697,7 +747,7 @@ class WebSocketHandler:
                         self.speech_cancellation_event.set()
                         
                         # Add some delay for natural interruption
-                        await asyncio.sleep(0.2)
+                        await asyncio.sleep(0.1)
                         
                         # Send silence to cut off current speech
                         silence_data = bytes([0x7f] * 320)  # 40ms of silence
@@ -728,7 +778,7 @@ class WebSocketHandler:
             if (len(self.input_buffer) >= self.buffer_size_minimum and 
                 not self.is_processing and 
                 (self.audio_processor.preprocessor.speech_state == SpeechState.CONFIRMED_SPEECH or 
-                 self.chunks_since_last_process >= 5)):  # Only process every 5 chunks if no speech
+                 self.chunks_since_last_process >= 3)):  # Only process every 3 chunks if no speech (reduced)
                 
                 async with self.processing_lock:
                     if not self.is_processing:  # Double-check within lock
@@ -909,8 +959,8 @@ class WebSocketHandler:
                         self._set_conversation_state(ConversationState.LISTENING)
                         return  # Skip further processing
                     
-                    # Process if it's a valid transcription
-                    if len(transcription.split()) >= 2:  # Only require 2 words minimum
+                    # Process if it's a valid transcription - more lenient (1 word minimum)
+                    if len(transcription.split()) >= self.min_words_for_valid_query:
                         # Now clear the input buffer since we have a valid transcription
                         self.input_buffer.clear()
                         
@@ -985,12 +1035,12 @@ class WebSocketHandler:
                     self._set_conversation_state(ConversationState.LISTENING)
                 
                 # Reset the STT session only if we got a valid transcription
-                if transcription and len(transcription.split()) >= 2:
+                if transcription and len(transcription.split()) >= self.min_words_for_valid_query:
                     try:
                         if hasattr(self.pipeline.speech_recognizer, 'stop_streaming'):
                             await self.pipeline.speech_recognizer.stop_streaming()
                         
-                        await asyncio.sleep(0.2)  # Add delay between stop and start
+                        await asyncio.sleep(0.1)  # Add a smaller delay between stop and start
                         
                         if hasattr(self.pipeline.speech_recognizer, 'start_streaming'):
                             await self.pipeline.speech_recognizer.start_streaming()
@@ -1012,14 +1062,15 @@ class WebSocketHandler:
             # On error, go back to listening
             self._set_conversation_state(ConversationState.LISTENING)
     
-    async def _send_audio(self, audio_data: bytes, ws, is_interrupt: bool = False) -> None:
+    async def _send_audio(self, audio_data: bytes, ws, is_interrupt: bool = False, is_indicator: bool = False) -> None:
         """
-        Send audio data to Twilio with improved barge-in support.
+        Send audio data to Twilio with immediate barge-in interruption support.
         
         Args:
             audio_data: Audio data as bytes
             ws: WebSocket connection
             is_interrupt: Whether this is a barge-in interruption
+            is_indicator: Whether this is a listening indicator sound
         """
         try:
             # Ensure the audio data is valid
@@ -1027,14 +1078,32 @@ class WebSocketHandler:
                 logger.warning("Attempted to send empty audio data")
                 return
                 
-            # Skip very small chunks unless they're for interruption
-            if len(audio_data) < 320 and not is_interrupt:
+            # Skip very small chunks unless they're for interruption or indicator
+            if len(audio_data) < 320 and not (is_interrupt or is_indicator):
                 logger.debug(f"Skipping very small audio chunk: {len(audio_data)} bytes")
                 return
                 
             # Check connection status
             if not self.connected:
                 logger.warning("WebSocket connection is closed, cannot send audio")
+                return
+            
+            # Special handling for indicator sounds
+            if is_indicator:
+                # Use a shorter, simplified sending process for indicators
+                try:
+                    audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+                    message = {
+                        "event": "media",
+                        "streamSid": self.stream_sid,
+                        "media": {
+                            "payload": audio_base64
+                        }
+                    }
+                    ws.send(json.dumps(message))
+                    logger.debug("Sent listening indicator sound")
+                except Exception as e:
+                    logger.error(f"Error sending indicator sound: {e}")
                 return
             
             # Get audio info for debugging
@@ -1052,14 +1121,53 @@ class WebSocketHandler:
             if not is_interrupt and not self.audio_processor.preprocessor.agent_speaking:
                 self.audio_processor.set_agent_speaking(True)
             
+            # Send a few chunks of silence first if this is an interruption
+            if is_interrupt:
+                # Send 5 chunks (100ms) of silence to stop current audio
+                silence_chunk = bytes([0x7f] * chunk_size)
+                for _ in range(5):
+                    try:
+                        audio_base64 = base64.b64encode(silence_chunk).decode('utf-8')
+                        message = {
+                            "event": "media",
+                            "streamSid": self.stream_sid,
+                            "media": {
+                                "payload": audio_base64
+                            }
+                        }
+                        ws.send(json.dumps(message))
+                    except Exception as e:
+                        logger.error(f"Error sending silence chunk: {e}")
+                
+                # Log the interruption
+                logger.info("Sent silence to interrupt current speech")
+                
+                # Reset agent speaking flag immediately
+                self.audio_processor.set_agent_speaking(False)
+                return
+            
             for i, chunk in enumerate(chunks):
                 # Check if we should cancel speech (barge-in detected)
                 if self.speech_cancellation_event.is_set():
                     logger.info(f"Cancelling speech output at chunk {i}/{len(chunks)} due to barge-in")
-                    # Only send a few more chunks to avoid abrupt cutoff
-                    if i > 5:  # We've sent enough to avoid an abrupt stop
-                        break
-                    # Otherwise, continue with a few more chunks for a smoother transition
+                    # Send a few silence frames to clear the audio buffer
+                    silence_chunk = bytes([0x7f] * chunk_size)
+                    try:
+                        for _ in range(3):  # Send 3 chunks of silence
+                            audio_base64 = base64.b64encode(silence_chunk).decode('utf-8')
+                            message = {
+                                "event": "media",
+                                "streamSid": self.stream_sid,
+                                "media": {
+                                    "payload": audio_base64
+                                }
+                            }
+                            ws.send(json.dumps(message))
+                    except Exception as e:
+                        logger.error(f"Error sending silence on cancel: {e}")
+                    
+                    # Important: stop sending immediately after silence
+                    break
                 
                 try:
                     # Encode audio to base64
@@ -1079,8 +1187,8 @@ class WebSocketHandler:
                     
                     # Add a small delay between chunks to prevent flooding and allow
                     # for barge-in detection during speech
-                    if i < len(chunks) - 1 and i % 10 == 0:  # Every 10 chunks (reduced from 5)
-                        await asyncio.sleep(0.005)  # 5ms delay (reduced from 10ms)
+                    if i % 5 == 0:  # Every 5 chunks (increased frequency)
+                        await asyncio.sleep(0.005)  # 5ms delay
                     
                 except Exception as e:
                     if "Connection closed" in str(e):
@@ -1166,6 +1274,7 @@ class WebSocketHandler:
             self._set_conversation_state(ConversationState.LISTENING)
     
     async def _keep_alive_loop(self, ws) -> None:
+        
         """
         Send periodic keep-alive messages to maintain the WebSocket connection.
         """
@@ -1195,3 +1304,4 @@ class WebSocketHandler:
             logger.debug("Keep-alive loop cancelled")
         except Exception as e:
             logger.error(f"Error in keep-alive loop: {e}")
+                    
