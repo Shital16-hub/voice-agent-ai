@@ -1,6 +1,6 @@
 """
 Enhanced WebSocket handler for Twilio media streams with improved speech/noise
-discrimination and barge-in detection using the new AudioPreprocessor.
+discrimination and barge-in detection using the simplified AudioProcessor.
 This version has optimized Alexa-like conversation flow and improved barge-in functionality.
 """
 import json
@@ -744,7 +744,7 @@ class WebSocketHandler:
                 return
             
             # Check for barge-in immediately if agent is speaking
-            if self.audio_processor.preprocessor.agent_speaking:
+            if self.audio_processor.agent_speaking:
                 # Convert mulaw to PCM for energy detection
                 try:
                     pcm_audio = self.audio_processor.mulaw_to_pcm(audio_data)
@@ -788,19 +788,40 @@ class WebSocketHandler:
             # Process buffer when it's large enough and not already processing
             # Use reduced buffer size for lower latency
             if (len(self.input_buffer) >= self.buffer_size_minimum and 
-                not self.is_processing and 
-                (self.audio_processor.preprocessor.speech_state == SpeechState.CONFIRMED_SPEECH or 
-                 self.chunks_since_last_process >= 3)):  # Only process every 3 chunks if no speech (reduced)
+                not self.is_processing):
                 
-                async with self.processing_lock:
-                    if not self.is_processing:  # Double-check within lock
-                        self.is_processing = True
-                        try:
-                            logger.info(f"Processing audio buffer of size: {len(self.input_buffer)} bytes")
-                            await self._process_audio(ws)
-                            self.chunks_since_last_process = 0  # Reset counter
-                        finally:
-                            self.is_processing = False
+                # Check if speech detected or enough chunks have accumulated
+                process_now = False
+                
+                # Convert audio sample for speech detection
+                try:
+                    pcm_audio = self.audio_processor.mulaw_to_pcm(audio_data)
+                    if isinstance(pcm_audio, bytes):
+                        audio_array = np.frombuffer(pcm_audio, dtype=np.int16).astype(np.float32) / 32768.0
+                    else:
+                        audio_array = pcm_audio
+                        
+                    # Check if audio contains speech
+                    contains_speech = self.audio_processor.contains_speech(audio_array)
+                    if contains_speech:
+                        process_now = True
+                    elif self.chunks_since_last_process >= 3:  # Process every 3 chunks even if no obvious speech
+                        process_now = True
+                except Exception as e:
+                    logger.error(f"Error in speech detection: {e}")
+                    # If error in detection, process anyway
+                    process_now = True
+                
+                if process_now:
+                    async with self.processing_lock:
+                        if not self.is_processing:  # Double-check within lock
+                            self.is_processing = True
+                            try:
+                                logger.info(f"Processing audio buffer of size: {len(self.input_buffer)} bytes")
+                                await self._process_audio(ws)
+                                self.chunks_since_last_process = 0  # Reset counter
+                            finally:
+                                self.is_processing = False
             
         except Exception as e:
             logger.error(f"Error processing media payload: {e}", exc_info=True)
@@ -1135,7 +1156,7 @@ class WebSocketHandler:
             logger.debug(f"Splitting {len(audio_data)} bytes into {len(chunks)} chunks")
             
             # Set agent speaking flag if this isn't an interrupt signal
-            if not is_interrupt and not self.audio_processor.preprocessor.agent_speaking:
+            if not is_interrupt and not self.audio_processor.agent_speaking:
                 self.audio_processor.set_agent_speaking(True)
             
             # Send a few chunks of silence first if this is an interruption
@@ -1220,7 +1241,7 @@ class WebSocketHandler:
             logger.debug(f"Sent {len(chunks)} audio chunks ({len(audio_data)} bytes total)")
             
             # Reset speaking flag after sending all chunks
-            if not is_interrupt and self.audio_processor.preprocessor.agent_speaking:
+            if not is_interrupt and self.audio_processor.agent_speaking:
                 self.audio_processor.set_agent_speaking(False)
                 
                 # Update echo detection variables

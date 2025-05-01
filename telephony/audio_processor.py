@@ -28,7 +28,7 @@ class AudioProcessor:
         self.last_barge_in_time = 0.0
         self.min_barge_in_interval = 0.5
         
-        # Agent speaking state tracking - replacing AudioPreprocessor functionality
+        # Agent speaking state tracking - added to match references in websocket_handler
         self.agent_speaking = False
         self.agent_speaking_start_time = 0.0
         
@@ -164,7 +164,7 @@ class AudioProcessor:
             logger.error(f"Error converting PCM to mulaw: {e}")
             # Return silence rather than empty data
             return bytes([0x7f] * 160)  # Return 20ms of silence
-    
+
     def _apply_simple_compression(self, audio_data: np.ndarray) -> np.ndarray:
         """
         Apply simple compression to make telephone speech more consistent.
@@ -212,7 +212,7 @@ class AudioProcessor:
         except Exception as e:
             logger.error(f"Error applying compression: {e}")
             return audio_data  # Return original if compression fails
-    
+
     def direct_check_for_barge_in(self, audio_data: np.ndarray) -> bool:
         """
         Direct barge-in detection without relying on AudioPreprocessor.
@@ -251,7 +251,7 @@ class AudioProcessor:
         except Exception as e:
             logger.error(f"Error in direct barge-in detection: {e}")
             return False
-    
+
     def contains_speech(self, audio_data: np.ndarray) -> bool:
         """
         Simplified speech detection.
@@ -299,7 +299,7 @@ class AudioProcessor:
             logger.error(f"Error in speech detection: {e}")
             # Be conservative - assume speech is present
             return True
-    
+
     def check_for_barge_in(self, audio_data: np.ndarray) -> bool:
         """
         Check for barge-in using direct detection.
@@ -312,7 +312,7 @@ class AudioProcessor:
         """
         # Use direct detection
         return self.direct_check_for_barge_in(audio_data)
-    
+
     def set_agent_speaking(self, is_speaking: bool) -> None:
         """
         Update the agent speaking state for barge-in detection.
@@ -326,7 +326,7 @@ class AudioProcessor:
         # Update timestamp if agent started speaking
         if is_speaking:
             self.agent_speaking_start_time = time.time()
-    
+
     def get_audio_info(self, audio_data: bytes) -> Dict[str, Any]:
         """
         Get information about audio data.
@@ -367,7 +367,7 @@ class AudioProcessor:
                     info["format"] = "pcm"
         
         return info
-    
+
     def reset(self) -> None:
         """Reset all state."""
         self.agent_speaking = False
