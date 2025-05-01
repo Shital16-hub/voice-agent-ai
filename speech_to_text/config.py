@@ -12,16 +12,16 @@ load_dotenv()
 class STTConfig(BaseSettings):
     """Configuration for Speech-to-Text module."""
     
-    # Google STT API settings
-    google_application_credentials: str = Field(
-        default=os.getenv("GOOGLE_APPLICATION_CREDENTIALS", ""),
-        description="Path to Google Cloud credentials JSON file"
+    # Deepgram API settings
+    deepgram_api_key: str = Field(
+        default=os.getenv("DEEPGRAM_API_KEY", ""),
+        description="Deepgram API Key for STT services"
     )
     
     # STT settings
     model_name: str = Field(
-        default="phone_call",
-        description="Google STT model to use"
+        default="general",
+        description="Deepgram STT model to use"
     )
     
     language: str = Field(
@@ -30,7 +30,7 @@ class STTConfig(BaseSettings):
     )
     
     sample_rate: int = Field(
-        default=8000,
+        default=16000,
         description="Audio sample rate in Hz"
     )
     
@@ -40,12 +40,11 @@ class STTConfig(BaseSettings):
         description="Whether to return interim results"
     )
     
-    use_enhanced: bool = Field(
-        default=True, 
-        description="Whether to use enhanced models"
+    endpointing: str = Field(
+        default="500",
+        description="Endpointing in ms, or 'default'"
     )
     
-    # Voice detection settings
     vad_events: bool = Field(
         default=True,
         description="Whether to return VAD events"
@@ -83,16 +82,23 @@ class STTConfig(BaseSettings):
         description="Whether to filter profanity"
     )
     
-    # Speech contexts - These help Google STT recognize specific phrases better
-    speech_contexts: list = Field(
-        default=[
-            {
-                "phrases": ["price", "plan", "cost", "subscription", "service", "features", "support", 
-                           "help", "agent", "assistant", "voice", "stop", "continue", "yes", "no"],
-                "boost": 15.0
-            }
-        ],
-        description="Speech contexts for improved recognition"
+    # Telephony-specific settings
+    diarize: bool = Field(
+        default=False,
+        description="Whether to perform speaker diarization"
+    )
+    
+    multichannel: bool = Field(
+        default=False,
+        description="Whether to treat audio as multichannel"
+    )
+    
+    model_options: dict = Field(
+        default={
+            "tier": "enhanced",  # Use enhanced model for telephony
+            "filler_words": False,  # Filter out um, uh, etc.
+        },
+        description="Additional model options"
     )
     
     class Config:

@@ -65,5 +65,4 @@ typing-extensions
 
 # Google Cloud TTS
 google-cloud-texttospeech
-google-cloud-speech
 google-auth

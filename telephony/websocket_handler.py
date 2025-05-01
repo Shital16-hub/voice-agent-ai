@@ -9,7 +9,6 @@ import logging
 import time
 import numpy as np
 import re
-import audioop  # Add this import
 from typing import Dict, Any, Callable, Awaitable, Optional, List, Union, Tuple
 from collections import deque
 
@@ -18,9 +17,6 @@ from telephony.config import (
     CHUNK_SIZE, AUDIO_BUFFER_SIZE, SILENCE_THRESHOLD, SILENCE_DURATION, 
     MAX_BUFFER_SIZE, ENABLE_BARGE_IN, BARGE_IN_THRESHOLD, BARGE_IN_DETECTION_WINDOW
 )
-
-# Import Google Cloud STT integration instead of Deepgram
-from speech_to_text.google_stt import GoogleCloudStreamingSTT, StreamingTranscriptionResult
 
 logger = logging.getLogger(__name__)
 
@@ -620,29 +616,24 @@ class WebSocketHandler:
     
     async def _process_audio(self, ws) -> None:
         """
-        Simplified process for accumulated audio data through the pipeline with Google Cloud Speech-to-Text.
-        Bypasses extensive preprocessing and avoids unnecessary STT session resets.
+        Process accumulated audio data through the pipeline with enhanced speech processing.
+        Also handles short commands and improves barge-in detection.
         
         Args:
             ws: WebSocket connection
         """
         try:
-            # Basic conversion without extensive preprocessing
-            mulaw_bytes = bytes(self.input_buffer)
-            
+            # Convert buffer to PCM with enhanced processing
             try:
-                # Simple conversion to PCM
-                pcm_data = audioop.ulaw2lin(mulaw_bytes, 2)
-                pcm_audio = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32) / 32768.0
+                mulaw_bytes = bytes(self.input_buffer)
                 
-                # Basic noise gate - very mild
-                noise_threshold = 0.005  # Reduced threshold
-                pcm_audio = np.where(np.abs(pcm_audio) < noise_threshold, 0, pcm_audio)
+                # Convert using the enhanced audio processing
+                pcm_audio = self.audio_processor.mulaw_to_pcm(mulaw_bytes)
                 
-                # Simple normalization
-                if np.max(np.abs(pcm_audio)) > 0:
-                    pcm_audio = pcm_audio / np.max(np.abs(pcm_audio)) * 0.95
-                    
+                # Ensure float32 format
+                if pcm_audio.dtype != np.float32:
+                    pcm_audio = pcm_audio.astype(np.float32)
+                
             except Exception as e:
                 logger.error(f"Error converting audio: {e}")
                 # Clear part of buffer and try again next time
@@ -650,6 +641,33 @@ class WebSocketHandler:
                 self.input_buffer = self.input_buffer[half_size:]
                 return
                     
+            # Add checks for audio quality
+            if len(pcm_audio) < 1000:  # Very small audio chunk
+                logger.warning(f"Audio chunk too small: {len(pcm_audio)} samples")
+                return
+            
+            # Use enhanced preprocessor to check if audio contains actual speech
+            contains_speech = self.audio_processor.contains_speech(pcm_audio)
+            if not contains_speech:
+                logger.info("No speech detected in audio buffer, skipping processing")
+                
+                # Increment silent frame counter
+                self.consecutive_silent_frames += 1
+                
+                # Only reduce buffer if we've confirmed it's truly silence
+                # (multiple consecutive silent frames)
+                if self.consecutive_silent_frames >= self.min_silent_frames_for_silence:
+                    # Reduce buffer size but keep some context
+                    half_size = len(self.input_buffer) // 2
+                    self.input_buffer = self.input_buffer[half_size:]
+                    logger.debug(f"Confirmed silence, reduced buffer to {len(self.input_buffer)} bytes")
+                    self.consecutive_silent_frames = 0  # Reset counter
+                
+                return
+            
+            # If we get here, we have speech - reset silent frame counter
+            self.consecutive_silent_frames = 0
+            
             # Create a list to collect transcription results
             transcription_results = []
             
@@ -663,146 +681,341 @@ class WebSocketHandler:
             try:
                 # Ensure STT is properly initialized and in streaming mode
                 if hasattr(self.pipeline, 'speech_recognizer'):
-                    # Make sure streaming is started
-                    if hasattr(self.pipeline.speech_recognizer, 'is_streaming'):
-                        if not getattr(self.pipeline.speech_recognizer, 'is_streaming', False):
-                            if hasattr(self.pipeline.speech_recognizer, 'start_streaming'):
+                    # Make sure streaming is started before processing
+                    if hasattr(self.pipeline.speech_recognizer, 'start_streaming'):
+                        # Check if it's an async method
+                        if asyncio.iscoroutinefunction(self.pipeline.speech_recognizer.start_streaming):
+                            # Make sure streaming is started
+                            if not getattr(self.pipeline.speech_recognizer, 'is_streaming', False):
                                 await self.pipeline.speech_recognizer.start_streaming()
-                                await asyncio.sleep(0.1)  # Small delay
+                                # Add a small delay to ensure streaming is fully started
+                                await asyncio.sleep(0.1)
+                        else:
+                            # Handle synchronous start_streaming
+                            if not getattr(self.pipeline.speech_recognizer, 'is_streaming', False):
+                                self.pipeline.speech_recognizer.start_streaming()
+                                # Add a small delay to ensure streaming is fully started
+                                await asyncio.sleep(0.1)
                 
-                # Convert to bytes format for Google Cloud
+                # Determine what type of STT we're using by checking attributes and methods
+                using_whisper = False
+                using_deepgram = False
+                
+                if hasattr(self.pipeline, 'speech_recognizer'):
+                    # Check for Whisper-specific attributes
+                    if hasattr(self.pipeline.speech_recognizer, 'model'):
+                        using_whisper = True
+                    # Check for Deepgram-specific attributes
+                    elif hasattr(self.pipeline.speech_recognizer, 'api_key'):
+                        using_deepgram = True
+                
+                # For Deepgram, convert to bytes format
                 audio_bytes = (pcm_audio * 32767).astype(np.int16).tobytes()
-                
-                # Process through Google Cloud Speech-to-Text
-                # Google Cloud expects 16-bit PCM audio
-                await self.pipeline.speech_recognizer.process_audio_chunk(
-                    audio_chunk=audio_bytes,
-                    callback=transcription_callback
-                )
-                
-                # Check for results in the queue
-                while not self.pipeline.speech_recognizer.result_queue.empty():
+                    
+                if using_whisper:
+                    # Process with Whisper (expects numpy array)
+                    await self.pipeline.speech_recognizer.process_audio_chunk(
+                        audio_chunk=pcm_audio,  # Pass numpy array for Whisper
+                        callback=transcription_callback
+                    )
+                    logger.debug("Processed audio with Whisper STT")
+                elif using_deepgram:
+                    # For Deepgram, ensure we're streaming first by checking and waiting
+                    streaming_started = getattr(self.pipeline.speech_recognizer, 'streaming_started', None)
+                    if streaming_started and hasattr(streaming_started, 'wait'):
+                        try:
+                            # Wait for streaming to be properly initialized
+                            await asyncio.wait_for(streaming_started.wait(), timeout=2.0)
+                        except asyncio.TimeoutError:
+                            logger.warning("Timeout waiting for Deepgram streaming to initialize")
+                            # Try restarting streaming
+                            await self.pipeline.speech_recognizer.start_streaming()
+                            # Wait again, but shorter timeout
+                            try:
+                                await asyncio.wait_for(streaming_started.wait(), timeout=1.0)
+                            except:
+                                pass
+                    
+                    # Process with Deepgram (expects bytes)
+                    await self.pipeline.speech_recognizer.process_audio_chunk(
+                        audio_chunk=audio_bytes,  # Use bytes for Deepgram
+                        callback=transcription_callback
+                    )
+                    logger.debug("Processed audio with Deepgram STT")
+                else:
+                    # Try both formats if we can't determine the type
                     try:
-                        result = self.pipeline.speech_recognizer.result_queue.get_nowait()
-                        if result and result not in transcription_results:
-                            transcription_results.append(result)
-                            self.pipeline.speech_recognizer.result_queue.task_done()
-                    except Exception:
-                        break
+                        # First try with numpy array
+                        await self.pipeline.speech_recognizer.process_audio_chunk(
+                            audio_chunk=pcm_audio,
+                            callback=transcription_callback
+                        )
+                    except AttributeError:
+                        # If that fails, try with bytes
+                        await self.pipeline.speech_recognizer.process_audio_chunk(
+                            audio_chunk=audio_bytes,
+                            callback=transcription_callback
+                        )
                 
-                # Find any final results
-                final_results = [r for r in transcription_results if 
-                                getattr(r, 'is_final', False) and 
-                                hasattr(r, 'text') and r.text]
+                # Get final transcription
+                final_transcription = ""
+                if hasattr(self.pipeline.speech_recognizer, 'stop_streaming'):
+                    # Check if stop_streaming is async
+                    try:
+                        if asyncio.iscoroutinefunction(self.pipeline.speech_recognizer.stop_streaming):
+                            result = await self.pipeline.speech_recognizer.stop_streaming()
+                            # Check if result is None or a tuple
+                            if result is not None:
+                                # Handle as tuple
+                                if isinstance(result, tuple) and len(result) >= 1:
+                                    final_transcription, _ = result
+                                else:
+                                    # Handle as single value
+                                    final_transcription = str(result)
+                            else:
+                                # Deepgram error case - result is None
+                                final_transcription = ""
+                        else:
+                            # Handle synchronous stop_streaming
+                            result = self.pipeline.speech_recognizer.stop_streaming()
+                            # Similar unpacking with safety checks
+                            if result is not None:
+                                if isinstance(result, tuple) and len(result) >= 1:
+                                    final_transcription, _ = result
+                                else:
+                                    final_transcription = str(result)
+                            else:
+                                final_transcription = ""
+                    except Exception as e:
+                        logger.error(f"Error getting final transcription: {e}")
+                        final_transcription = ""
+                    
+                    # Add to results if not empty
+                    if final_transcription:
+                        # Create a simple result object to unify handling
+                        class SimpleResult:
+                            def __init__(self, text):
+                                self.text = text
+                                self.is_final = True
+                                self.confidence = 1.0
+                                
+                        transcription_results.append(SimpleResult(final_transcription))
                 
-                # Get best result
+                # Find best result (highest confidence or longest text)
                 best_result = None
-                if final_results:
-                    # Use result with highest confidence if available
-                    if hasattr(final_results[0], 'confidence'):
-                        best_result = max(final_results, key=lambda r: getattr(r, 'confidence', 0))
+                if transcription_results:
+                    # First try to get final results with confidence
+                    final_results = [r for r in transcription_results if 
+                                    getattr(r, 'is_final', False) and 
+                                    hasattr(r, 'text') and r.text]
+                    
+                    if final_results:
+                        # Use highest confidence if available
+                        if hasattr(final_results[0], 'confidence'):
+                            best_result = max(final_results, key=lambda r: getattr(r, 'confidence', 0))
+                        else:
+                            # Otherwise use longest text
+                            best_result = max(final_results, key=lambda r: len(getattr(r, 'text', '')))
                     else:
-                        # Otherwise use longest text
-                        best_result = max(final_results, key=lambda r: len(getattr(r, 'text', '')))
+                        # No final results, use any result with text
+                        text_results = [r for r in transcription_results if hasattr(r, 'text') and r.text]
+                        if text_results:
+                            best_result = max(text_results, key=lambda r: len(getattr(r, 'text', '')))
                 
                 # Get transcription from best result
-                transcription = best_result.text if best_result and hasattr(best_result, 'text') else ""
-                
-                # Log the transcription
-                if transcription:
-                    logger.info(f"Transcription: '{transcription}'")
-                    
-                    # Process if it's a valid transcription
-                    if len(transcription.split()) >= 2:  # Only require 2 words minimum
-                        # Now clear the input buffer since we have a valid transcription
-                        self.input_buffer.clear()
-                        
-                        # Don't process duplicate transcriptions
-                        if transcription == self.last_transcription:
-                            logger.info("Duplicate transcription, not processing again")
-                            return
-                        
-                        # Process through knowledge base
-                        try:
-                            if hasattr(self.pipeline, 'query_engine'):
-                                query_result = await self.pipeline.query_engine.query(transcription)
-                                response = query_result.get("response", "")
-                                
-                                logger.info(f"Generated response: {response}")
-                                
-                                # Convert to speech
-                                if response and hasattr(self.pipeline, 'tts_integration'):
-                                    try:
-                                        # Set agent speaking state before sending audio
-                                        if hasattr(self.audio_processor, 'set_agent_speaking'):
-                                            self.audio_processor.set_agent_speaking(True)
-                                        self.speech_cancellation_event.clear()
-                                        
-                                        speech_audio = await self.pipeline.tts_integration.text_to_speech(response)
-                                        
-                                        # Convert to mulaw for Twilio
-                                        mulaw_audio = self.audio_processor.pcm_to_mulaw(speech_audio)
-                                        
-                                        # Send back to Twilio
-                                        logger.info(f"Sending audio response ({len(mulaw_audio)} bytes)")
-                                        await self._send_audio(mulaw_audio, ws)
-                                        
-                                    except Exception as tts_error:
-                                        logger.error(f"TTS Error: {tts_error}", exc_info=True)
-                                        # Try to send a text-based fallback response
-                                        fallback_message = "I'm having trouble generating speech right now."
-                                        
-                                        try:
-                                            # Use a simple message
-                                            simple_audio = await self.pipeline.tts_integration.tts_client.synthesize(
-                                                fallback_message, is_ssml=False
-                                            )
-                                            fallback_mulaw = self.audio_processor.pcm_to_mulaw(simple_audio)
-                                            await self._send_audio(fallback_mulaw, ws)
-                                        except Exception as fallback_error:
-                                            logger.error(f"Failed to generate fallback: {fallback_error}")
-                                    finally:
-                                        # Reset agent speaking state
-                                        if hasattr(self.audio_processor, 'set_agent_speaking'):
-                                            self.audio_processor.set_agent_speaking(False)
-                                    
-                                    # Update state
-                                    self.last_transcription = transcription
-                                    self.last_response_time = time.time()
-                        except Exception as e:
-                            logger.error(f"Error processing through knowledge base: {e}", exc_info=True)
-                    else:
-                        # If no valid transcription, reduce buffer size but keep some for context
-                        half_size = len(self.input_buffer) // 2
-                        self.input_buffer = self.input_buffer[half_size:]
-                        logger.debug(f"Transcription too short, reduced buffer to {len(self.input_buffer)} bytes")
+                if best_result and hasattr(best_result, 'text'):
+                    transcription = best_result.text
                 else:
-                    # If no transcription at all, just reduce buffer size
+                    transcription = ""
+                
+                # Log before cleanup for debugging
+                logger.info(f"RAW TRANSCRIPTION: '{transcription}'")
+                
+                # Clean up transcription
+                transcription = self.cleanup_transcription(transcription)
+                logger.info(f"CLEANED TRANSCRIPTION: '{transcription}'")
+                
+                # Check for noise keywords - skip knowledge base query for noise
+                noise_keywords = ["click", "keyboard", "tongue", "scoff", "static", "*", "(", ")"]
+                if any(keyword in transcription.lower() for keyword in noise_keywords):
+                    logger.info(f"Detected noise keywords in transcription, skipping: '{transcription}'")
+                    # Clear part of buffer and continue
                     half_size = len(self.input_buffer) // 2
                     self.input_buffer = self.input_buffer[half_size:]
-                    logger.debug(f"No transcription found, reduced buffer to {len(self.input_buffer)} bytes")
+                    return
                 
-                # Don't reset the STT session every time - only reset if we got a valid transcription
-                if transcription and len(transcription.split()) >= 2:
+                # Check if this is a simple command before applying minimum word filter
+                is_command, command_type = self._is_simple_command(transcription)
+                if is_command:
+                    logger.info(f"Detected command: '{transcription}' -> {command_type}")
+                    
+                    # Clear input buffer since we recognized a command
+                    self.input_buffer.clear()
+                    
+                    # Handle the command
+                    command_handled = self._handle_command(command_type, ws)
+                    if command_handled:
+                        return
+                
+                # Check for empty transcriptions (if not a command)
+                if not transcription:
+                    logger.info("Empty transcription, skipping")
+                    # Clear part of buffer and continue
+                    half_size = len(self.input_buffer) // 2
+                    self.input_buffer = self.input_buffer[half_size:]
+                    return
+                
+                # Check minimum word count for regular queries (not commands)
+                if not is_command and len(transcription.split()) < self.min_words_for_valid_query:
+                    logger.info(f"Transcription too short, skipping: '{transcription}'")
+                    # Clear part of buffer and continue
+                    half_size = len(self.input_buffer) // 2
+                    self.input_buffer = self.input_buffer[half_size:]
+                    return
+                
+                # Process if it's a valid transcription or recognized command
+                if transcription:
+                    logger.info(f"Complete transcription: {transcription}")
+                    
+                    # Now clear the input buffer since we have a valid transcription
+                    self.input_buffer.clear()
+                    
+                    # Don't process duplicate transcriptions
+                    if transcription == self.last_transcription:
+                        logger.info("Duplicate transcription, not processing again")
+                        return
+                    
+                    # Process through knowledge base
                     try:
-                        if hasattr(self.pipeline.speech_recognizer, 'stop_streaming'):
-                            await self.pipeline.speech_recognizer.stop_streaming()
+                        if hasattr(self.pipeline, 'query_engine'):
+                            query_result = await self.pipeline.query_engine.query(transcription)
+                            response = query_result.get("response", "")
+                            
+                            # Make responses more concise for telephony
+                            if len(response.split()) > 100:  # Long response
+                                paragraphs = response.split("\n\n")
+                                if len(paragraphs) > 2:
+                                    # Keep first two paragraphs and summarize
+                                    response = "\n\n".join(paragraphs[:2])
+                                    response += "\n\nI have more details if you'd like me to continue."
+                            
+                            logger.info(f"Generated response: {response}")
+                            
+                            # Convert to speech
+                            if response and hasattr(self.pipeline, 'tts_integration'):
+                                try:
+                                    # Set agent speaking state before sending audio
+                                    self.audio_processor.set_agent_speaking(True)
+                                    self.speech_cancellation_event.clear()
+                                    
+                                    speech_audio = await self.pipeline.tts_integration.text_to_speech(response)
+                                    
+                                    # Convert to mulaw for Twilio
+                                    mulaw_audio = self.audio_processor.pcm_to_mulaw(speech_audio)
+                                    
+                                    # Send back to Twilio
+                                    logger.info(f"Sending audio response ({len(mulaw_audio)} bytes)")
+                                    await self._send_audio(mulaw_audio, ws)
+                                    
+                                except Exception as tts_error:
+                                    logger.error(f"TTS Error: {tts_error}. Sending fallback response.", exc_info=True)
+                                    
+                                    # Try to send a text-based fallback response
+                                    fallback_message = "I'm having trouble generating speech at the moment. Let me try again in a moment."
+                                    
+                                    try:
+                                        # Try to use a simple SSML template that works with all voices
+                                        simple_audio = await self.pipeline.tts_integration.tts_client.synthesize(
+                                            "<speak>" + fallback_message + "</speak>", 
+                                            is_ssml=True
+                                        )
+                                        fallback_mulaw = self.audio_processor.pcm_to_mulaw(simple_audio)
+                                        await self._send_audio(fallback_mulaw, ws)
+                                    except Exception as fallback_error:
+                                        logger.error(f"Failed to generate fallback response: {fallback_error}")
+                                        
+                                        # Use a pre-recorded or simple beep as last resort
+                                        silence_duration = 0.5  # seconds
+                                        silence_size = int(8000 * silence_duration)
+                                        fallback_audio = bytes([0x7f] * silence_size)  # Simple audio
+                                        await self._send_audio(fallback_audio, ws)
+                                
+                                finally:
+                                    # Reset agent speaking state
+                                    self.audio_processor.set_agent_speaking(False)
+                                
+                                # Update state
+                                self.last_transcription = transcription
+                                self.last_response_time = time.time()
+                    except Exception as e:
+                        logger.error(f"Error processing through knowledge base: {e}", exc_info=True)
                         
-                        await asyncio.sleep(0.2)  # Add delay between stop and start
-                        
-                        if hasattr(self.pipeline.speech_recognizer, 'start_streaming'):
-                            await self.pipeline.speech_recognizer.start_streaming()
-                            await asyncio.sleep(0.1)  # Add a small delay
-                        
-                        logger.info("Reset STT after successful transcription")
-                    except Exception as reset_error:
-                        logger.error(f"Error resetting STT: {reset_error}")
+                        # Try to send a fallback response
+                        fallback_message = "I'm sorry, I'm having trouble understanding. Could you try again?"
+                        try:
+                            # Use simple SSML template
+                            fallback_audio = await self.pipeline.tts_integration.tts_client.synthesize(
+                                "<speak>" + fallback_message + "</speak>",
+                                is_ssml=True
+                            )
+                            mulaw_fallback = self.audio_processor.pcm_to_mulaw(fallback_audio)
+                            await self._send_audio(mulaw_fallback, ws)
+                            self.last_response_time = time.time()
+                        except Exception as e2:
+                            logger.error(f"Failed to send fallback response: {e2}")
+                else:
+                    # If no valid transcription, reduce buffer size but keep some for context
+                    half_size = len(self.input_buffer) // 2
+                    self.input_buffer = self.input_buffer[half_size:]
+                    logger.debug(f"No valid transcription, reduced buffer to {len(self.input_buffer)} bytes")
+                
+                # Restart STT streaming session for next input
+                if hasattr(self.pipeline, 'speech_recognizer'):
+                    # Check if start_streaming is async
+                    if asyncio.iscoroutinefunction(self.pipeline.speech_recognizer.start_streaming):
+                        await self.pipeline.speech_recognizer.start_streaming()
+                        # Add a small delay to ensure streaming is fully started
+                        await asyncio.sleep(0.1)
+                    else:
+                        # Handle synchronous start_streaming
+                        self.pipeline.speech_recognizer.start_streaming()
+                        # Add a small delay to ensure streaming is fully started
+                        await asyncio.sleep(0.1)
+                    logger.info("Reset STT streaming session for next input")
             
             except Exception as e:
                 logger.error(f"Error during STT processing: {e}", exc_info=True)
                 # If error, clear part of buffer and continue
                 half_size = len(self.input_buffer) // 2
                 self.input_buffer = self.input_buffer[half_size:]
+                
+                # Reset STT if needed
+                if hasattr(self.pipeline, 'speech_recognizer'):
+                    try:
+                        # Try to reset STT with error handling for sync/async methods
+                        if hasattr(self.pipeline.speech_recognizer, 'stop_streaming'):
+                            try:
+                                if asyncio.iscoroutinefunction(self.pipeline.speech_recognizer.stop_streaming):
+                                    await self.pipeline.speech_recognizer.stop_streaming()
+                                else:
+                                    self.pipeline.speech_recognizer.stop_streaming()
+                            except Exception:
+                                pass
+                        
+                        await asyncio.sleep(0.2)  # Add delay between stop and start
+                        
+                        if hasattr(self.pipeline.speech_recognizer, 'start_streaming'):
+                            if asyncio.iscoroutinefunction(self.pipeline.speech_recognizer.start_streaming):
+                                await self.pipeline.speech_recognizer.start_streaming()
+                                # Add a small delay to ensure streaming is fully started
+                                await asyncio.sleep(0.1)
+                            else:
+                                self.pipeline.speech_recognizer.start_streaming()
+                                # Add a small delay to ensure streaming is fully started
+                                await asyncio.sleep(0.1)
+                            logger.info("Reset STT after error")
+                    except Exception as reset_error:
+                        logger.error(f"Error resetting STT: {reset_error}")
                 
         except Exception as e:
             logger.error(f"Error processing audio: {e}", exc_info=True)
