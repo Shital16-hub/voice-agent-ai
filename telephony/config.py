@@ -1,5 +1,5 @@
 """
-Enhanced configuration settings for telephony integration with improved barge-in.
+Enhanced configuration settings for telephony integration with improved noise handling.
 """
 import os
 from dotenv import load_dotenv
@@ -20,50 +20,51 @@ DEBUG = os.getenv('DEBUG', 'False').lower() == 'true'
 SAMPLE_RATE_TWILIO = 8000  # Twilio's sample rate
 SAMPLE_RATE_AI = 16000     # Our AI system's sample rate
 CHUNK_SIZE = 320           # 20ms at 8kHz
-# Reduced buffer sizes for faster processing
-AUDIO_BUFFER_SIZE = 24000  # 1.5 second buffer (reduced from 32000)
-MAX_BUFFER_SIZE = 32000    # 2.0 seconds maximum buffer (reduced from 48000)
+# Increased buffer size for better speech analysis
+AUDIO_BUFFER_SIZE = 32000  # 2.0 second buffer (reduced from 38400)
+MAX_BUFFER_SIZE = 48000    # 3.0 seconds maximum buffer (reduced from 57600)
 
 # WebSocket Configuration
 WS_PING_INTERVAL = 20
 WS_PING_TIMEOUT = 10
 WS_MAX_MESSAGE_SIZE = 1048576  # 1MB
 
-# Enhanced Speech Detection Settings - More Sensitive
-SILENCE_THRESHOLD = 0.0018   # Reduced from 0.0025 for better sensitivity
-SILENCE_DURATION = 1.5       # Reduced from 2.0 seconds for faster response
+# Enhanced Speech Detection Settings
+SILENCE_THRESHOLD = 0.0025   # Increased from 0.0018 for better noise rejection
+SILENCE_DURATION = 2.0       # Increased from 1.8 seconds to ensure proper pauses
 MAX_CALL_DURATION = 3600     # 1 hour
-MAX_PROCESSING_TIME = 4.0    # Reduced from 5.0 seconds
+MAX_PROCESSING_TIME = 5.0    # Reduced from 6.0 seconds
 
 # Response Settings
-RESPONSE_TIMEOUT = 3.0        # Reduced from 4.0 seconds
-MIN_TRANSCRIPTION_LENGTH = 3  # Reduced from 4 to process shorter utterances
+RESPONSE_TIMEOUT = 4.0        # Reduced from 4.5 seconds
+MIN_TRANSCRIPTION_LENGTH = 4  # Increased from 3 to avoid processing noise/short utterances
 
 # Enhanced Noise Filtering Settings
-HIGH_PASS_FILTER = 120
-NOISE_GATE_THRESHOLD = 0.02  # Reduced from 0.025 for better sensitivity
+HIGH_PASS_FILTER = 120       # Increased from 100Hz to further reduce low-frequency noise
+NOISE_GATE_THRESHOLD = 0.025  # Increased from 0.018
 ENABLE_NOISE_FILTERING = True
 
 # Enhanced Barge-in Settings
-ENABLE_BARGE_IN = True
-BARGE_IN_THRESHOLD = 0.04               # Reduced from 0.045 for faster detection
-BARGE_IN_DETECTION_WINDOW = 100         # Reduced from 140ms for faster detection
-BARGE_IN_MIN_SPEECH_DURATION = 200      # Reduced from 300ms for faster response
-BARGE_IN_COOLDOWN_MS = 500              # Reduced from 1500ms to 500ms
+ENABLE_BARGE_IN = True                   # Enable barge-in functionality
+BARGE_IN_THRESHOLD = 0.045               # Increased from 0.045 for more reliable detection
+BARGE_IN_DETECTION_WINDOW = 140          # Increased from 100ms for better detection
+BARGE_IN_MIN_SPEECH_DURATION = 300       # Increased from 200ms to reduce false positives
+BARGE_IN_COOLDOWN_MS = 1500              # 2 second cooldown after agent starts speaking
 
 # Logging Configuration
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 
-# New: Audio Preprocessor Configuration - Optimized for barge-in
+# New: Audio Preprocessor Configuration
 PREPROCESSOR_ENABLE_DEBUG = False  # Enable detailed debug logging for audio preprocessor
-PREPROCESSOR_WARMUP_FRAMES = 8     # Reduced from 15 for faster startup
-PREPROCESSOR_NOISE_FLOOR_MIN = 0.006  # Reduced from 0.008 for better sensitivity
+PREPROCESSOR_WARMUP_FRAMES = 15    # Frames to collect before making VAD decisions
+PREPROCESSOR_NOISE_FLOOR_MIN = 0.008  # Minimum noise floor level
 
-# STT Optimization Settings
+# STT Optimization Settings - Enhanced for noise handling
 STT_INITIAL_PROMPT = """This is a telephone conversation. 
-Focus only on the clearly spoken words and ignore any background noise or interference."""
+Focus only on the clearly spoken words and ignore any background noise, static, 
+beeps, or line interference. Transcribe only the spoken words."""
 
-STT_NO_CONTEXT = True
-STT_TEMPERATURE = 0.0
-STT_PRESET = "default"
+STT_NO_CONTEXT = True       # Disable context to prevent false additions in noisy environments
+STT_TEMPERATURE = 0.0       # Use greedy decoding for less hallucination
+STT_PRESET = "default"      # Use default preset with enhanced noise handling
