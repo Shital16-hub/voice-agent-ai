@@ -1,13 +1,14 @@
 """
 Google Cloud Speech-to-Text client for streaming transcription.
+Updated version with proper timedelta handling and improved error recovery.
 """
-import datetime
 import os
 import logging
 import asyncio
 import time
 import queue
 import threading
+import datetime
 from typing import Dict, Any, Optional, Union, List, AsyncGenerator, Callable, Awaitable
 from dataclasses import dataclass
 
@@ -76,7 +77,6 @@ class GoogleCloudStreamingSTT:
         # Streaming state
         self.is_streaming = False
         self.stream = None
-        self.streaming_config = None
         self.streaming_lock = asyncio.Lock()
         self.streaming_started = asyncio.Event()
         self.streaming_started.clear()
@@ -90,6 +90,12 @@ class GoogleCloudStreamingSTT:
         # Result tracking
         self.utterance_id = 0
         self.last_result = None
+        
+        # Error recovery
+        self.consecutive_errors = 0
+        self.max_consecutive_errors = 3
+        self.error_backoff_time = 1.0  # Starting backoff time in seconds
+        self.max_backoff_time = 8.0    # Maximum backoff time
         
         # Initialize client
         self._init_client()
@@ -181,6 +187,10 @@ class GoogleCloudStreamingSTT:
             self.audio_queue = queue.Queue()
             self.result_queue = queue.Queue()
             self.stop_event = threading.Event()
+            
+            # Reset error counters
+            self.consecutive_errors = 0
+            self.error_backoff_time = 1.0
             
             # Start streaming thread
             self.streaming_thread = threading.Thread(
@@ -294,9 +304,16 @@ class GoogleCloudStreamingSTT:
                     # Store as last result if final
                     if result.is_final:
                         self.last_result = transcription_result
-                    
+            
+            # Reset error counter on successful completion
+            self.consecutive_errors = 0
+                
         except Exception as e:
             logger.error(f"Error in streaming thread: {e}", exc_info=True)
+            
+            # Track consecutive errors for backoff
+            self.consecutive_errors += 1
+            
             # Add error to result queue
             error_result = StreamingTranscriptionResult(
                 text="",
@@ -308,6 +325,33 @@ class GoogleCloudStreamingSTT:
                 words=[]
             )
             self.result_queue.put(error_result)
+            
+            # If too many errors, implement backoff
+            if self.consecutive_errors >= self.max_consecutive_errors:
+                backoff_time = min(self.error_backoff_time * (2 ** (self.consecutive_errors - self.max_consecutive_errors)), 
+                                 self.max_backoff_time)
+                logger.warning(f"Too many consecutive errors ({self.consecutive_errors}), "
+                             f"backing off for {backoff_time:.1f}s before restart")
+                time.sleep(backoff_time)
+                
+                # Auto-restart the streaming session if not stopped
+                if not self.stop_event.is_set():
+                    logger.info("Auto-restarting streaming session after backoff")
+                    try:
+                        # Create a new speech client
+                        new_credentials = service_account.Credentials.from_service_account_file(self.credentials_path)
+                        new_client = speech.SpeechClient(credentials=new_credentials)
+                        
+                        # Recreate streaming session
+                        new_streaming_config = speech.StreamingRecognitionConfig(
+                            config=rec_config,
+                            interim_results=self.streaming_config["interim_results"]
+                        )
+                        
+                        # Try to restart
+                        self._run_streaming_thread()
+                    except Exception as restart_error:
+                        logger.error(f"Failed to auto-restart streaming: {restart_error}")
     
     async def process_audio_chunk(
         self, 
@@ -315,14 +359,14 @@ class GoogleCloudStreamingSTT:
         callback: Optional[Callable[[StreamingTranscriptionResult], Awaitable[None]]] = None
     ) -> Optional[StreamingTranscriptionResult]:
         """
-        Process an audio chunk.
+        Process a chunk of streaming audio.
         
         Args:
-            audio_chunk: Audio data chunk
-            callback: Optional async callback for results
+            audio_chunk: Audio chunk data
+            callback: Optional callback for results
             
         Returns:
-            Optional transcription result
+            Transcription result or None for interim results
         """
         # Check if streaming is initialized
         if not self.is_streaming:

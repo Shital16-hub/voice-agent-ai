@@ -1,6 +1,7 @@
 """
 Enhanced WebSocket handler for Twilio media streams with improved speech/noise
 discrimination and barge-in detection using the new AudioPreprocessor.
+This version is optimized for low latency and better responsiveness.
 """
 import json
 import base64
@@ -9,9 +10,10 @@ import logging
 import time
 import numpy as np
 import re
-import audioop  # Add this import
+import audioop
 from typing import Dict, Any, Callable, Awaitable, Optional, List, Union, Tuple
 from collections import deque
+from enum import Enum
 
 from telephony.audio_preprocessor import AudioPreprocessor, SpeechState
 from telephony.config import (
@@ -26,40 +28,21 @@ logger = logging.getLogger(__name__)
 
 # Enhanced patterns for non-speech annotations
 NON_SPEECH_PATTERNS = [
-    r'\(.*?music.*?\)',         # (music), (tense music), etc.
-    r'\(.*?wind.*?\)',          # (wind), (wind blowing), etc.
-    r'\(.*?engine.*?\)',        # (engine), (engine revving), etc.
-    r'\(.*?noise.*?\)',         # (noise), (background noise), etc.
-    r'\(.*?sound.*?\)',         # (sound), (sounds), etc.
-    r'\(.*?silence.*?\)',       # (silence), etc.
-    r'\[.*?silence.*?\]',       # [silence], etc.
-    r'\[.*?BLANK.*?\]',         # [BLANK_AUDIO], etc.
-    r'\(.*?applause.*?\)',      # (applause), etc.
-    r'\(.*?laughter.*?\)',      # (laughter), etc.
-    r'\(.*?footsteps.*?\)',     # (footsteps), etc.
-    r'\(.*?breathing.*?\)',     # (breathing), etc.
-    r'\(.*?growling.*?\)',      # (growling), etc.
-    r'\(.*?coughing.*?\)',      # (coughing), etc.
-    r'\(.*?clap.*?\)',          # (clap), etc.
-    r'\(.*?laugh.*?\)',         # (laughing), etc.
-    # Additional noise patterns
-    r'\[.*?noise.*?\]',         # [noise], etc.
-    r'\(.*?background.*?\)',    # (background), etc.
-    r'\[.*?music.*?\]',         # [music], etc.
-    r'\(.*?static.*?\)',        # (static), etc.
-    r'\[.*?unclear.*?\]',       # [unclear], etc.
-    r'\(.*?inaudible.*?\)',     # (inaudible), etc.
-    r'<.*?noise.*?>',           # <noise>, etc.
-    r'music playing',           # Common transcription
-    r'background noise',        # Common transcription
-    r'static',                  # Common transcription
-    r'\*.*?\*',                 # *any text* (scoff, etc.)
-    r'^\(.*?\)$',               # Entire text is (in parentheses)
-    r'clicking',                # keyboard/tongue clicking
-    r'clacking',                # keyboard clacking
-    r'tongue',                  # tongue clicks
-    r'keyboard',                # keyboard noises
+    r'\[.*?\]',           # Anything in square brackets
+    r'\(.*?\)',           # Anything in parentheses
+    r'\<.*?\>',           # Anything in angle brackets
+    r'music playing',     # Common transcription
+    r'background noise',  # Common transcription
+    r'static',            # Common transcription
+    r'\b(um|uh|hmm|mmm)\b',  # Common filler words
 ]
+
+class ConversationState(Enum):
+    IDLE = "idle"  # Not actively engaged
+    LISTENING = "listening"  # Listening for user input
+    PROCESSING = "processing"  # Processing user input
+    RESPONDING = "responding"  # Agent is speaking
+    PAUSED = "paused"  # Conversation paused
 
 class WebSocketHandler:
     """
@@ -67,28 +50,25 @@ class WebSocketHandler:
     Integrates the new AudioPreprocessor via the updated AudioProcessor.
     """
     
-    # Add these constants for command recognition
-    STOP_COMMANDS = ["stop", "okay", "ok", "enough", "halt", "pause", "quit", "exit", "bye", "end"]
-    SIMPLE_COMMANDS = {
-        "stop": "stop",
-        "okay": "stop",
-        "ok": "stop",
-        "enough": "stop",
-        "halt": "stop",
-        "pause": "stop",
-        "quit": "stop",
-        "exit": "stop",
-        "bye": "stop",
-        "end": "stop",
-        "continue": "continue",
-        "go on": "continue",
-        "proceed": "continue",
-        "yes": "continue",
-        "help": "help",
-        "repeat": "repeat",
-        "again": "repeat",
-        "what": "repeat"
-    }
+    # Enhanced command lists
+    STOP_COMMANDS = [
+        "stop", "stop speaking", "stop talking", "be quiet", "shut up", "quiet", 
+        "enough", "halt", "pause", "quit", "exit", "bye", "end", "silence"
+    ]
+
+    CONTINUE_COMMANDS = [
+        "continue", "go on", "proceed", "resume", "keep going", "carry on", "go ahead"
+    ]
+
+    REPEAT_COMMANDS = [
+        "repeat", "say again", "repeat that", "what did you say", "say that again", 
+        "can you repeat", "again", "what"
+    ]
+
+    HELP_COMMANDS = [
+        "help", "help me", "what can you do", "how does this work", "instructions", 
+        "commands", "options"
+    ]
     
     def __init__(self, call_sid: str, pipeline):
         """
@@ -108,7 +88,7 @@ class WebSocketHandler:
             from telephony.audio_processor import AudioProcessor
             self.audio_processor = AudioProcessor()
         
-        # Audio buffers
+        # Audio buffers - reduced size for lower latency
         self.input_buffer = bytearray()
         self.output_buffer = bytearray()
         
@@ -130,12 +110,33 @@ class WebSocketHandler:
         self.processing_lock = asyncio.Lock()
         self.keep_alive_task = None
         
+        # Add variables for echo detection
+        self.agent_last_response = ""  # Store the agent's last response text
+        self.echo_detection_window = 5.0  # Seconds to ignore similar utterances after agent speaks
+        self.similarity_threshold = 0.6  # Threshold for considering text similar
+        self.last_agent_speech_time = 0.0  # When the agent last finished speaking
+        self.is_processing_self_echo = False  # Flag to track potential self-echoes
+        
+        # Conversation state management
+        self.conversation_state = ConversationState.IDLE
+        self.last_state_change_time = time.time()
+        self.max_state_duration = {
+            ConversationState.IDLE: 60.0,  # 1 minute max in idle
+            ConversationState.LISTENING: 10.0,  # 10 seconds max listening
+            ConversationState.PROCESSING: 5.0,  # 5 seconds max processing (reduced)
+            ConversationState.RESPONDING: 20.0,  # 20 seconds max responding (reduced)
+            ConversationState.PAUSED: 30.0  # 30 seconds max paused
+        }
+        
+        # Track state timeout tasks
+        self.state_timeout_task = None
+        
         # Compile the non-speech patterns for efficient use
         self.non_speech_pattern = re.compile('|'.join(NON_SPEECH_PATTERNS))
         
         # Conversation flow management with increased pause
-        self.pause_after_response = 4.0  # Increased from 3.0 seconds - wait 4 seconds after response
-        self.min_words_for_valid_query = 3  # Increased from 2 - minimum 3 words for a valid query
+        self.pause_after_response = 1.5  # Reduced from 4.0 seconds for lower latency
+        self.min_words_for_valid_query = 2  # Reduced to 2 words minimum for higher responsiveness
         
         # Create an event to signal when we should stop processing
         self.stop_event = asyncio.Event()
@@ -146,24 +147,207 @@ class WebSocketHandler:
         
         # New: Add startup delay before processing audio (prevents false triggers at start)
         self.startup_time = time.time()
-        self.startup_delay_sec = 2.0  # 2 second delay before processing audio
+        self.startup_delay_sec = 1.0  # Reduced to 1 second for faster initial response
         
         # New: Track consecutive silent frames for better silence detection
         self.consecutive_silent_frames = 0
-        self.min_silent_frames_for_silence = 10  # Increased from 5 - minimum 10 frames to be considered silence
+        self.min_silent_frames_for_silence = 5  # Reduced for faster response
         
         # New: Add a flag to prevent multiple barge-in detections in quick succession
         self.last_barge_in_time = 0
-        self.barge_in_cooldown_sec = 1.5  # 1.5 second cooldown between barge-ins
+        self.barge_in_cooldown_sec = 0.5  # Reduced from 1.5 to 0.5 seconds for faster interruption
         
         # Track chunks processed since last processing 
         self.chunks_since_last_process = 0
         
+        # Reduced buffer size for lower latency
+        self.buffer_size_minimum = AUDIO_BUFFER_SIZE // 2  # Half the original size
+
+        # Conversation manager reference
+        if hasattr(self.pipeline, 'conversation_manager'):
+            self.conversation_manager = self.pipeline.conversation_manager
+        else:
+            self.conversation_manager = None
+        
         logger.info(f"WebSocketHandler initialized for call {call_sid} with enhanced audio preprocessing")
+    
+    def _set_conversation_state(self, new_state: ConversationState) -> None:
+        """
+        Set conversation state with timeout handling.
+        
+        Args:
+            new_state: New conversation state
+        """
+        old_state = self.conversation_state
+        if old_state == new_state:
+            return  # No change
+        
+        # Update state
+        self.conversation_state = new_state
+        self.last_state_change_time = time.time()
+        
+        # Log state change
+        logger.info(f"Conversation state change: {old_state.value} -> {new_state.value}")
+        
+        # Cancel existing timeout task
+        if self.state_timeout_task:
+            self.state_timeout_task.cancel()
+        
+        # Create new timeout task
+        max_duration = self.max_state_duration.get(new_state, 30.0)
+        self.state_timeout_task = asyncio.create_task(self._handle_state_timeout(new_state, max_duration))
+        
+        # Perform state-specific actions
+        if new_state == ConversationState.LISTENING:
+            # Ensure STT is ready
+            if hasattr(self.pipeline, 'speech_recognizer'):
+                if hasattr(self.pipeline.speech_recognizer, 'start_streaming'):
+                    if not getattr(self.pipeline.speech_recognizer, 'is_streaming', False):
+                        asyncio.create_task(self.pipeline.speech_recognizer.start_streaming())
+        
+        elif new_state == ConversationState.RESPONDING:
+            # Set agent speaking flag
+            if hasattr(self.audio_processor, 'set_agent_speaking'):
+                self.audio_processor.set_agent_speaking(True)
+                
+        elif new_state == ConversationState.IDLE or new_state == ConversationState.LISTENING:
+            # Clear agent speaking flag if transitioning from RESPONDING
+            if old_state == ConversationState.RESPONDING and hasattr(self.audio_processor, 'set_agent_speaking'):
+                self.audio_processor.set_agent_speaking(False)
+
+    async def _handle_state_timeout(self, expected_state: ConversationState, timeout: float) -> None:
+        """
+        Handle timeout for a conversation state.
+        
+        Args:
+            expected_state: The state that should timeout
+            timeout: Timeout duration in seconds
+        """
+        try:
+            await asyncio.sleep(timeout)
+            
+            # Only act if we're still in the same state
+            if self.conversation_state == expected_state:
+                logger.warning(f"Conversation state {expected_state.value} timed out after {timeout}s")
+                
+                # Handle timeout based on state
+                if expected_state == ConversationState.RESPONDING:
+                    # Force stop speaking
+                    self.speech_cancellation_event.set()
+                    self._set_conversation_state(ConversationState.LISTENING)
+                    
+                elif expected_state == ConversationState.PROCESSING:
+                    # Reset processing state
+                    self.is_processing = False
+                    self._set_conversation_state(ConversationState.LISTENING)
+                    
+                elif expected_state == ConversationState.LISTENING:
+                    # If listening too long without input, go to idle
+                    self._set_conversation_state(ConversationState.IDLE)
+                    
+                elif expected_state == ConversationState.PAUSED:
+                    # Resume from pause after timeout
+                    self._set_conversation_state(ConversationState.LISTENING)
+                    
+        except asyncio.CancelledError:
+            # Task was cancelled, this is expected when state changes
+            pass
+        except Exception as e:
+            logger.error(f"Error in state timeout handler: {e}")
+
+    def _detect_barge_in(self, audio_data: np.ndarray) -> bool:
+        """
+        Simplified barge-in detection that works directly with audio data.
+        
+        Args:
+            audio_data: Audio data as numpy array
+            
+        Returns:
+            True if barge-in is detected
+        """
+        if not self.audio_processor.preprocessor.agent_speaking:
+            return False  # Only check for barge-in when agent is speaking
+        
+        # Calculate energy of the audio
+        energy = np.mean(np.abs(audio_data))
+        
+        # Use a simpler, more responsive threshold for barge-in
+        barge_in_threshold = 0.03  # Lower threshold makes it more sensitive
+        
+        # Check for current time since agent started speaking
+        current_time = time.time()
+        time_since_agent_started = (current_time - self.audio_processor.preprocessor.agent_speaking_start_time) * 1000  # ms
+        
+        # Only allow barge-in after a short delay (to avoid detecting echo)
+        if time_since_agent_started < 800:  # Reduced from 1500ms to 800ms
+            return False
+        
+        # Check time since last barge-in to avoid multiple triggers
+        time_since_last_barge_in = (current_time - self.last_barge_in_time) * 1000  # ms
+        if time_since_last_barge_in < 500:  # Reduced from 800ms
+            return False
+        
+        # Check energy threshold
+        if energy > barge_in_threshold:
+            # Update last barge-in time
+            self.last_barge_in_time = current_time
+            logger.info(f"Barge-in detected! Energy: {energy:.4f}, Threshold: {barge_in_threshold:.4f}")
+            return True
+        
+        return False
+    
+    def _is_similar_to_last_response(self, transcription: str) -> bool:
+        """
+        Check if a transcription is similar to the agent's last response (indicating echo).
+        
+        Args:
+            transcription: Transcription text to check
+            
+        Returns:
+            True if transcription is likely an echo of agent's speech
+        """
+        if not self.agent_last_response or not transcription:
+            return False
+        
+        # Simple word-overlap similarity check
+        last_response_words = set(self.agent_last_response.lower().split())
+        transcription_words = set(transcription.lower().split())
+        
+        # If too few words to check meaningfully, be conservative
+        if len(transcription_words) < 2:
+            return False
+        
+        # Calculate overlap
+        intersection = last_response_words.intersection(transcription_words)
+        
+        if len(transcription_words) == 0:
+            return False
+            
+        # Calculate Jaccard similarity
+        similarity = len(intersection) / len(transcription_words)
+        
+        # Time-based factor - more strict just after agent spoke, more lenient as time passes
+        time_since_agent_speech = time.time() - self.last_agent_speech_time
+        time_factor = max(0.5, min(1.0, time_since_agent_speech / self.echo_detection_window))
+        
+        # Adjust threshold based on time
+        effective_threshold = self.similarity_threshold * time_factor
+        
+        # Log for debugging
+        if similarity > 0.3:  # Only log potentially problematic cases
+            logger.debug(f"Echo check: Similarity {similarity:.2f}, Time factor {time_factor:.2f}, " 
+                        f"Effective threshold {effective_threshold:.2f}")
+        
+        # Short transcriptions with high word match are likely echoes
+        if similarity > effective_threshold:
+            logger.info(f"Detected potential echo: '{transcription}' (similarity: {similarity:.2f})")
+            return True
+        
+        return False
     
     def _is_simple_command(self, text: str) -> Tuple[bool, str]:
         """
-        Check if text is a simple command like "stop", "okay", etc.
+        Enhanced method to check if text is a command with better fuzzy matching.
         
         Args:
             text: Text to check
@@ -173,24 +357,52 @@ class WebSocketHandler:
         """
         if not text:
             return False, ""
-            
+        
         # Clean and lowercase the text
         clean_text = text.lower().strip().rstrip('.!?')
         
-        # Direct matches
-        if clean_text in self.SIMPLE_COMMANDS:
-            return True, self.SIMPLE_COMMANDS[clean_text]
+        # Define all command categories
+        command_categories = {
+            "stop": self.STOP_COMMANDS,
+            "continue": self.CONTINUE_COMMANDS,
+            "repeat": self.REPEAT_COMMANDS,
+            "help": self.HELP_COMMANDS
+        }
         
-        # Check for commands embedded in longer phrases
-        for command, action in self.SIMPLE_COMMANDS.items():
-            if f" {command} " in f" {clean_text} ":
-                return True, action
+        # Check each category
+        for command_type, commands in command_categories.items():
+            # Direct exact matches
+            if clean_text in commands:
+                logger.info(f"Detected exact command: '{clean_text}' -> {command_type}")
+                return True, command_type
+            
+            # Check if any command is a substring of the text
+            for cmd in commands:
+                if f" {cmd} " in f" {clean_text} " or clean_text.startswith(cmd + " ") or clean_text.endswith(" " + cmd):
+                    logger.info(f"Detected command in phrase: '{clean_text}' -> {command_type}")
+                    return True, command_type
+            
+            # Check for partial word matches with higher threshold for shorter commands
+            word_tokens = clean_text.split()
+            for cmd in commands:
+                cmd_tokens = cmd.split()
                 
+                # Skip short commands like "stop" for partial matching to avoid false positives
+                if len(cmd) < 5 and len(cmd_tokens) == 1:
+                    continue
+                    
+                # For multi-word commands, check if most words match
+                if len(cmd_tokens) > 1 and len(word_tokens) >= len(cmd_tokens):
+                    matches = sum(1 for cmd_token in cmd_tokens if any(cmd_token in word for word in word_tokens))
+                    if matches >= len(cmd_tokens) * 0.7:  # 70% of words match
+                        logger.info(f"Detected partial command match: '{clean_text}' -> {command_type}")
+                        return True, command_type
+        
         return False, ""
     
     def _handle_command(self, command_type: str, ws) -> bool:
         """
-        Handle a recognized command.
+        Improved command handling with better user feedback.
         
         Args:
             command_type: Type of command
@@ -204,32 +416,40 @@ class WebSocketHandler:
             logger.info("Stop command detected, interrupting speech")
             self.speech_cancellation_event.set()
             
-            # Send confirmation to user
-            asyncio.create_task(self.send_text_response("Okay, I'll stop.", ws))
+            # Set to paused state
+            self._set_conversation_state(ConversationState.PAUSED)
+            
+            # Send confirmation to user - shorter acknowledgment
+            asyncio.create_task(self.send_text_response("Okay, stopping.", ws))
             
             # Reset buffer
             self.input_buffer.clear()
             return True
             
         elif command_type == "continue":
-            # Acknowledge continue command
+            # Acknowledge continue command and resume listening
             logger.info("Continue command detected")
+            self._set_conversation_state(ConversationState.LISTENING)
             asyncio.create_task(self.send_text_response("I'll continue.", ws))
             return True
             
         elif command_type == "help":
-            # Provide help
+            # Provide help - more concise and informative
             logger.info("Help command detected")
-            help_text = "You can say things like 'stop', 'repeat', or ask me questions about our services."
+            help_text = ("You can ask me questions about VoiceAI and its features. "
+                        "You can also say 'stop' to interrupt me, 'repeat' to hear something again, "
+                        "or 'continue' to resume.")
             asyncio.create_task(self.send_text_response(help_text, ws))
             return True
             
         elif command_type == "repeat":
-            # Repeat last response
+            # Repeat last response with clear acknowledgment
             logger.info("Repeat command detected")
             if hasattr(self, 'last_transcription') and hasattr(self, 'last_response_time'):
                 if self.last_transcription:
-                    # Reprocess the last query
+                    # First acknowledge
+                    asyncio.create_task(self.send_text_response("Sure, I'll repeat that.", ws))
+                    # Add a small delay before repeating
                     asyncio.create_task(self._process_last_query(ws))
                     return True
             
@@ -238,17 +458,16 @@ class WebSocketHandler:
             return True
             
         return False
-        
+    
     async def _process_last_query(self, ws):
         """Reprocess the last valid query."""
         try:
             if hasattr(self, 'last_transcription') and self.last_transcription:
                 # Process through knowledge base
                 if hasattr(self.pipeline, 'query_engine'):
+                    logger.info(f"Repeating response for: {self.last_transcription}")
                     query_result = await self.pipeline.query_engine.query(self.last_transcription)
                     response = query_result.get("response", "")
-                    
-                    logger.info(f"Repeating response for: {self.last_transcription}")
                     
                     # Convert to speech
                     if response and hasattr(self.pipeline, 'tts_integration'):
@@ -276,7 +495,7 @@ class WebSocketHandler:
     
     def cleanup_transcription(self, text: str) -> str:
         """
-        Enhanced cleanup of transcription text by removing non-speech annotations and filler words.
+        More lenient cleanup of transcription text.
         
         Args:
             text: Original transcription text
@@ -286,27 +505,12 @@ class WebSocketHandler:
         """
         if not text:
             return ""
+            
+        # Keep simple cleanup but reduce filtering
+        cleaned_text = text
         
-        # Add stronger filter for non-speech annotations - complete filter on noise-only transcriptions
-        if re.search(r'^\(.*?\)$', text) or text.startswith('*') or text.endswith('*'):
-            logger.info(f"Detected non-speech annotation, ignoring: '{text}'")
-            return ""  # Return empty for parenthesized content
-        
-        # Remove noise keywords
-        noise_keywords = ["click", "keyboard", "tongue", "scoff", "static", "clacking"]
-        for keyword in noise_keywords:
-            if keyword in text.lower():
-                logger.info(f"Detected noise keyword '{keyword}', ignoring: '{text}'")
-                return ""  # Return empty for noise content
-        
-        # Remove non-speech annotations
-        cleaned_text = self.non_speech_pattern.sub('', text)
-        
-        # Remove common filler words at beginning of sentences
-        cleaned_text = re.sub(r'^(um|uh|er|ah|like|so)\s+', '', cleaned_text, flags=re.IGNORECASE)
-        
-        # Remove repeated words (stuttering)
-        cleaned_text = re.sub(r'\b(\w+)( \1\b)+', r'\1', cleaned_text)
+        # Only remove obvious noise markers
+        cleaned_text = re.sub(r'\[.*?\]|\(.*?\)', '', cleaned_text)
         
         # Clean up punctuation
         cleaned_text = re.sub(r'\s+([.,!?])', r'\1', cleaned_text)
@@ -319,48 +523,6 @@ class WebSocketHandler:
             logger.info(f"Cleaned transcription: '{text}' -> '{cleaned_text}'")
             
         return cleaned_text
-    
-    def is_valid_transcription(self, text: str) -> bool:
-        """
-        Check if a transcription is valid and worth processing with enhanced criteria.
-        
-        Args:
-            text: Transcription text
-            
-        Returns:
-            True if the transcription is valid
-        """
-        # Clean up the text first
-        cleaned_text = self.cleanup_transcription(text)
-        
-        # Check if it's empty after cleaning
-        if not cleaned_text:
-            logger.info("Transcription contains only non-speech annotations")
-            return False
-        
-        # Add noise keyword filtering
-        noise_keywords = ["click", "keyboard", "tongue", "scoff", "static", "*"]
-        if any(keyword in text.lower() for keyword in noise_keywords):
-            logger.info(f"Transcription contains noise keywords: {text}")
-            return False
-        
-        # Be more lenient with question marks and punctuation in confidence calculation
-        confidence_estimate = 1.0
-        if ("[" in text or "(" in text or "<" in text) and not "?" in text:
-            confidence_estimate = 0.7  # Only reduce for annotation markers, not question marks
-            logger.info(f"Reduced confidence due to uncertainty markers: {text}")
-        
-        if confidence_estimate < 0.65:
-            logger.info(f"Transcription confidence too low: {confidence_estimate}")
-            return False
-        
-        # Check word count - increased minimum requirement
-        word_count = len(cleaned_text.split())
-        if word_count < self.min_words_for_valid_query:
-            logger.info(f"Transcription too short: {word_count} words")
-            return False
-        
-        return True
     
     async def handle_message(self, message: str, ws) -> None:
         """
@@ -453,6 +615,9 @@ class WebSocketHandler:
         # Reset the audio processor
         self.audio_processor.reset()
         
+        # Initialize conversation state
+        self._set_conversation_state(ConversationState.IDLE)
+        
         # Send a welcome message with slight delay to give the client time to connect fully
         await asyncio.sleep(0.5)  # Small delay for connection setup
         await self.send_text_response("I'm listening. How can I help you today?", ws)
@@ -483,6 +648,15 @@ class WebSocketHandler:
         if not self.conversation_active:
             logger.debug("Conversation not active, ignoring media")
             return
+        
+        # Only process media if in IDLE, LISTENING or RESPONDING states
+        if self.conversation_state not in [ConversationState.IDLE, ConversationState.LISTENING, ConversationState.RESPONDING]:
+            logger.debug(f"Not processing media in {self.conversation_state.value} state")
+            return
+        
+        # If in IDLE, move to LISTENING when receiving media
+        if self.conversation_state == ConversationState.IDLE:
+            self._set_conversation_state(ConversationState.LISTENING)
             
         media = data.get('media', {})
         payload = media.get('payload')
@@ -507,41 +681,33 @@ class WebSocketHandler:
                 logger.debug(f"In startup delay period ({time_since_startup:.1f}s < {self.startup_delay_sec:.1f}s)")
                 return
             
-            # Check for barge-in if agent is speaking
+            # Check for barge-in immediately if agent is speaking
             if self.audio_processor.preprocessor.agent_speaking:
-                audio_array = self.audio_processor.mulaw_to_pcm(audio_data)
-                # Ensure float32 format
-                if audio_array.dtype != np.float32:
-                    audio_array = audio_array.astype(np.float32)
-                    
-                if self.audio_processor.check_for_barge_in(audio_array):
-                    # Enough time since last barge-in?
-                    current_time = time.time()
-                    if current_time - self.last_barge_in_time > self.barge_in_cooldown_sec:
-                        # Set the barge-in timestamp
-                        self.last_barge_in_time = current_time
+                # Convert mulaw to PCM for energy detection
+                try:
+                    pcm_audio = self.audio_processor.mulaw_to_pcm(audio_data)
+                    if isinstance(pcm_audio, bytes):
+                        audio_array = np.frombuffer(pcm_audio, dtype=np.int16).astype(np.float32) / 32768.0
+                    else:
+                        audio_array = pcm_audio
                         
-                        # Log and signal barge-in
-                        logger.info("Barge-in detected, interrupting agent speech")
+                    # Check for barge-in with the simplified detector
+                    if self._detect_barge_in(audio_array):
+                        # Signal barge-in
                         self.speech_cancellation_event.set()
                         
-                        # Add some delay to make interruption sound natural
-                        await asyncio.sleep(0.3)  # 300ms debounce
+                        # Add some delay for natural interruption
+                        await asyncio.sleep(0.2)
                         
                         # Send silence to cut off current speech
                         silence_data = bytes([0x7f] * 320)  # 40ms of silence
                         await self._send_audio(silence_data, ws, is_interrupt=True)
                         
-                        # Process new input immediately
-                        async with self.processing_lock:
-                            if not self.is_processing:
-                                self.is_processing = True
-                                try:
-                                    logger.info(f"Processing audio buffer after barge-in")
-                                    await self._process_audio(ws)
-                                finally:
-                                    self.is_processing = False
-                                    self.chunks_since_last_process = 0
+                        # Process buffer immediately
+                        await self._process_audio(ws)
+                        return  # Skip further processing for this chunk
+                except Exception as e:
+                    logger.error(f"Error in barge-in detection: {e}")
             
             # Limit buffer size to prevent memory issues
             if len(self.input_buffer) > MAX_BUFFER_SIZE:
@@ -558,7 +724,8 @@ class WebSocketHandler:
                 return
             
             # Process buffer when it's large enough and not already processing
-            if (len(self.input_buffer) >= AUDIO_BUFFER_SIZE and 
+            # Use reduced buffer size for lower latency
+            if (len(self.input_buffer) >= self.buffer_size_minimum and 
                 not self.is_processing and 
                 (self.audio_processor.preprocessor.speech_state == SpeechState.CONFIRMED_SPEECH or 
                  self.chunks_since_last_process >= 5)):  # Only process every 5 chunks if no speech
@@ -626,6 +793,9 @@ class WebSocketHandler:
         Args:
             ws: WebSocket connection
         """
+        # Set state to processing
+        self._set_conversation_state(ConversationState.PROCESSING)
+        
         try:
             # Basic conversion without extensive preprocessing
             mulaw_bytes = bytes(self.input_buffer)
@@ -648,6 +818,7 @@ class WebSocketHandler:
                 # Clear part of buffer and try again next time
                 half_size = len(self.input_buffer) // 2
                 self.input_buffer = self.input_buffer[half_size:]
+                self._set_conversation_state(ConversationState.LISTENING)
                 return
                     
             # Create a list to collect transcription results
@@ -708,9 +879,35 @@ class WebSocketHandler:
                 # Get transcription from best result
                 transcription = best_result.text if best_result and hasattr(best_result, 'text') else ""
                 
-                # Log the transcription
+                # Check for commands first - do this before echo detection
                 if transcription:
                     logger.info(f"Transcription: '{transcription}'")
+                    
+                    is_command, command_type = self._is_simple_command(transcription)
+                    if is_command:
+                        # Handle command and return early - don't process as regular query
+                        logger.info(f"Handling command: {command_type}")
+                        
+                        # Clear the input buffer since we're handling a command
+                        self.input_buffer.clear()
+                        
+                        # Handle the command
+                        if self._handle_command(command_type, ws):
+                            # Command was handled, update state and return early
+                            self.last_transcription = transcription
+                            self.last_response_time = time.time()
+                            return
+                
+                    # Check for echo - if within time window and similar to last response
+                    time_since_agent_speech = time.time() - self.last_agent_speech_time
+                    if (time_since_agent_speech < self.echo_detection_window and 
+                        self._is_similar_to_last_response(transcription)):
+                        logger.info(f"Ignoring likely self-echo: '{transcription}'")
+                        # Reduce buffer but don't clear
+                        half_size = len(self.input_buffer) // 2
+                        self.input_buffer = self.input_buffer[half_size:]
+                        self._set_conversation_state(ConversationState.LISTENING)
+                        return  # Skip further processing
                     
                     # Process if it's a valid transcription
                     if len(transcription.split()) >= 2:  # Only require 2 words minimum
@@ -720,6 +917,7 @@ class WebSocketHandler:
                         # Don't process duplicate transcriptions
                         if transcription == self.last_transcription:
                             logger.info("Duplicate transcription, not processing again")
+                            self._set_conversation_state(ConversationState.LISTENING)
                             return
                         
                         # Process through knowledge base
@@ -733,9 +931,10 @@ class WebSocketHandler:
                                 # Convert to speech
                                 if response and hasattr(self.pipeline, 'tts_integration'):
                                     try:
-                                        # Set agent speaking state before sending audio
-                                        if hasattr(self.audio_processor, 'set_agent_speaking'):
-                                            self.audio_processor.set_agent_speaking(True)
+                                        # Set state to responding before sending audio
+                                        self._set_conversation_state(ConversationState.RESPONDING)
+                                        
+                                        # Clear the speech cancellation event
                                         self.speech_cancellation_event.clear()
                                         
                                         speech_audio = await self.pipeline.tts_integration.text_to_speech(response)
@@ -762,27 +961,30 @@ class WebSocketHandler:
                                         except Exception as fallback_error:
                                             logger.error(f"Failed to generate fallback: {fallback_error}")
                                     finally:
-                                        # Reset agent speaking state
-                                        if hasattr(self.audio_processor, 'set_agent_speaking'):
-                                            self.audio_processor.set_agent_speaking(False)
+                                        # Set back to listening
+                                        self._set_conversation_state(ConversationState.LISTENING)
                                     
                                     # Update state
                                     self.last_transcription = transcription
                                     self.last_response_time = time.time()
                         except Exception as e:
                             logger.error(f"Error processing through knowledge base: {e}", exc_info=True)
+                            # On error, go back to listening
+                            self._set_conversation_state(ConversationState.LISTENING)
                     else:
                         # If no valid transcription, reduce buffer size but keep some for context
                         half_size = len(self.input_buffer) // 2
                         self.input_buffer = self.input_buffer[half_size:]
                         logger.debug(f"Transcription too short, reduced buffer to {len(self.input_buffer)} bytes")
+                        self._set_conversation_state(ConversationState.LISTENING)
                 else:
                     # If no transcription at all, just reduce buffer size
                     half_size = len(self.input_buffer) // 2
                     self.input_buffer = self.input_buffer[half_size:]
                     logger.debug(f"No transcription found, reduced buffer to {len(self.input_buffer)} bytes")
+                    self._set_conversation_state(ConversationState.LISTENING)
                 
-                # Don't reset the STT session every time - only reset if we got a valid transcription
+                # Reset the STT session only if we got a valid transcription
                 if transcription and len(transcription.split()) >= 2:
                     try:
                         if hasattr(self.pipeline.speech_recognizer, 'stop_streaming'):
@@ -803,9 +1005,12 @@ class WebSocketHandler:
                 # If error, clear part of buffer and continue
                 half_size = len(self.input_buffer) // 2
                 self.input_buffer = self.input_buffer[half_size:]
+                self._set_conversation_state(ConversationState.LISTENING)
                 
         except Exception as e:
             logger.error(f"Error processing audio: {e}", exc_info=True)
+            # On error, go back to listening
+            self._set_conversation_state(ConversationState.LISTENING)
     
     async def _send_audio(self, audio_data: bytes, ws, is_interrupt: bool = False) -> None:
         """
@@ -874,8 +1079,8 @@ class WebSocketHandler:
                     
                     # Add a small delay between chunks to prevent flooding and allow
                     # for barge-in detection during speech
-                    if i < len(chunks) - 1 and i % 5 == 0:  # Every 5 chunks (~100ms)
-                        await asyncio.sleep(0.01)  # 10ms delay 
+                    if i < len(chunks) - 1 and i % 10 == 0:  # Every 10 chunks (reduced from 5)
+                        await asyncio.sleep(0.005)  # 5ms delay (reduced from 10ms)
                     
                 except Exception as e:
                     if "Connection closed" in str(e):
@@ -892,6 +1097,23 @@ class WebSocketHandler:
             # Reset speaking flag after sending all chunks
             if not is_interrupt and self.audio_processor.preprocessor.agent_speaking:
                 self.audio_processor.set_agent_speaking(False)
+                
+                # Update echo detection variables
+                if hasattr(self, 'last_transcription') and self.last_transcription:
+                    # Store the knowledge base response, not the transcription
+                    response_text = ""
+                    if self.conversation_manager and self.conversation_manager.history:
+                        response_text = self.conversation_manager.history[-1].response
+                    elif hasattr(self.pipeline, 'conversation_manager') and self.pipeline.conversation_manager.history:
+                        response_text = self.pipeline.conversation_manager.history[-1].response
+                    
+                    # If we can't get the exact response, fall back to last_transcription
+                    # This is still useful for echo detection
+                    if not response_text:
+                        response_text = self.last_transcription
+                    
+                    self.agent_last_response = response_text
+                self.last_agent_speech_time = time.time()
             
         except Exception as e:
             logger.error(f"Error sending audio: {e}", exc_info=True)
@@ -908,6 +1130,9 @@ class WebSocketHandler:
             ws: WebSocket connection
         """
         try:
+            # Set state to responding
+            self._set_conversation_state(ConversationState.RESPONDING)
+            
             # Convert text to speech
             if hasattr(self.pipeline, 'tts_integration'):
                 # Set agent speaking state
@@ -928,10 +1153,17 @@ class WebSocketHandler:
                 
                 # Update last response time to add pause
                 self.last_response_time = time.time()
+                
+                # After response completes, set back to listening
+                self._set_conversation_state(ConversationState.LISTENING)
             else:
                 logger.error("TTS integration not available")
+                # If error, go back to listening
+                self._set_conversation_state(ConversationState.LISTENING)
         except Exception as e:
             logger.error(f"Error sending text response: {e}", exc_info=True)
+            # On error, go back to listening
+            self._set_conversation_state(ConversationState.LISTENING)
     
     async def _keep_alive_loop(self, ws) -> None:
         """
