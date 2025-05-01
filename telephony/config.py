@@ -46,10 +46,10 @@ ENABLE_NOISE_FILTERING = True
 
 # Enhanced Barge-in Settings
 ENABLE_BARGE_IN = True                   # Enable barge-in functionality
-BARGE_IN_THRESHOLD = 0.055               # Increased from 0.045 for more reliable detection
+BARGE_IN_THRESHOLD = 0.045               # Increased from 0.045 for more reliable detection
 BARGE_IN_DETECTION_WINDOW = 140          # Increased from 100ms for better detection
 BARGE_IN_MIN_SPEECH_DURATION = 300       # Increased from 200ms to reduce false positives
-BARGE_IN_COOLDOWN_MS = 2000              # 2 second cooldown after agent starts speaking
+BARGE_IN_COOLDOWN_MS = 1500              # 2 second cooldown after agent starts speaking
 
 # Logging Configuration
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')

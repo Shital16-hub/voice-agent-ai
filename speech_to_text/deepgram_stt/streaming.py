@@ -14,7 +14,7 @@ import aiohttp
 import json
 import base64
 import time
-from typing import Dict, Any, Optional, Union, List, AsyncGenerator, Callable, Awaitable
+from typing import Dict, Any, Optional, Union, List, AsyncGenerator, Callable, Awaitable, Tuple
 from dataclasses import dataclass
 
 from ..config import config

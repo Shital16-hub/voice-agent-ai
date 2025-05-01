@@ -68,7 +68,7 @@ class AudioPreprocessor:
         # Enhanced adaptive noise tracking
         self.noise_samples = []
         self.max_samples = 50  # Increased for better statistics
-        self.ambient_noise_level = 0.01555  # Increased from 0.01 for better noise rejection
+        self.ambient_noise_level = 0.015  # Increased from 0.01 for better noise rejection
         self.min_noise_floor = 0.008  # Increased from 0.005
         
         # Enhanced energy thresholds with hysteresis
@@ -628,44 +628,51 @@ class AudioPreprocessor:
         if not self.enable_barge_in or not self.agent_speaking:
             return False
         
-        # Ensure audio_data is float32
-        if audio_data.dtype != np.float32:
-            audio_data = audio_data.astype(np.float32)
-            
         try:
-            # Check cooldown period - don't detect barge-in immediately after agent starts speaking
+            # Check cooldown period - reduced from 2000ms to 1500ms for faster response
             current_time = time.time()
             time_since_agent_started = (current_time - self.agent_speaking_start_time) * 1000  # ms
-            if time_since_agent_started < self.barge_in_cooldown_ms:
+            if time_since_agent_started < 1500:  # Reduced from 2000ms
                 if self.enable_debug:
-                    logger.debug(f"In barge-in cooldown period: {time_since_agent_started:.0f}/{self.barge_in_cooldown_ms}ms")
+                    logger.debug(f"In barge-in cooldown period: {time_since_agent_started:.0f}/1500ms")
                 return False
             
             # Check last barge-in time - don't trigger multiple barge-ins too quickly
             time_since_last_barge_in = (current_time - self.last_barge_in_time) * 1000  # ms
-            if time_since_last_barge_in < 1000:  # Increased from 500ms - at least 1 second between barge-ins
+            if time_since_last_barge_in < 800:  # Reduced from 1000ms to 800ms
                 return False
             
-            # Ensure we have speech using the state machine
-            contains_speech = self.contains_speech(audio_data)
+            # Calculate energy of the audio for more sensitive detection
+            rms_energy = np.sqrt(np.mean(np.square(audio_data)))
             
-            # Only consider barge-in if we have confirmed speech for enough frames - higher requirement
-            if (contains_speech and self.speech_state == SpeechState.CONFIRMED_SPEECH and 
-                self.confirmed_speech_frames >= self.min_speech_frames_for_barge_in):
+            # Add spectral analysis for better interruption detection
+            speech_band_energies = self._calculate_speech_band_energy(audio_data)
+            speech_ratio = speech_band_energies.get("speech_band", 0.0)
+            
+            # More aggressive barge-in detection during agent speech
+            # Use lower threshold (80% of normal) when agent is speaking
+            barge_in_threshold_adjusted = self.barge_in_threshold * 0.8
+            
+            # Look for sudden energy spike which is common in interruptions
+            is_energy_spike = rms_energy > barge_in_threshold_adjusted
+            # Look for good speech ratio which indicates speech rather than noise
+            is_good_speech_quality = speech_ratio > 0.55  # Slightly reduced from 0.6
+            
+            # Only consider barge-in if we have speech or just starting speech
+            if ((is_energy_spike and is_good_speech_quality) or 
+                (self.speech_state == SpeechState.CONFIRMED_SPEECH and 
+                 self.confirmed_speech_frames >= self.min_speech_frames_for_barge_in * 0.75)):  # Reduced to 75% of min frames
                 
-                # Calculate additional metrics for higher confidence
-                rms_energy = np.sqrt(np.mean(np.square(audio_data)))
+                # Update barge-in state
+                self.barge_in_detected = True
+                self.last_barge_in_time = current_time
                 
-                # Check additional energy threshold specifically for barge-in - higher threshold
-                if rms_energy > self.barge_in_threshold:
-                    logger.info(f"Barge-in detected! Speech frames: {self.confirmed_speech_frames}, "
-                               f"Energy: {rms_energy:.4f}, Threshold: {self.barge_in_threshold:.4f}")
-                    
-                    # Update barge-in state
-                    self.barge_in_detected = True
-                    self.last_barge_in_time = current_time
-                    
-                    return True
+                if self.enable_debug:
+                    logger.debug(f"Barge-in detected! Energy: {rms_energy:.4f}, Speech ratio: {speech_ratio:.2f}")
+                
+                logger.info(f"Barge-in detected! Energy: {rms_energy:.4f}, Speech frames: {self.confirmed_speech_frames}, " 
+                           f"Threshold: {barge_in_threshold_adjusted:.4f}")
+                return True
             
             return False
             
@@ -719,7 +726,7 @@ class AudioPreprocessor:
         self.noise_samples = []
         
         # Reset threshold values to defaults
-        self.ambient_noise_level = 0.01555  # Increased from 0.01
+        self.ambient_noise_level = 0.015  # Increased from 0.01
         self.low_threshold = self.ambient_noise_level * 2.0
         self.high_threshold = self.ambient_noise_level * 4.5  # Increased from 3.5
         

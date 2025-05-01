@@ -9,7 +9,7 @@ import logging
 import time
 import numpy as np
 import re
-from typing import Dict, Any, Callable, Awaitable, Optional, List, Union
+from typing import Dict, Any, Callable, Awaitable, Optional, List, Union, Tuple
 from collections import deque
 
 from telephony.audio_preprocessor import AudioPreprocessor, SpeechState
@@ -62,6 +62,29 @@ class WebSocketHandler:
     Handles WebSocket connections for Twilio media streams with enhanced speech/noise discrimination.
     Integrates the new AudioPreprocessor via the updated AudioProcessor.
     """
+    
+    # Add these constants for command recognition
+    STOP_COMMANDS = ["stop", "okay", "ok", "enough", "halt", "pause", "quit", "exit", "bye", "end"]
+    SIMPLE_COMMANDS = {
+        "stop": "stop",
+        "okay": "stop",
+        "ok": "stop",
+        "enough": "stop",
+        "halt": "stop",
+        "pause": "stop",
+        "quit": "stop",
+        "exit": "stop",
+        "bye": "stop",
+        "end": "stop",
+        "continue": "continue",
+        "go on": "continue",
+        "proceed": "continue",
+        "yes": "continue",
+        "help": "help",
+        "repeat": "repeat",
+        "again": "repeat",
+        "what": "repeat"
+    }
     
     def __init__(self, call_sid: str, pipeline):
         """
@@ -133,6 +156,119 @@ class WebSocketHandler:
         self.chunks_since_last_process = 0
         
         logger.info(f"WebSocketHandler initialized for call {call_sid} with enhanced audio preprocessing")
+    
+    def _is_simple_command(self, text: str) -> Tuple[bool, str]:
+        """
+        Check if text is a simple command like "stop", "okay", etc.
+        
+        Args:
+            text: Text to check
+            
+        Returns:
+            Tuple of (is_command, command_type)
+        """
+        if not text:
+            return False, ""
+            
+        # Clean and lowercase the text
+        clean_text = text.lower().strip().rstrip('.!?')
+        
+        # Direct matches
+        if clean_text in self.SIMPLE_COMMANDS:
+            return True, self.SIMPLE_COMMANDS[clean_text]
+        
+        # Check for commands embedded in longer phrases
+        for command, action in self.SIMPLE_COMMANDS.items():
+            if f" {command} " in f" {clean_text} ":
+                return True, action
+                
+        return False, ""
+    
+    def _handle_command(self, command_type: str, ws) -> bool:
+        """
+        Handle a recognized command.
+        
+        Args:
+            command_type: Type of command
+            ws: WebSocket connection
+            
+        Returns:
+            True if command was handled
+        """
+        if command_type == "stop":
+            # Interrupt any ongoing speech
+            logger.info("Stop command detected, interrupting speech")
+            self.speech_cancellation_event.set()
+            
+            # Send confirmation to user
+            asyncio.create_task(self.send_text_response("Okay, I'll stop.", ws))
+            
+            # Reset buffer
+            self.input_buffer.clear()
+            return True
+            
+        elif command_type == "continue":
+            # Acknowledge continue command
+            logger.info("Continue command detected")
+            asyncio.create_task(self.send_text_response("I'll continue.", ws))
+            return True
+            
+        elif command_type == "help":
+            # Provide help
+            logger.info("Help command detected")
+            help_text = "You can say things like 'stop', 'repeat', or ask me questions about our services."
+            asyncio.create_task(self.send_text_response(help_text, ws))
+            return True
+            
+        elif command_type == "repeat":
+            # Repeat last response
+            logger.info("Repeat command detected")
+            if hasattr(self, 'last_transcription') and hasattr(self, 'last_response_time'):
+                if self.last_transcription:
+                    # Reprocess the last query
+                    asyncio.create_task(self._process_last_query(ws))
+                    return True
+            
+            # No last response to repeat
+            asyncio.create_task(self.send_text_response("I don't have anything to repeat yet.", ws))
+            return True
+            
+        return False
+        
+    async def _process_last_query(self, ws):
+        """Reprocess the last valid query."""
+        try:
+            if hasattr(self, 'last_transcription') and self.last_transcription:
+                # Process through knowledge base
+                if hasattr(self.pipeline, 'query_engine'):
+                    query_result = await self.pipeline.query_engine.query(self.last_transcription)
+                    response = query_result.get("response", "")
+                    
+                    logger.info(f"Repeating response for: {self.last_transcription}")
+                    
+                    # Convert to speech
+                    if response and hasattr(self.pipeline, 'tts_integration'):
+                        try:
+                            # Set agent speaking state before sending audio
+                            self.audio_processor.set_agent_speaking(True)
+                            self.speech_cancellation_event.clear()
+                            
+                            speech_audio = await self.pipeline.tts_integration.text_to_speech(response)
+                            
+                            # Convert to mulaw for Twilio
+                            mulaw_audio = self.audio_processor.pcm_to_mulaw(speech_audio)
+                            
+                            # Send back to Twilio
+                            logger.info(f"Sending repeated audio response ({len(mulaw_audio)} bytes)")
+                            await self._send_audio(mulaw_audio, ws)
+                            
+                        except Exception as e:
+                            logger.error(f"Error repeating response: {e}")
+                        finally:
+                            # Reset agent speaking state
+                            self.audio_processor.set_agent_speaking(False)
+        except Exception as e:
+            logger.error(f"Error processing repeat request: {e}")
     
     def cleanup_transcription(self, text: str) -> str:
         """
@@ -481,6 +617,7 @@ class WebSocketHandler:
     async def _process_audio(self, ws) -> None:
         """
         Process accumulated audio data through the pipeline with enhanced speech processing.
+        Also handles short commands and improves barge-in detection.
         
         Args:
             ws: WebSocket connection
@@ -503,7 +640,7 @@ class WebSocketHandler:
                 half_size = len(self.input_buffer) // 2
                 self.input_buffer = self.input_buffer[half_size:]
                 return
-                
+                    
             # Add checks for audio quality
             if len(pcm_audio) < 1000:  # Very small audio chunk
                 logger.warning(f"Audio chunk too small: {len(pcm_audio)} samples")
@@ -707,16 +844,37 @@ class WebSocketHandler:
                     self.input_buffer = self.input_buffer[half_size:]
                     return
                 
-                # Check for empty or short transcriptions
-                if not transcription or len(transcription.split()) < self.min_words_for_valid_query:
+                # Check if this is a simple command before applying minimum word filter
+                is_command, command_type = self._is_simple_command(transcription)
+                if is_command:
+                    logger.info(f"Detected command: '{transcription}' -> {command_type}")
+                    
+                    # Clear input buffer since we recognized a command
+                    self.input_buffer.clear()
+                    
+                    # Handle the command
+                    command_handled = self._handle_command(command_type, ws)
+                    if command_handled:
+                        return
+                
+                # Check for empty transcriptions (if not a command)
+                if not transcription:
+                    logger.info("Empty transcription, skipping")
+                    # Clear part of buffer and continue
+                    half_size = len(self.input_buffer) // 2
+                    self.input_buffer = self.input_buffer[half_size:]
+                    return
+                
+                # Check minimum word count for regular queries (not commands)
+                if not is_command and len(transcription.split()) < self.min_words_for_valid_query:
                     logger.info(f"Transcription too short, skipping: '{transcription}'")
                     # Clear part of buffer and continue
                     half_size = len(self.input_buffer) // 2
                     self.input_buffer = self.input_buffer[half_size:]
                     return
                 
-                # Only process if it's a valid transcription
-                if transcription and self.is_valid_transcription(transcription):
+                # Process if it's a valid transcription or recognized command
+                if transcription:
                     logger.info(f"Complete transcription: {transcription}")
                     
                     # Now clear the input buffer since we have a valid transcription
