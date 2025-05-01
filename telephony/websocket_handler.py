@@ -62,7 +62,7 @@ class WebSocketHandler:
 
     REPEAT_COMMANDS = [
         "repeat", "say again", "repeat that", "what did you say", "say that again", 
-        "can you repeat", "again", "what"
+        "can you repeat", "again", "what was that"
     ]
 
     HELP_COMMANDS = [
@@ -171,6 +171,12 @@ class WebSocketHandler:
         
         # Add flag for "Alexa-like" wait indicator
         self.has_played_listening_indicator = False
+        
+        # Add flag to track first interaction to avoid command detection
+        self.first_interaction = True
+        
+        # Add confidence threshold for command detection
+        self.min_command_confidence = 0.8
         
         logger.info(f"Enhanced WebSocketHandler initialized for call {call_sid} with improved barge-in")
     
@@ -414,7 +420,8 @@ class WebSocketHandler:
                     
                 # For multi-word commands, check if most words match
                 if len(cmd_tokens) > 1 and len(words) >= len(cmd_tokens):
-                    matches = sum(1 for cmd_token in cmd_tokens if any(cmd_token in word for word in words))
+                    # FIXED: Use exact word matching instead of substring matching
+                    matches = sum(1 for cmd_token in cmd_tokens if cmd_token in words)
                     if matches >= len(cmd_tokens) * 0.7:  # 70% of words match
                         logger.info(f"Detected partial command match: '{clean_text}' -> {command_type}")
                         return True, command_type
@@ -661,6 +668,7 @@ class WebSocketHandler:
         self.last_barge_in_time = 0
         self.chunks_since_last_process = 0
         self.has_played_listening_indicator = False
+        self.first_interaction = True  # Reset first interaction flag
         
         # Reset the audio processor
         self.audio_processor.reset()
@@ -933,7 +941,12 @@ class WebSocketHandler:
                 if transcription:
                     logger.info(f"Transcription: '{transcription}'")
                     
-                    is_command, command_type = self._is_simple_command(transcription)
+                    # Skip command detection on first interaction
+                    # FIXED: Skip command detection for first interaction to avoid false command recognition
+                    is_command, command_type = (False, "") if self.first_interaction else self._is_simple_command(transcription)
+                    if self.first_interaction:
+                        self.first_interaction = False
+                    
                     if is_command:
                         # Handle command and return early - don't process as regular query
                         logger.info(f"Handling command: {command_type}")
@@ -1304,4 +1317,3 @@ class WebSocketHandler:
             logger.debug("Keep-alive loop cancelled")
         except Exception as e:
             logger.error(f"Error in keep-alive loop: {e}")
-                    
