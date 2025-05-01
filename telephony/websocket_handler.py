@@ -11,6 +11,8 @@ import time
 import numpy as np
 import re
 import audioop
+import queue
+import threading
 from typing import Dict, Any, Callable, Awaitable, Optional, List, Union, Tuple
 from collections import deque
 from enum import Enum
@@ -182,7 +184,72 @@ class WebSocketHandler:
         # Add confidence threshold for command detection
         self.min_command_confidence = 0.8
         
+        # CRITICAL FIX: Add flag for barge-in recovery
+        self.barge_in_recovery_active = False
+        self.barge_in_recovery_time = 0
+        self.barge_in_recovery_timeout = 3.0  # 3 seconds
+        
+        # CRITICAL FIX: Add lock for STT reset operations
+        self.stt_reset_lock = asyncio.Lock()
+        
+        # CRITICAL FIX: Flag to track if we need to completely restart STT
+        self.needs_stt_restart = False
+        
+        # CRITICAL FIX: Save the voice response while we reset STT
+        self.pending_response = None
+        
+        # CRITICAL FIX: Add counter for failed STT operations
+        self.stt_reset_attempts = 0
+        self.max_stt_reset_attempts = 3
+        
+        # CRITICAL FIX: STT heartbeat task reference
+        self.stt_heartbeat_task = None
+        
         logger.info(f"Enhanced WebSocketHandler initialized for call {call_sid} with simplified audio processing")
+    
+    # CRITICAL FIX: Add heartbeat mechanism to keep STT alive during responses
+    async def _start_stt_heartbeat(self):
+        """Send periodic small audio chunks to keep STT session alive."""
+        if not hasattr(self, 'stt_heartbeat_task') or self.stt_heartbeat_task is None:
+            self.stt_heartbeat_task = asyncio.create_task(self._stt_heartbeat_loop())
+
+    async def _stop_stt_heartbeat(self):
+        """Stop the STT heartbeat task."""
+        if hasattr(self, 'stt_heartbeat_task') and self.stt_heartbeat_task is not None:
+            self.stt_heartbeat_task.cancel()
+            try:
+                await self.stt_heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.warning(f"Error cancelling STT heartbeat task: {e}")
+            self.stt_heartbeat_task = None
+
+    async def _stt_heartbeat_loop(self):
+        """Send silent audio chunks periodically to keep STT session alive."""
+        try:
+            while self.conversation_active:
+                # Only send heartbeat when agent is speaking (to prevent Audio Timeout errors)
+                if self.audio_processor.agent_speaking:
+                    try:
+                        speech_recognizer = self.pipeline.speech_recognizer
+                        if (hasattr(speech_recognizer, 'process_audio_chunk') and 
+                            hasattr(speech_recognizer, 'is_streaming') and 
+                            speech_recognizer.is_streaming):
+                            # Create a small silence audio chunk (50ms of silence at 16kHz)
+                            silence_chunk = bytes([0] * 1600)
+                            await speech_recognizer.process_audio_chunk(silence_chunk, callback=None)
+                            logger.debug("Sent STT heartbeat")
+                    except Exception as e:
+                        logger.warning(f"Error sending STT heartbeat: {e}")
+                
+                # Wait before next heartbeat
+                await asyncio.sleep(5.0)  # Send heartbeat every 5 seconds
+                
+        except asyncio.CancelledError:
+            logger.debug("STT heartbeat task cancelled")
+        except Exception as e:
+            logger.error(f"Error in STT heartbeat loop: {e}")
     
     def _set_conversation_state(self, new_state: ConversationState) -> None:
         """
@@ -215,16 +282,20 @@ class WebSocketHandler:
             # Reset listening indicator flag
             self.has_played_listening_indicator = False
             
-            # Ensure STT is ready
-            if hasattr(self.pipeline, 'speech_recognizer'):
-                if hasattr(self.pipeline.speech_recognizer, 'start_streaming'):
-                    if not getattr(self.pipeline.speech_recognizer, 'is_streaming', False):
-                        asyncio.create_task(self.pipeline.speech_recognizer.start_streaming())
+            # CRITICAL FIX: If we need STT restart, trigger it
+            if self.needs_stt_restart:
+                self.needs_stt_restart = False
+                asyncio.create_task(self._restart_google_stt())
             
             # Add a subtle audio indicator for listening state
             if old_state == ConversationState.RESPONDING:
                 # Play a very short "ready" tone if we just finished speaking
                 asyncio.create_task(self._play_listening_indicator())
+                
+            # Mark barge-in recovery as complete when transitioning to listening
+            if self.barge_in_recovery_active:
+                logger.info("Barge-in recovery complete")
+                self.barge_in_recovery_active = False
         
         elif new_state == ConversationState.RESPONDING:
             # Set agent speaking flag
@@ -235,6 +306,104 @@ class WebSocketHandler:
             # Clear agent speaking flag if transitioning from RESPONDING
             if old_state == ConversationState.RESPONDING and hasattr(self.audio_processor, 'set_agent_speaking'):
                 self.audio_processor.set_agent_speaking(False)
+
+    # CRITICAL FIX: Complete restart of Google STT
+    async def _restart_google_stt(self):
+        """
+        Completely restart the Google STT system.
+        This is more aggressive than just stopping and starting the stream.
+        """
+        async with self.stt_reset_lock:
+            try:
+                speech_recognizer = self.pipeline.speech_recognizer
+                
+                logger.info("Performing complete Google STT restart")
+                
+                # First, try to stop any existing streaming session
+                if hasattr(speech_recognizer, 'stop_streaming'):
+                    try:
+                        await speech_recognizer.stop_streaming()
+                        await asyncio.sleep(0.3)  # Give it time to clean up
+                    except Exception as e:
+                        logger.warning(f"Error stopping STT: {e}")
+                
+                # CRITICAL FIX: Ensure streaming thread is properly cleaned up
+                if hasattr(speech_recognizer, 'streaming_thread'):
+                    try:
+                        if (speech_recognizer.streaming_thread and 
+                            hasattr(speech_recognizer.streaming_thread, 'is_alive') and 
+                            speech_recognizer.streaming_thread.is_alive()):
+                            # Set stop event if it exists
+                            if hasattr(speech_recognizer, 'stop_event') and speech_recognizer.stop_event:
+                                speech_recognizer.stop_event.set()
+                            
+                            # Wait for thread to join with timeout
+                            speech_recognizer.streaming_thread.join(timeout=0.5)
+                    except Exception as e:
+                        logger.warning(f"Error cleaning up STT thread: {e}")
+                    
+                    # Ensure thread reference is cleared
+                    speech_recognizer.streaming_thread = None
+                
+                # Ensure stop_event is reset
+                if hasattr(speech_recognizer, 'stop_event'):
+                    speech_recognizer.stop_event = None
+                
+                # Force reinitialization of client
+                if hasattr(speech_recognizer, 'client'):
+                    try:
+                        # Close the client if it has a close method
+                        if hasattr(speech_recognizer.client, 'close'):
+                            await speech_recognizer.client.close()
+                        
+                        # Reinitialize the client if it has an initialization method
+                        if hasattr(speech_recognizer, 'initialize_client'):
+                            await speech_recognizer.initialize_client()
+                            logger.info("Reinitialized Google Cloud STT client")
+                    except Exception as e:
+                        logger.error(f"Error reinitializing STT client: {e}")
+                
+                # Start a new streaming session after a delay
+                await asyncio.sleep(0.5)
+                
+                # Create new stop event before starting
+                if hasattr(speech_recognizer, 'stop_event') and speech_recognizer.stop_event is None:
+                    speech_recognizer.stop_event = threading.Event()
+                    speech_recognizer.stop_event.clear()
+                
+                if hasattr(speech_recognizer, 'start_streaming'):
+                    await speech_recognizer.start_streaming()
+                    logger.info("Started Google Cloud STT streaming session")
+                
+                # Reset state variables
+                self.stt_reset_attempts = 0
+                
+                # Send heartbeat audio to prevent timeout
+                if hasattr(speech_recognizer, 'process_audio_chunk'):
+                    # Create a small silence audio chunk to keep the session alive
+                    silence_chunk = bytes([0] * 1600)  # 0.1 seconds of silence at 16kHz
+                    try:
+                        await speech_recognizer.process_audio_chunk(silence_chunk, callback=None)
+                        logger.debug("Sent heartbeat audio to STT")
+                    except Exception as e:
+                        logger.warning(f"Error sending heartbeat audio: {e}")
+                
+                # If there was a pending response, try to send it now
+                if self.pending_response and self.ws:
+                    await self._send_audio(self.pending_response, self.ws)
+                    self.pending_response = None
+                
+            except Exception as e:
+                logger.error(f"Critical error during STT restart: {e}")
+                self.stt_reset_attempts += 1
+                
+                # If we've tried too many times, give up
+                if self.stt_reset_attempts >= self.max_stt_reset_attempts:
+                    logger.error("Maximum STT reset attempts reached, giving up")
+                    # Maybe try to send a message to the user that we're having technical difficulties
+                else:
+                    # Try again after a delay
+                    self.needs_stt_restart = True
 
     async def _handle_state_timeout(self, expected_state: ConversationState, timeout: float) -> None:
         """
@@ -269,6 +438,22 @@ class WebSocketHandler:
                 elif expected_state == ConversationState.PAUSED:
                     # Resume from pause after timeout
                     self._set_conversation_state(ConversationState.LISTENING)
+                
+                # Check if we're stuck in barge-in recovery
+                if self.barge_in_recovery_active:
+                    current_time = time.time()
+                    time_in_recovery = current_time - self.barge_in_recovery_time
+                    
+                    if time_in_recovery > self.barge_in_recovery_timeout:
+                        logger.warning(f"Stuck in barge-in recovery for {time_in_recovery:.1f}s, forcing reset")
+                        self.barge_in_recovery_active = False
+                        
+                        # Force STT restart
+                        self.needs_stt_restart = True
+                        asyncio.create_task(self._restart_google_stt())
+                        
+                        # Reset state
+                        self._set_conversation_state(ConversationState.LISTENING)
                     
         except asyncio.CancelledError:
             # Task was cancelled, this is expected when state changes
@@ -673,6 +858,11 @@ class WebSocketHandler:
         self.chunks_since_last_process = 0
         self.has_played_listening_indicator = False
         self.first_interaction = True  # Reset first interaction flag
+        self.barge_in_recovery_active = False
+        self.needs_stt_restart = False
+        self.stt_reset_attempts = 0
+        self.pending_response = None
+        self.stt_heartbeat_task = None  # Reset heartbeat task
         
         # Reset the audio processor
         self.audio_processor.reset()
@@ -680,24 +870,29 @@ class WebSocketHandler:
         # Initialize conversation state
         self._set_conversation_state(ConversationState.IDLE)
         
-        # Send a welcome message with slight delay to give the client time to connect fully
-        await asyncio.sleep(0.5)  # Small delay for connection setup
-        await self.send_text_response("I'm listening. How can I help you today?", ws)
-        
         # Initialize STT for streaming if available
         if hasattr(self.pipeline, 'speech_recognizer'):
             try:
-                # Check if the speech recognizer has start_streaming method
+                # Stop any existing session 
+                if hasattr(self.pipeline.speech_recognizer, 'stop_streaming'):
+                    try:
+                        await self.pipeline.speech_recognizer.stop_streaming()
+                        await asyncio.sleep(0.2)  # Wait for cleanup
+                    except Exception as e:
+                        logger.warning(f"Error stopping STT session: {e}")
+                
+                # Start a new streaming session
                 if hasattr(self.pipeline.speech_recognizer, 'start_streaming'):
-                    # Check if it's an async method
-                    if asyncio.iscoroutinefunction(self.pipeline.speech_recognizer.start_streaming):
-                        await self.pipeline.speech_recognizer.start_streaming()
-                    else:
-                        # Handle if it's a synchronous method
-                        self.pipeline.speech_recognizer.start_streaming()
+                    await self.pipeline.speech_recognizer.start_streaming()
                     logger.info("Started STT streaming session")
             except Exception as e:
                 logger.error(f"Error starting STT streaming session: {e}")
+                # Force restart later
+                self.needs_stt_restart = True
+        
+        # Send a welcome message with slight delay to give the client time to connect fully
+        await asyncio.sleep(0.5)  # Small delay for connection setup
+        await self.send_text_response("I'm listening. How can I help you today?", ws)
     
     async def _handle_media(self, data: Dict[str, Any], ws) -> None:
         """
@@ -758,6 +953,10 @@ class WebSocketHandler:
                         # Signal barge-in
                         self.speech_cancellation_event.set()
                         
+                        # Set barge-in recovery state
+                        self.barge_in_recovery_active = True
+                        self.barge_in_recovery_time = time.time()
+                        
                         # Add some delay for natural interruption
                         await asyncio.sleep(0.1)
                         
@@ -765,8 +964,15 @@ class WebSocketHandler:
                         silence_data = bytes([0x7f] * 320)  # 40ms of silence
                         await self._send_audio(silence_data, ws, is_interrupt=True)
                         
-                        # Process buffer immediately
-                        await self._process_audio(ws)
+                        # CRITICAL FIX: Force reset STT after barge-in
+                        asyncio.create_task(self._restart_google_stt())
+                        
+                        # Ensure agent speaking state is reset
+                        self.audio_processor.set_agent_speaking(False)
+                        
+                        # Set to listening state 
+                        self._set_conversation_state(ConversationState.LISTENING)
+                        
                         return  # Skip further processing for this chunk
                 except Exception as e:
                     logger.error(f"Error in barge-in detection: {e}")
@@ -784,6 +990,23 @@ class WebSocketHandler:
                 # Still in pause period after last response, wait before processing new input
                 logger.debug(f"In pause period after response ({time_since_last_response:.1f}s < {self.pause_after_response:.1f}s)")
                 return
+            
+            # CRITICAL FIX: Check if STT needs restart
+            if self.needs_stt_restart:
+                # Don't process audio until STT is restarted
+                logger.debug("Waiting for STT restart")
+                return
+                
+            # Check if we're in barge-in recovery and it's taking too long
+            if self.barge_in_recovery_active:
+                time_in_recovery = time.time() - self.barge_in_recovery_time
+                if time_in_recovery > self.barge_in_recovery_timeout:
+                    logger.warning(f"Barge-in recovery taking too long ({time_in_recovery:.1f}s), forcing STT restart")
+                    self.barge_in_recovery_active = False
+                    
+                    # Force STT restart
+                    asyncio.create_task(self._restart_google_stt())
+                    return
             
             # Process buffer when it's large enough and not already processing
             # Use reduced buffer size for lower latency
@@ -839,6 +1062,9 @@ class WebSocketHandler:
         self.connection_active.clear()
         self.stop_event.set()
         self.speech_cancellation_event.set()  # Cancel any ongoing speech
+        
+        # CRITICAL FIX: Stop STT heartbeat
+        await self._stop_stt_heartbeat()
         
         # Cancel keep-alive task
         if self.keep_alive_task:
@@ -915,32 +1141,72 @@ class WebSocketHandler:
             
             # Process audio through STT
             try:
-                # Ensure STT is properly initialized and in streaming mode
-                if hasattr(self.pipeline, 'speech_recognizer'):
-                    # Make sure streaming is started
-                    if hasattr(self.pipeline.speech_recognizer, 'is_streaming'):
-                        if not getattr(self.pipeline.speech_recognizer, 'is_streaming', False):
-                            if hasattr(self.pipeline.speech_recognizer, 'start_streaming'):
-                                await self.pipeline.speech_recognizer.start_streaming()
-                                await asyncio.sleep(0.1)  # Small delay
+                speech_recognizer = self.pipeline.speech_recognizer
+                
+                # CRITICAL FIX: Check if STT is ready
+                is_streaming = getattr(speech_recognizer, 'is_streaming', False)
+                
+                if not is_streaming:
+                    logger.warning("STT not in streaming mode, attempting to restart")
+                    # Try to reinitialize
+                    try:
+                        # First check if session needs shutdown
+                        if hasattr(speech_recognizer, 'stop_streaming'):
+                            try:
+                                await speech_recognizer.stop_streaming()
+                                await asyncio.sleep(0.2)
+                            except Exception as e:
+                                logger.warning(f"Error stopping STT: {e}")
+                        
+                        # Restart streaming
+                        if hasattr(speech_recognizer, 'start_streaming'):
+                            await speech_recognizer.start_streaming()
+                            await asyncio.sleep(0.2)
+                            logger.info("Restarted STT streaming")
+                            
+                            # Check again
+                            is_streaming = getattr(speech_recognizer, 'is_streaming', False)
+                            if not is_streaming:
+                                # Still not streaming, go for full restart
+                                self.needs_stt_restart = True
+                                self._set_conversation_state(ConversationState.LISTENING)
+                                return
+                    except Exception as restart_error:
+                        logger.error(f"Error restarting STT: {restart_error}")
+                        self.needs_stt_restart = True
+                        self._set_conversation_state(ConversationState.LISTENING)
+                        return
                 
                 # Convert to bytes format for Google Cloud
                 audio_bytes = (pcm_audio * 32767).astype(np.int16).tobytes()
                 
-                # Process through Google Cloud Speech-to-Text
-                # Google Cloud expects 16-bit PCM audio
-                await self.pipeline.speech_recognizer.process_audio_chunk(
-                    audio_chunk=audio_bytes,
-                    callback=transcription_callback
-                )
+                # CRITICAL FIX: Use a timeout for the STT process
+                try:
+                    # Process with timeout
+                    await asyncio.wait_for(
+                        speech_recognizer.process_audio_chunk(
+                            audio_chunk=audio_bytes,
+                            callback=transcription_callback
+                        ),
+                        timeout=2.0  # 2 second timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.error("STT processing timed out")
+                    self._set_conversation_state(ConversationState.LISTENING)
+                    # Force STT restart
+                    self.needs_stt_restart = True
+                    return
                 
-                # Check for results in the queue
-                while not self.pipeline.speech_recognizer.result_queue.empty():
+                # Check for results in the queue with timeout
+                queue_timeout = time.time() + 1.0  # 1 second timeout
+                
+                # Check for results
+                while not speech_recognizer.result_queue.empty() and time.time() < queue_timeout:
                     try:
-                        result = self.pipeline.speech_recognizer.result_queue.get_nowait()
+                        result = speech_recognizer.result_queue.get_nowait()
                         if result and result not in transcription_results:
                             transcription_results.append(result)
-                            self.pipeline.speech_recognizer.result_queue.task_done()
+                            speech_recognizer.result_queue.task_done()
                     except Exception:
                         break
                 
@@ -967,7 +1233,6 @@ class WebSocketHandler:
                     logger.info(f"Transcription: '{transcription}'")
                     
                     # Skip command detection on first interaction
-                    # FIXED: Skip command detection for first interaction to avoid false command recognition
                     is_command, command_type = (False, "") if self.first_interaction else self._is_simple_command(transcription)
                     if self.first_interaction:
                         self.first_interaction = False
@@ -984,6 +1249,10 @@ class WebSocketHandler:
                             # Command was handled, update state and return early
                             self.last_transcription = transcription
                             self.last_response_time = time.time()
+                            
+                            # Reset barge-in recovery
+                            self.barge_in_recovery_active = False
+                            
                             return
                 
                     # Check for echo - if within time window and similar to last response
@@ -1001,6 +1270,9 @@ class WebSocketHandler:
                     if len(transcription.split()) >= self.min_words_for_valid_query:
                         # Now clear the input buffer since we have a valid transcription
                         self.input_buffer.clear()
+                        
+                        # End barge-in recovery
+                        self.barge_in_recovery_active = False
                         
                         # Don't process duplicate transcriptions
                         if transcription == self.last_transcription:
@@ -1030,6 +1302,12 @@ class WebSocketHandler:
                                         # Convert to mulaw for Twilio
                                         mulaw_audio = self.audio_processor.pcm_to_mulaw(speech_audio)
                                         
+                                        # CRITICAL FIX: Check if we need to save this for later
+                                        if self.needs_stt_restart:
+                                            logger.info("Saving response for after STT restart")
+                                            self.pending_response = mulaw_audio
+                                            return
+                                            
                                         # Send back to Twilio
                                         logger.info(f"Sending audio response ({len(mulaw_audio)} bytes)")
                                         await self._send_audio(mulaw_audio, ws)
@@ -1072,21 +1350,10 @@ class WebSocketHandler:
                     logger.debug(f"No transcription found, reduced buffer to {len(self.input_buffer)} bytes")
                     self._set_conversation_state(ConversationState.LISTENING)
                 
-                # Reset the STT session only if we got a valid transcription
+                # CRITICAL FIX: Only restart STT if needed instead of every time
                 if transcription and len(transcription.split()) >= self.min_words_for_valid_query:
-                    try:
-                        if hasattr(self.pipeline.speech_recognizer, 'stop_streaming'):
-                            await self.pipeline.speech_recognizer.stop_streaming()
-                        
-                        await asyncio.sleep(0.1)  # Add a smaller delay between stop and start
-                        
-                        if hasattr(self.pipeline.speech_recognizer, 'start_streaming'):
-                            await self.pipeline.speech_recognizer.start_streaming()
-                            await asyncio.sleep(0.1)  # Add a small delay
-                        
-                        logger.info("Reset STT after successful transcription")
-                    except Exception as reset_error:
-                        logger.error(f"Error resetting STT: {reset_error}")
+                    # Signal that we want a clean STT session for next time
+                    self.needs_stt_restart = True
             
             except Exception as e:
                 logger.error(f"Error during STT processing: {e}", exc_info=True)
@@ -1094,6 +1361,9 @@ class WebSocketHandler:
                 half_size = len(self.input_buffer) // 2
                 self.input_buffer = self.input_buffer[half_size:]
                 self._set_conversation_state(ConversationState.LISTENING)
+                
+                # Mark STT for restart
+                self.needs_stt_restart = True
                 
         except Exception as e:
             logger.error(f"Error processing audio: {e}", exc_info=True)
@@ -1125,6 +1395,11 @@ class WebSocketHandler:
             if not self.connected:
                 logger.warning("WebSocket connection is closed, cannot send audio")
                 return
+            
+            # CRITICAL FIX: Start STT heartbeat for regular audio responses
+            if not is_interrupt and not is_indicator:
+                # Start heartbeat when sending regular audio response
+                await self._start_stt_heartbeat()
             
             # Special handling for indicator sounds
             if is_indicator:
@@ -1182,6 +1457,19 @@ class WebSocketHandler:
                 
                 # Reset agent speaking flag immediately
                 self.audio_processor.set_agent_speaking(False)
+                
+                # CRITICAL FIX: Stop heartbeat when speech is interrupted
+                await self._stop_stt_heartbeat()
+                
+                # CRITICAL FIX: Set the speech cancellation event
+                self.speech_cancellation_event.set()
+                
+                # CRITICAL FIX: Move to listening state
+                self._set_conversation_state(ConversationState.LISTENING)
+                
+                # CRITICAL FIX: Restart STT on barge-in
+                asyncio.create_task(self._restart_google_stt())
+                
                 return
             
             for i, chunk in enumerate(chunks):
@@ -1203,6 +1491,18 @@ class WebSocketHandler:
                             ws.send(json.dumps(message))
                     except Exception as e:
                         logger.error(f"Error sending silence on cancel: {e}")
+                    
+                    # CRITICAL FIX: Stop heartbeat when speech is cancelled
+                    await self._stop_stt_heartbeat()
+                    
+                    # CRITICAL FIX: Ensure agent speaking state is reset
+                    self.audio_processor.set_agent_speaking(False)
+                    
+                    # CRITICAL FIX: Force listening state
+                    self._set_conversation_state(ConversationState.LISTENING)
+                    
+                    # CRITICAL FIX: Force STT restart
+                    asyncio.create_task(self._restart_google_stt())
                     
                     # Important: stop sending immediately after silence
                     break
@@ -1233,6 +1533,9 @@ class WebSocketHandler:
                         logger.warning(f"WebSocket connection closed while sending chunk {i+1}/{len(chunks)}")
                         self.connected = False
                         self.connection_active.clear()
+                        
+                        # CRITICAL FIX: Stop heartbeat if connection closes
+                        await self._stop_stt_heartbeat()
                         return
                     else:
                         logger.error(f"Error sending audio chunk {i+1}/{len(chunks)}: {e}")
@@ -1243,6 +1546,9 @@ class WebSocketHandler:
             # Reset speaking flag after sending all chunks
             if not is_interrupt and self.audio_processor.agent_speaking:
                 self.audio_processor.set_agent_speaking(False)
+                
+                # CRITICAL FIX: Stop heartbeat when done speaking
+                await self._stop_stt_heartbeat()
                 
                 # Update echo detection variables
                 if hasattr(self, 'last_transcription') and self.last_transcription:
@@ -1263,6 +1569,10 @@ class WebSocketHandler:
             
         except Exception as e:
             logger.error(f"Error sending audio: {e}", exc_info=True)
+            
+            # CRITICAL FIX: Stop heartbeat on error
+            await self._stop_stt_heartbeat()
+            
             if "Connection closed" in str(e):
                 self.connected = False
                 self.connection_active.clear()
@@ -1290,6 +1600,13 @@ class WebSocketHandler:
                 # Convert to mulaw
                 mulaw_audio = self.audio_processor.pcm_to_mulaw(speech_audio)
                 
+                # CRITICAL FIX: Check if we need to save this for later
+                if self.needs_stt_restart:
+                    logger.info("Saving response for after STT restart")
+                    self.pending_response = mulaw_audio
+                    asyncio.create_task(self._restart_google_stt())
+                    return
+                
                 # Send audio
                 await self._send_audio(mulaw_audio, ws)
                 logger.info(f"Sent text response: '{text}'")
@@ -1312,7 +1629,6 @@ class WebSocketHandler:
             self._set_conversation_state(ConversationState.LISTENING)
     
     async def _keep_alive_loop(self, ws) -> None:
-        
         """
         Send periodic keep-alive messages to maintain the WebSocket connection.
         """
