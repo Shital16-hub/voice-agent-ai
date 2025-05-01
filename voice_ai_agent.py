@@ -1,6 +1,6 @@
 """
 Enhanced Voice AI Agent main class that coordinates all components with improved
-speech/noise discrimination and Deepgram STT integration for telephony applications.
+speech/noise discrimination and Google Cloud Speech-to-Text integration for telephony applications.
 """
 import os
 import logging
@@ -12,8 +12,8 @@ import numpy as np
 # Import the enhanced audio preprocessor
 from telephony.audio_preprocessor import AudioPreprocessor
 
-# Deepgram STT imports
-from speech_to_text.deepgram_stt import DeepgramStreamingSTT
+# Google STT imports
+from speech_to_text.google_stt import GoogleCloudStreamingSTT
 from speech_to_text.stt_integration import STTIntegration
 from knowledge_base.conversation_manager import ConversationManager
 from knowledge_base.llama_index.document_store import DocumentStore
@@ -25,17 +25,16 @@ logger = logging.getLogger(__name__)
 
 class VoiceAIAgent:
     """
-    Enhanced Voice AI Agent class that integrates the new AudioPreprocessor component
-    and prioritizes Deepgram STT for superior speech/noise discrimination.
+    Enhanced Voice AI Agent class that integrates the AudioPreprocessor component
+    and uses Google Cloud Speech-to-Text for superior speech/noise discrimination.
     """
     
     def __init__(
         self,
         storage_dir: str = './storage',
         model_name: str = 'mistral:7b-instruct-v0.2-q4_0',
-        api_key: Optional[str] = None,
+        credentials_path: Optional[str] = None,
         llm_temperature: float = 0.7,
-        whisper_model_path: Optional[str] = None,
         enable_debug: bool = False,
         **kwargs
     ):
@@ -45,17 +44,15 @@ class VoiceAIAgent:
         Args:
             storage_dir: Directory for persistent storage
             model_name: LLM model name for knowledge base
-            api_key: Deepgram API key (defaults to env variable)
+            credentials_path: Path to Google Cloud credentials JSON
             llm_temperature: LLM temperature for response generation
-            whisper_model_path: Path to whisper model (fallback if Deepgram unavailable)
             enable_debug: Enable detailed debug logging
             **kwargs: Additional parameters for customization
         """
         self.storage_dir = storage_dir
         self.model_name = model_name
-        self.api_key = api_key or os.getenv("DEEPGRAM_API_KEY")
+        self.credentials_path = credentials_path or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
         self.llm_temperature = llm_temperature
-        self.whisper_model_path = whisper_model_path
         self.enable_debug = enable_debug
         
         # STT Parameters
@@ -67,12 +64,8 @@ class VoiceAIAgent:
             'support', 'help', 'agent', 'assistant', 'voice'
         ])
         
-        # Enhanced speech processing parameters - primarily for fallback to Whisper
-        self.whisper_initial_prompt = kwargs.get('whisper_initial_prompt', 
-            "This is a telephone conversation. Focus only on clear speech and ignore background noise.")
-        self.whisper_temperature = kwargs.get('whisper_temperature', 0.0)
-        self.whisper_no_context = kwargs.get('whisper_no_context', True)
-        self.whisper_preset = kwargs.get('whisper_preset', "default")
+        # Additional STT parameters
+        self.stt_model = kwargs.get('stt_model', 'phone_call')
         
         # Component placeholders
         self.speech_recognizer = None
@@ -83,6 +76,8 @@ class VoiceAIAgent:
         
         # Create the dedicated audio preprocessor with improved thresholds
         self.audio_preprocessor = AudioPreprocessor(
+            # Continuing voice_ai_agent.py from where it was cut off
+
             sample_rate=16000,
             enable_barge_in=True,
             barge_in_threshold=0.055,  # Increased from 0.045
@@ -94,40 +89,31 @@ class VoiceAIAgent:
         logger.info("Initialized Voice AI Agent with enhanced audio preprocessor")
                 
     async def init(self):
-        """Initialize all components with enhanced speech processing."""
+        """Initialize all components with enhanced speech processing using Google Cloud."""
         logger.info("Initializing Voice AI Agent components with enhanced speech processing...")
         
         try:
-            # Check if Deepgram API key is available
-            if not self.api_key:
-                logger.warning("No Deepgram API key found. Check your environment variables.")
-                self.api_key = os.getenv("DEEPGRAM_API_KEY")
-                if not self.api_key:
-                    logger.warning("Still no Deepgram API key, will fall back to Whisper if needed")
+            # Check if Google Cloud credentials are available
+            if not self.credentials_path:
+                raise ValueError("Google Cloud credentials are required for Speech-to-Text")
 
-            # Initialize speech recognizer with Deepgram - make this the primary path
-            if self.api_key:
-                try:
-                    # Create an optimized Deepgram client with telephony-specific settings
-                    # Changed the model from "enhanced" to "general" to avoid permission issues
-                    self.speech_recognizer = DeepgramStreamingSTT(
-                        api_key=self.api_key,
-                        model_name="general",  # Changed from "enhanced" to "general"
-                        language=self.stt_language,
-                        sample_rate=16000,
-                        encoding="linear16",
-                        channels=1,
-                        interim_results=True  # Enable interim results for responsiveness
-                    )
-                    logger.info("Successfully initialized Deepgram STT with general model")
-                    
-                except Exception as e:
-                    logger.error(f"Failed to initialize Deepgram: {e}")
-                    logger.warning("Falling back to Whisper STT")
-                    self._init_whisper_fallback()
-            else:
-                # Initialize Whisper as fallback if no Deepgram API key
-                self._init_whisper_fallback()
+            # Initialize speech recognizer with Google Cloud
+            try:
+                # Create an optimized Google Cloud client with telephony-specific settings
+                self.speech_recognizer = GoogleCloudStreamingSTT(
+                    credentials_path=self.credentials_path,
+                    language_code=self.stt_language,
+                    sample_rate=8000,  # 8kHz for telephony
+                    encoding="LINEAR16",
+                    channels=1,
+                    interim_results=True,  # Enable interim results for responsiveness
+                    model=self.stt_model  # Use phone_call model
+                )
+                logger.info("Successfully initialized Google Cloud Speech-to-Text")
+                
+            except Exception as e:
+                logger.error(f"Failed to initialize Google Cloud Speech-to-Text: {e}")
+                raise
             
             # Initialize STT integration with better validation thresholds
             self.stt_integration = STTIntegration(
@@ -141,7 +127,6 @@ class VoiceAIAgent:
             await index_manager.init()
             
             # Initialize query engine with improved configuration
-            # Removed the use_cache parameter as it's not supported
             self.query_engine = QueryEngine(
                 index_manager=index_manager, 
                 llm_model_name=self.model_name,
@@ -160,7 +145,7 @@ class VoiceAIAgent:
             await self.conversation_manager.init()
             
             # Initialize TTS client
-            self.tts_client = GoogleCloudTTS()
+            self.tts_client = GoogleCloudTTS(credentials_path=self.credentials_path)
             
             logger.info("Voice AI Agent initialization complete with enhanced speech processing")
             
@@ -168,27 +153,6 @@ class VoiceAIAgent:
             logger.error(f"Error initializing Voice AI Agent: {e}", exc_info=True)
             raise
     
-    def _init_whisper_fallback(self):
-        """Initialize Whisper as a fallback STT solution with optimized settings."""
-        from speech_to_text.streaming.whisper_streaming import StreamingWhisperASR
-        
-        # Use optimized Whisper parameters for lower latency
-        self.speech_recognizer = StreamingWhisperASR(
-            model_path=self.whisper_model_path or "base.en",  # Use smaller model for speed
-            language="en",
-            n_threads=8,  # Increased from 4 for better CPU utilization
-            chunk_size_ms=1500,  # Decreased from 2000 for lower latency
-            overlap_ms=100,  # Reduced overlap for speed
-            vad_enabled=True,
-            single_segment=True,
-            temperature=0.0,
-            beam_size=1,  # Added for faster processing
-            initial_prompt=self.whisper_initial_prompt,
-            no_context=self.whisper_no_context,
-            preset=self.whisper_preset
-        )
-        logger.info(f"Initialized Whisper STT fallback with preset: {self.whisper_preset}")
-        
     def process_audio_with_enhanced_preprocessing(self, audio_data: np.ndarray) -> np.ndarray:
         """
         Process audio with the dedicated AudioPreprocessor for superior speech/noise discrimination.
