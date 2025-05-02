@@ -2,7 +2,7 @@
 Enhanced Speech-to-Text integration module for Voice AI Agent with improved noise handling
 and foreground speech extraction.
 
-This module provides classes and functions for integrating Deepgram speech-to-text
+This module provides classes and functions for integrating Google Cloud speech-to-text
 capabilities with the Voice AI Agent system.
 """
 import logging
@@ -14,8 +14,11 @@ from typing import Optional, Dict, Any, Callable, Awaitable, List, Tuple, Union,
 from scipy import signal
 from collections import deque
 
-from speech_to_text.deepgram_stt import DeepgramStreamingSTT, StreamingTranscriptionResult
+from speech_to_text.google_stt import GoogleCloudSTT, STTStreamer, SpeechDetector
+from speech_to_text.streamer import GoogleCloudStreamer, StreamingTranscriptionResult
 from speech_to_text.utils.audio_utils import load_audio_file
+
+# Continue with the rest of the file...
 
 logger = logging.getLogger(__name__)
 
@@ -53,14 +56,14 @@ class STTIntegration:
     
     def __init__(
         self,
-        speech_recognizer: Optional[DeepgramStreamingSTT] = None,
+        speech_recognizer: Optional[GoogleCloudStreamer] = None,
         language: str = "en"
     ):
         """
         Initialize the STT integration.
         
         Args:
-            speech_recognizer: Initialized DeepgramStreamingSTT instance
+            speech_recognizer: Initialized GoogleCloudStreamer instance
             language: Language code for speech recognition
         """
         self.speech_recognizer = speech_recognizer
@@ -101,7 +104,7 @@ class STTIntegration:
             
         try:
             # Create a new Deepgram streaming client optimized for telephony
-            self.speech_recognizer = DeepgramStreamingSTT(
+            self.speech_recognizer = GoogleCloudStreamer(
                 api_key=api_key,
                 language=self.language,
                 sample_rate=16000,

@@ -14,6 +14,8 @@ from knowledge_base.llama_index.document_store import DocumentStore
 from knowledge_base.llama_index.index_manager import IndexManager
 from knowledge_base.llama_index.query_engine import QueryEngine
 from text_to_speech import GoogleCloudTTS
+from speech_to_text.streamer import GoogleCloudStreamer, StreamingTranscriptionResult
+
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +76,13 @@ class VoiceAIAgent:
                 language_code=self.stt_language,
                 model="phone_call",
                 use_enhanced=True
+            )
+
+            self.streaming_stt = GoogleCloudStreamer(
+            speech_client=self.speech_recognizer,
+            language_code=self.stt_language,
+            model="phone_call",
+            use_enhanced=True
             )
             
             # Initialize STT integration

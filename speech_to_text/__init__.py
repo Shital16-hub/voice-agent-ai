@@ -7,7 +7,7 @@ This module provides real-time streaming speech recognition using Google Cloud's
 import logging
 from speech_to_text.google_stt.client import GoogleCloudSTT
 from speech_to_text.google_stt.streaming import STTStreamer, SpeechDetector
-from speech_to_text.stt_integration import STTIntegration
+from speech_to_text.streamer import GoogleCloudStreamer, StreamingTranscriptionResult
 
 __version__ = "0.2.0"
 
@@ -21,5 +21,6 @@ __all__ = [
     "GoogleCloudSTT",
     "STTStreamer",
     "SpeechDetector",
-    "STTIntegration",
+    "GoogleCloudStreamer",
+    "StreamingTranscriptionResult"
 ]
