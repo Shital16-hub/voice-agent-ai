@@ -12,7 +12,6 @@ import re
 from typing import Dict, Any, Callable, Awaitable, Optional, List, Union, Tuple
 from collections import deque
 
-from telephony.audio_preprocessor import AudioPreprocessor, SpeechState
 from telephony.config import (
     CHUNK_SIZE, AUDIO_BUFFER_SIZE, SILENCE_THRESHOLD, SILENCE_DURATION, 
     MAX_BUFFER_SIZE, ENABLE_BARGE_IN, BARGE_IN_THRESHOLD, BARGE_IN_DETECTION_WINDOW
@@ -57,10 +56,18 @@ NON_SPEECH_PATTERNS = [
     r'keyboard',                # keyboard noises
 ]
 
+# Speech state enum for detection
+class SpeechState:
+    """Speech state for detection state machine"""
+    SILENCE = 0
+    POTENTIAL_SPEECH = 1
+    CONFIRMED_SPEECH = 2
+    SPEECH_ENDED = 3
+
 class WebSocketHandler:
     """
     Handles WebSocket connections for Twilio media streams with enhanced speech/noise discrimination.
-    Integrates the new AudioPreprocessor via the updated AudioProcessor.
+    Implements advanced barge-in detection directly in this class.
     """
     
     # Add these constants for command recognition
@@ -148,6 +155,40 @@ class WebSocketHandler:
         
         # Track chunks processed since last processing 
         self.chunks_since_last_process = 0
+        
+        # Implement advanced barge-in detection directly
+        # Enhanced adaptive noise tracking
+        self.noise_samples = []
+        self.max_samples = 50
+        self.ambient_noise_level = 0.015
+        self.min_noise_floor = 0.008
+        
+        # Enhanced energy thresholds with hysteresis
+        self.low_threshold = self.ambient_noise_level * 2.0
+        self.high_threshold = self.ambient_noise_level * 4.5
+        
+        # Speech frequency band energy tracking
+        self.speech_band_energies = deque(maxlen=30)
+        
+        # Speech detection state machine
+        self.speech_state = SpeechState.SILENCE
+        self.potential_speech_frames = 0
+        self.confirmed_speech_frames = 0
+        self.silence_frames = 0
+        
+        # Maintain enhanced audio buffer for improved detection
+        self.recent_audio_buffer = deque(maxlen=20)
+        
+        # Barge-in state tracking
+        self.agent_speaking = False
+        self.agent_speaking_start_time = 0.0
+        self.barge_in_detected = False
+        self.last_barge_in_time = 0.0
+        
+        # Set barge-in parameters
+        self.barge_in_threshold = BARGE_IN_THRESHOLD
+        self.barge_in_min_speech_frames = 10
+        self.barge_in_cooldown_ms = 2000
         
         logger.info(f"WebSocketHandler initialized for call {call_sid} with Google Cloud STT")
     
@@ -437,6 +478,13 @@ class WebSocketHandler:
         self.stop_event.clear()
         self.startup_time = time.time()  # Reset startup time
         self.chunks_since_last_process = 0
+        
+        # Reset barge-in state
+        self.speech_state = SpeechState.SILENCE
+        self.potential_speech_frames = 0
+        self.confirmed_speech_frames = 0
+        self.silence_frames = 0
+        self.barge_in_detected = False
         
         # Send a welcome message with slight delay to give the client time to connect fully
         await asyncio.sleep(0.5)  # Small delay for connection setup
@@ -811,6 +859,108 @@ class WebSocketHandler:
                 self.connected = False
                 self.connection_active.clear()
     
+    def _update_ambient_noise_level(self, audio_data: bytes) -> None:
+        """
+        Update ambient noise level using adaptive statistics.
+        
+        Args:
+            audio_data: Audio data as bytes
+        """
+        try:
+            # Convert mu-law to PCM for energy calculation
+            pcm_data = self._mulaw_to_pcm(audio_data)
+            
+            # Calculate energy for noise level
+            import audioop
+            rms = audioop.rms(pcm_data, 2)  # 2 bytes per sample for 16-bit PCM
+            
+            # Normalize to 0.0-1.0 range
+            energy = rms / 32768.0
+            
+            # If audio is silence (very low energy), use it to update noise floor
+            if energy < 0.02:  # Very quiet audio
+                self.noise_samples.append(energy)
+                # Keep only recent samples
+                if len(self.noise_samples) > self.max_samples:
+                    self.noise_samples.pop(0)
+                
+                # Update ambient noise level (with safety floor)
+                if self.noise_samples:
+                    # Use 90th percentile to avoid outliers
+                    import numpy as np
+                    new_noise_level = max(
+                        self.min_noise_floor,  # Minimum threshold
+                        np.percentile(self.noise_samples, 90) * 2.0  # Set threshold just above noise
+                    )
+                    
+                    # Use exponential moving average to avoid abrupt changes
+                    alpha = 0.3  # Weight for new value (0.3 = 30% new, 70% old)
+                    self.ambient_noise_level = (alpha * new_noise_level + 
+                                              (1 - alpha) * self.ambient_noise_level)
+                    
+                    # Update derived thresholds
+                    self.low_threshold = self.ambient_noise_level * 2.0
+                    self.high_threshold = self.ambient_noise_level * 4.5
+        except Exception as e:
+            logger.error(f"Error updating ambient noise level: {e}")
+    
+    def _calculate_speech_band_energy(self, audio_data: bytes) -> Dict[str, float]:
+        """
+        Calculate energy in specific frequency bands relevant to speech.
+        
+        Args:
+            audio_data: Audio data as bytes
+            
+        Returns:
+            Dictionary with energy in different frequency bands
+        """
+        try:
+            # Convert mu-law to PCM for spectral analysis
+            pcm_data = self._mulaw_to_pcm(audio_data)
+            
+            # Convert to numpy array
+            import numpy as np
+            audio_array = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32) / 32768.0
+            
+            # Calculate FFT
+            fft_data = np.abs(np.fft.rfft(audio_array))
+            freqs = np.fft.rfftfreq(len(audio_array), 1/16000)  # 16kHz sample rate after conversion
+            
+            # Define frequency bands - focus on telephony speech range
+            low_band_idx = (freqs < 300)
+            speech_band_idx = (freqs >= 300) & (freqs <= 3400)  # Primary speech frequencies
+            high_band_idx = (freqs > 3400)
+            
+            # Calculate energy in each band
+            low_energy = np.sum(fft_data[low_band_idx]**2)  # Using squared magnitude for energy
+            speech_energy = np.sum(fft_data[speech_band_idx]**2)
+            high_energy = np.sum(fft_data[high_band_idx]**2)
+            
+            total_energy = low_energy + speech_energy + high_energy + 1e-10
+            
+            # Calculate ratios
+            speech_ratio = speech_energy / total_energy
+            
+            result = {
+                "low_band": low_energy / total_energy,
+                "speech_band": speech_ratio,
+                "high_band": high_energy / total_energy,
+                "speech_ratio": speech_ratio
+            }
+            
+            # Store speech band energy for tracking
+            self.speech_band_energies.append(speech_ratio)
+            
+            return result
+        except Exception as e:
+            logger.error(f"Error calculating frequency bands: {e}")
+            return {
+                "low_band": 0.0,
+                "speech_band": 0.0,
+                "high_band": 0.0,
+                "speech_ratio": 0.0
+            }
+    
     def _calculate_audio_energy(self, audio_data: bytes) -> float:
         """
         Calculate audio energy for basic speech detection.
@@ -835,6 +985,113 @@ class WebSocketHandler:
         except Exception as e:
             logger.error(f"Error calculating audio energy: {e}")
             return 0.0
+    
+    async def _check_for_barge_in(self, audio_data: bytes) -> bool:
+        """
+        Enhanced barge-in detection with state machine.
+        
+        Args:
+            audio_data: Audio data as bytes
+            
+        Returns:
+            True if barge-in is detected
+        """
+        # Don't check for barge-in if we're not speaking
+        if not self.is_speaking:
+            return False
+            
+        try:
+            # Update noise floor for adaptive thresholds
+            self._update_ambient_noise_level(audio_data)
+            
+            # Calculate energy of the audio
+            energy = self._calculate_audio_energy(audio_data)
+            
+            # Get speech band energy for better detection
+            band_energies = self._calculate_speech_band_energy(audio_data)
+            speech_ratio = band_energies.get("speech_band", 0.0)
+            
+            # Calculate the average speech band ratio from history
+            avg_speech_ratio = 0.4  # Default
+            if self.speech_band_energies:
+                import numpy as np
+                avg_speech_ratio = np.mean(self.speech_band_energies)
+            
+            import time
+            current_time = time.time() * 1000  # Convert to ms
+            
+            # Check cooldown period - don't detect barge-in too early after we start speaking
+            time_since_agent_started = current_time - (self.agent_speaking_start_time * 1000)
+            if time_since_agent_started < self.barge_in_cooldown_ms:  # E.g., 1.5 second cooldown
+                return False
+            
+            # Check if enough time has passed since last barge-in
+            time_since_last_barge_in = current_time - (self.last_barge_in_time * 1000)
+            if time_since_last_barge_in < 800:  # 800ms minimum between barge-ins
+                return False
+                
+            # State machine for more robust barge-in detection
+            if self.speech_state == SpeechState.SILENCE:
+                # Check if potential speech detected - more strict criteria for barge-in
+                if energy > self.low_threshold and speech_ratio > 0.6:
+                    self.speech_state = SpeechState.POTENTIAL_SPEECH
+                    self.potential_speech_frames = 1
+                    logger.debug(f"Potential barge-in speech detected: energy={energy:.4f}, speech_ratio={speech_ratio:.2f}")
+                    return False  # Not confirmed yet
+                return False  # Still silence
+                
+            elif self.speech_state == SpeechState.POTENTIAL_SPEECH:
+                # Check if still potential speech
+                if energy > self.low_threshold and speech_ratio > 0.6:
+                    self.potential_speech_frames += 1
+                    # Check if we have enough frames for barge-in - require fewer frames
+                    if self.potential_speech_frames >= 3:  # Need 3 consecutive frames
+                        # Check against higher threshold for confirmation
+                        if energy > self.high_threshold and speech_ratio > 0.65:
+                            self.speech_state = SpeechState.CONFIRMED_SPEECH
+                            self.confirmed_speech_frames = 1
+                            
+                            # Set barge-in detected state
+                            self.barge_in_detected = True
+                            self.last_barge_in_time = time.time()
+                            
+                            logger.info(f"Barge-in confirmed: energy={energy:.4f}, speech_ratio={speech_ratio:.2f}")
+                            return True
+                    return False  # Not confirmed yet
+                else:
+                    # Go back to silence
+                    self.speech_state = SpeechState.SILENCE
+                    self.potential_speech_frames = 0
+                    return False
+                    
+            elif self.speech_state == SpeechState.CONFIRMED_SPEECH:
+                # Already confirmed speech, maintain barge-in signal
+                self.confirmed_speech_frames += 1
+                return True
+                
+            # Default check in case we're in an unexpected state
+            # More aggressive barge-in detection during agent speech
+            # Use lower threshold (80% of normal) when agent is speaking
+            barge_in_threshold_adjusted = self.barge_in_threshold * 0.8
+            
+            # Look for sudden energy spike which is common in interruptions
+            is_energy_spike = energy > barge_in_threshold_adjusted
+            # Look for good speech ratio which indicates speech rather than noise
+            is_good_speech_quality = speech_ratio > 0.55
+            
+            if is_energy_spike and is_good_speech_quality:
+                # Update barge-in state
+                self.barge_in_detected = True
+                self.last_barge_in_time = time.time()
+                
+                logger.info(f"Barge-in detected (direct): energy={energy:.4f}, speech_ratio={speech_ratio:.2f}")
+                return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error in barge-in detection: {e}")
+            return False
     
     def _pcm_to_mulaw(self, pcm_data: bytes) -> bytes:
         """
@@ -920,70 +1177,25 @@ class WebSocketHandler:
         """
         # Update speaking state
         self.is_speaking = is_speaking
+        self.agent_speaking = is_speaking
         
         # Track speech start time for cooldown
         if is_speaking:
             import time
-            self.agent_speech_start_time = time.time()
+            self.agent_speaking_start_time = time.time()
             self.speech_cancellation_event.clear()
-        
-        # Update STT integration's speech detector if available
-        if hasattr(self.stt_integration, 'speech_detector'):
-            self.stt_integration.speech_detector.set_agent_speaking(is_speaking)
-    
-    async def _check_for_barge_in(self, audio_data: bytes) -> bool:
-        """
-        Check for barge-in using Google Cloud STT integration.
-        
-        Args:
-            audio_data: Audio data from Twilio
             
-        Returns:
-            True if barge-in is detected
-        """
-        # Use STT integration's barge-in detection if available
-        if hasattr(self.stt_integration, 'speech_detector'):
-            # Convert Twilio mulaw to PCM for speech detector
-            pcm_data = self._mulaw_to_pcm(audio_data)
-            
-            # Check for barge-in
-            return self.stt_integration.speech_detector.check_for_barge_in(pcm_data, None)
-            
-        # Fallback to simple energy detection
-        import time
+            # Reset speech state for new detection
+            self.speech_state = SpeechState.SILENCE
+            self.potential_speech_frames = 0
+            self.confirmed_speech_frames = 0
         
-        # Check cooldown period
-        current_time = time.time() * 1000  # Convert to ms
-        
-        # Don't check for barge-in if we're not speaking
-        if not self.is_speaking:
-            return False
-        
-        # Check if enough time has passed since agent started speaking (cooldown period)
-        time_since_agent_started = (current_time - (self.agent_speech_start_time * 1000)) if hasattr(self, 'agent_speech_start_time') else 2000
-        if time_since_agent_started < 1500:  # 1.5 second cooldown
-            return False
-        
-        # Check if enough time has passed since last barge-in
-        time_since_last_barge_in = (current_time - (self.last_barge_in_time * 1000)) if hasattr(self, 'last_barge_in_time') else 2000
-        if time_since_last_barge_in < 800:  # 800ms minimum between barge-ins
-            return False
-        
-        # Simple energy-based detection
-        energy = self._calculate_audio_energy(audio_data)
-        
-        # Update barge-in state if energy is high enough
-        if energy > 0.04:  # Threshold for barge-in
-            # Set state
-            if not hasattr(self, 'last_barge_in_time'):
-                self.last_barge_in_time = time.time()
-            else:
-                self.last_barge_in_time = time.time()
-                
-            logger.info(f"Barge-in detected with energy: {energy:.4f}")
-            return True
-        
-        return False
+        # Try to update STT integration's speech detector if available
+        if hasattr(self.stt_integration, 'speech_detector') and self.stt_integration.speech_detector is not None:
+            try:
+                self.stt_integration.speech_detector.set_agent_speaking(is_speaking)
+            except Exception as e:
+                logger.warning(f"Unable to update STT integration speech detector: {e}")
     
     async def send_text_response(self, text: str, ws) -> None:
         """
