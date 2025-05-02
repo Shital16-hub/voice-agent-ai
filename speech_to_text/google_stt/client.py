@@ -9,8 +9,6 @@ from typing import Dict, List, Optional, Any, AsyncGenerator, Union
 import io
 
 from google.cloud import speech
-from google.cloud.speech import enums
-from google.cloud.speech import types
 from google.oauth2 import service_account
 
 from .config import config
@@ -88,6 +86,7 @@ class GoogleCloudSTT:
         Returns:
             Recognition configuration
         """
+        # Updated for v2.x of the API - uses direct enum values instead of importing enums
         config_params = {
             "language_code": self.language_code,
             "sample_rate_hertz": self.sample_rate,
@@ -99,20 +98,20 @@ class GoogleCloudSTT:
         
         # Add telephony-specific settings
         if self.model == "phone_call":
-            # Add phone call-specific settings
-            config_params["metadata"] = {
-                "interaction_type": speech.RecognitionMetadata.InteractionType.PHONE_CALL,
-                "microphone_distance": speech.RecognitionMetadata.MicrophoneDistance.NEARFIELD,
-                "original_media_type": speech.RecognitionMetadata.OriginalMediaType.AUDIO,
-                "recording_device_type": speech.RecognitionMetadata.RecordingDeviceType.PHONE_LINE,
-            }
+            # Add phone call-specific settings - updated for v2.x
+            config_params["metadata"] = speech.RecognitionMetadata(
+                interaction_type=speech.RecognitionMetadata.InteractionType.PHONE_CALL,
+                microphone_distance=speech.RecognitionMetadata.MicrophoneDistance.NEARFIELD,
+                original_media_type=speech.RecognitionMetadata.OriginalMediaType.AUDIO,
+                recording_device_type=speech.RecognitionMetadata.RecordingDeviceType.PHONE_LINE,
+            )
         
         # Add speech adaptation for better recognition of keywords
         if config.speech_contexts:
-            config_params["speech_contexts"] = [{
-                "phrases": config.speech_contexts,
-                "boost": config.speech_context_boost
-            }]
+            config_params["speech_contexts"] = [speech.SpeechContext(
+                phrases=config.speech_contexts,
+                boost=config.speech_context_boost
+            )]
         
         # Add streaming-specific settings
         if streaming:
@@ -166,18 +165,20 @@ class GoogleCloudSTT:
             results = []
             for result in response.results:
                 for alternative in result.alternatives:
+                    word_info = []
+                    if hasattr(alternative, 'words') and alternative.words:
+                        for word in alternative.words:
+                            word_info.append({
+                                "word": word.word,
+                                "start_time": word.start_time.total_seconds() if hasattr(word.start_time, 'total_seconds') else 0,
+                                "end_time": word.end_time.total_seconds() if hasattr(word.end_time, 'total_seconds') else 0,
+                                "confidence": word.confidence if hasattr(word, 'confidence') else 0
+                            })
+                    
                     results.append({
                         "transcript": alternative.transcript,
                         "confidence": alternative.confidence,
-                        "words": [
-                            {
-                                "word": word.word,
-                                "start_time": word.start_time.total_seconds(),
-                                "end_time": word.end_time.total_seconds(),
-                                "confidence": word.confidence
-                            }
-                            for word in alternative.words
-                        ] if hasattr(alternative, 'words') else []
+                        "words": word_info
                     })
             
             # Return the best result
@@ -302,7 +303,7 @@ class GoogleCloudSTT:
                         yield {
                             "transcription": result.alternatives[0].transcript if result.alternatives else "",
                             "confidence": result.alternatives[0].confidence if result.alternatives else 0.0,
-                            "stability": result.stability,
+                            "stability": result.stability if hasattr(result, 'stability') else 1.0,
                             "is_final": result.is_final
                         }
                 except asyncio.TimeoutError:

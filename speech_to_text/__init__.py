@@ -1,16 +1,12 @@
 """
 Speech-to-text module for the Voice AI Agent.
 
-This module provides real-time streaming speech recognition using Deepgram's API.
+This module provides real-time streaming speech recognition using Google Cloud's API.
 """
 
 import logging
-from speech_to_text.deepgram_stt import (
-     
-    
-    StreamingTranscriptionResult,
-    TranscriptionResult
-)
+from speech_to_text.google_stt.client import GoogleCloudSTT
+from speech_to_text.google_stt.streaming import STTStreamer, SpeechDetector
 from speech_to_text.stt_integration import STTIntegration
 
 __version__ = "0.2.0"
@@ -22,9 +18,8 @@ logging.basicConfig(
 )
 
 __all__ = [
-    
-     
-    "StreamingTranscriptionResult",
-    "TranscriptionResult",
+    "GoogleCloudSTT",
+    "STTStreamer",
+    "SpeechDetector",
     "STTIntegration",
 ]
