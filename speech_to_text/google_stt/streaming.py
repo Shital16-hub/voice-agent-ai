@@ -50,6 +50,9 @@ class STTStreamer:
         # Create event to track when streaming is fully started
         self.streaming_started = asyncio.Event()
         self.streaming_started.clear()
+        
+        # Track latest result
+        self.latest_result = None
     
     async def _audio_generator(self) -> AsyncGenerator[bytes, None]:
         """
@@ -223,6 +226,7 @@ class STTStreamer:
         
         # Return final result
         return self.latest_result
+
 
 class SpeechDetector:
     """

@@ -44,12 +44,6 @@ class STTConfig(BaseSettings):
         description="Whether to add punctuation to transcriptions"
     )
     
-    # Streaming settings
-    interim_results: bool = Field(
-        default=True,
-        description="Whether to return interim results"
-    )
-    
     # Speech contexts for better recognition
     speech_contexts: list = Field(
         default=["help", "price", "plan", "cost", "support", "agent", "stop", "repeat"],

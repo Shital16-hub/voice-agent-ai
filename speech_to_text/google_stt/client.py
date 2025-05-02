@@ -76,20 +76,24 @@ class GoogleCloudSTT:
             logger.error(f"Failed to initialize Google Cloud STT client: {e}")
             raise STTAPIError(f"Failed to initialize Google Cloud STT client: {str(e)}")
     
-    def _get_recognition_config(self, streaming: bool = False) -> Dict[str, Any]:
+    def _get_recognition_config(self, streaming: bool = False, audio_sample_rate: Optional[int] = None) -> Dict[str, Any]:
         """
         Get recognition configuration optimized for telephony.
         
         Args:
             streaming: Whether this is for streaming recognition
+            audio_sample_rate: Override sample rate from audio file if provided
             
         Returns:
             Recognition configuration
         """
+        # Use provided sample rate or default
+        sample_rate = audio_sample_rate or self.sample_rate
+        
         # Updated for v2.x of the API - uses direct enum values instead of importing enums
         config_params = {
             "language_code": self.language_code,
-            "sample_rate_hertz": self.sample_rate,
+            "sample_rate_hertz": sample_rate,
             "encoding": speech.RecognitionConfig.AudioEncoding.LINEAR16,
             "model": self.model,
             "use_enhanced": self.use_enhanced,
@@ -107,15 +111,11 @@ class GoogleCloudSTT:
             )
         
         # Add speech adaptation for better recognition of keywords
-        if config.speech_contexts:
+        if hasattr(config, 'speech_contexts') and config.speech_contexts:
             config_params["speech_contexts"] = [speech.SpeechContext(
                 phrases=config.speech_contexts,
                 boost=config.speech_context_boost
             )]
-        
-        # Add streaming-specific settings
-        if streaming:
-            config_params["interim_results"] = True
         
         return config_params
     
@@ -130,26 +130,56 @@ class GoogleCloudSTT:
             Transcription result
         """
         try:
+            # Try to detect sample rate from WAV header if present
+            sample_rate = self._detect_wav_sample_rate(audio_data)
+            
             # Run in a thread to avoid blocking the event loop
             loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(None, self._transcribe_sync, audio_data)
+            return await loop.run_in_executor(
+                None, 
+                lambda: self._transcribe_sync(audio_data, sample_rate)
+            )
         except Exception as e:
             logger.error(f"Error during STT transcription: {str(e)}")
             raise STTError(f"Google Cloud STT transcription error: {str(e)}")
     
-    def _transcribe_sync(self, audio_data: bytes) -> Dict[str, Any]:
+    def _detect_wav_sample_rate(self, audio_data: bytes) -> Optional[int]:
+        """
+        Detect sample rate from WAV header if present.
+        
+        Args:
+            audio_data: Audio data as bytes
+            
+        Returns:
+            Sample rate if detected, None otherwise
+        """
+        # Check if WAV header is present
+        if len(audio_data) > 44 and audio_data[:4] == b'RIFF' and audio_data[8:12] == b'WAVE':
+            try:
+                with io.BytesIO(audio_data) as wav_io:
+                    import wave
+                    with wave.open(wav_io, 'rb') as wav_file:
+                        sample_rate = wav_file.getframerate()
+                        logger.info(f"Detected WAV sample rate: {sample_rate} Hz")
+                        return sample_rate
+            except Exception as e:
+                logger.warning(f"Error reading WAV header: {e}")
+        return None
+    
+    def _transcribe_sync(self, audio_data: bytes, sample_rate: Optional[int] = None) -> Dict[str, Any]:
         """
         Synchronous method to transcribe speech using Google Cloud STT.
         
         Args:
             audio_data: Audio data as bytes
+            sample_rate: Override sample rate if provided
             
         Returns:
             Transcription result
         """
         try:
             # Create recognition config
-            config_params = self._get_recognition_config()
+            config_params = self._get_recognition_config(audio_sample_rate=sample_rate)
             recognition_config = speech.RecognitionConfig(**config_params)
             
             # Create recognition audio
@@ -217,10 +247,29 @@ class GoogleCloudSTT:
         """
         # Set up the streaming config
         config_params = self._get_recognition_config(streaming=True)
-        streaming_config = speech.StreamingRecognitionConfig(
-            config=speech.RecognitionConfig(**config_params),
-            interim_results=True
-        )
+        recognition_config = speech.RecognitionConfig(**config_params)
+        
+        # FIXED: For v2.32.0, we need to use a different approach for streaming features
+        # Check if the API version supports StreamingFeatures class
+        try:
+            # Try to directly create the streaming config with interim_results
+            # This works for older versions (v1.x)
+            streaming_config = speech.StreamingRecognitionConfig(
+                config=recognition_config,
+                interim_results=True
+            )
+        except (TypeError, AttributeError) as e:
+            logger.warning(f"Older API structure not supported: {e}")
+            try:
+                # For v2.x: Create the structure that supports the v2 API
+                streaming_config = speech.StreamingRecognitionConfig(
+                    config=recognition_config,
+                )
+                # Add streaming features dictionary directly
+                streaming_config._pb.streaming_features.interim_results = True
+            except Exception as e2:
+                logger.error(f"Error creating streaming config for v2 API: {e2}")
+                raise STTError(f"Cannot create streaming configuration: {str(e2)}")
         
         # Create an async queue for results
         result_queue = asyncio.Queue()
