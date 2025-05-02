@@ -3,13 +3,10 @@ Streaming implementation for Google Cloud Speech-to-Text.
 """
 import asyncio
 import logging
-import queue  # Added for the previous error
-import threading
 import time
-from typing import AsyncGenerator, Dict, List, Optional, Any, Callable, Awaitable  # AsyncGenerator was already here
+from typing import Optional, Dict, Any, Callable, Awaitable, List, AsyncIterator
 
 from .client import GoogleCloudSTT
-from .config import config
 from .exceptions import STTStreamingError
 
 logger = logging.getLogger(__name__)
@@ -39,41 +36,27 @@ class STTStreamer:
         self.running = False
         self.stream_task = None
         
-        # Buffer for audio chunks
-        self.buffer = bytearray()
-        self.buffer_lock = asyncio.Lock()
-        self.min_buffer_size = 1024  # Minimum size to process
-        
-        # Barge-in detection
-        self.speech_detected_event = asyncio.Event()
-        self.speech_detected_callback = None
-        
         # Create event to track when streaming is fully started
         self.streaming_started = asyncio.Event()
         self.streaming_started.clear()
         
-        # Track latest result
+        # Track latest result for barge-in detection
         self.latest_result = None
     
-    async def _audio_generator(self) -> AsyncGenerator[bytes, None]:
+    async def _audio_generator(self) -> AsyncIterator[bytes]:
         """
         Generate audio chunks from the queue for streaming to Google STT.
-        More robust implementation with better error handling.
         
         Yields:
             Audio chunks as they become available
         """
-        # This is important - yield an empty chunk to properly start the stream
-        # with Google Cloud STT
-        yield b''  # Empty chunk to start the stream
+        # Empty chunk to start the stream properly
+        yield b''
         
         while self.running:
             try:
-                # Get audio from queue with timeout
-                audio_chunk = await asyncio.wait_for(
-                    self.audio_queue.get(),
-                    timeout=5.0  # 5 second timeout
-                )
+                # Get audio from queue
+                audio_chunk = await self.audio_queue.get()
                 
                 # Check for end signal
                 if audio_chunk is None:
@@ -81,19 +64,15 @@ class STTStreamer:
                 
                 yield audio_chunk
                 self.audio_queue.task_done()
-            except asyncio.TimeoutError:
-                # No new audio received within timeout
-                if self.running:
-                    # Send an empty chunk to keep the stream alive
-                    yield b''
-                else:
-                    break
+            except asyncio.CancelledError:
+                break
             except Exception as e:
                 logger.error(f"Error in audio generator: {str(e)}")
                 if self.running:
-                    raise STTStreamingError(f"Audio streaming error: {str(e)}")
-    
-    
+                    # Continue in case of error
+                    continue
+                else:
+                    break
     
     async def process_audio_chunk(
         self, 
@@ -110,29 +89,19 @@ class STTStreamer:
         Returns:
             Transcription result or None for interim results
         """
-        if not self.running or not self.streaming_started.is_set():
+        if not self.running:
             logger.warning("Cannot process audio: streamer is not running")
             return None
         
-        async with self.buffer_lock:
-            # Add to buffer
-            self.buffer.extend(audio_chunk)
-            
-            # Process buffer if it's large enough
-            if len(self.buffer) >= self.min_buffer_size:
-                # Copy and clear buffer
-                chunk_to_process = bytes(self.buffer)
-                self.buffer = bytearray()
-                
-                # Add to queue
-                await self.audio_queue.put(chunk_to_process)
-                
-                # Return latest result if available
-                if hasattr(self, 'latest_result') and self.latest_result:
-                    # If callback is provided and we have a result, call it
-                    if callback and self.latest_result:
-                        await callback(self.latest_result)
-                    return self.latest_result
+        # Add to queue
+        await self.audio_queue.put(audio_chunk)
+        
+        # Return latest result if available
+        if self.latest_result:
+            # If callback is provided, call it
+            if callback and self.latest_result:
+                await callback(self.latest_result)
+            return self.latest_result
         
         return None
     
@@ -151,9 +120,6 @@ class STTStreamer:
             return
             
         self.running = True
-        self.speech_detected_event.clear()
-        self.speech_detected_callback = speech_detected_callback
-        self.buffer = bytearray()
         self.latest_result = None
         
         # Create audio generator
@@ -162,12 +128,12 @@ class STTStreamer:
         # Start streaming in a separate task
         self.stream_task = asyncio.create_task(self._stream_processor(audio_stream))
         
-        # Wait for streaming to fully start
+        # Wait for streaming to start
         self.streaming_started.set()
         
         logger.info("Started Google Cloud STT streaming session")
     
-    async def _stream_processor(self, audio_stream: AsyncGenerator[bytes, None]) -> None:
+    async def _stream_processor(self, audio_stream: AsyncIterator[bytes]) -> None:
         """
         Process the streaming recognition and handle results.
         
@@ -180,23 +146,10 @@ class STTStreamer:
                 # Store latest result
                 self.latest_result = result
                 
-                # Check for speech detection
-                if result.get("is_final", False) or (
-                    result.get("stability", 0) > 0.8 and 
-                    result.get("transcription", "") and 
-                    result.get("confidence", 0) > 0.7
-                ):
-                    # Set speech detected event
-                    self.speech_detected_event.set()
-                    
-                    # Call speech detected callback if provided
-                    if self.speech_detected_callback:
-                        await self.speech_detected_callback(True)
-                
                 # Log result
                 if result.get("is_final", False):
                     logger.info(f"Final transcription: {result.get('transcription', '')}")
-                elif self.speech_detected_event.is_set():
+                else:
                     logger.debug(f"Interim result: {result.get('transcription', '')}")
                 
         except Exception as e:
@@ -228,17 +181,10 @@ class STTStreamer:
                 logger.warning("Timeout waiting for stream task to complete")
                 if not self.stream_task.done():
                     self.stream_task.cancel()
-                    try:
-                        await self.stream_task
-                    except asyncio.CancelledError:
-                        pass
-            except Exception as e:
-                logger.error(f"Error waiting for stream task: {e}")
             
             self.stream_task = None
         
         # Clear events
-        self.speech_detected_event.clear()
         self.streaming_started.clear()
         
         # Return final result
@@ -247,7 +193,7 @@ class STTStreamer:
 
 class SpeechDetector:
     """
-    Enhanced speech and barge-in detection using Google Cloud STT results.
+    Speech and barge-in detection using Google Cloud STT results.
     """
     
     def __init__(

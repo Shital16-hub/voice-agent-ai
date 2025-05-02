@@ -2,100 +2,46 @@
 Configuration for Google Cloud Speech-to-Text.
 """
 import os
-from pydantic import Field
-from pydantic_settings import BaseSettings
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
-class STTConfig(BaseSettings):
-    """Configuration for Google Cloud STT."""
-    
-    # Google Cloud credentials
-    google_credentials_path: str = Field(
-        default=os.getenv("GOOGLE_APPLICATION_CREDENTIALS", ""),
-        description="Path to Google Cloud credentials JSON file"
-    )
-    
-    # STT settings
-    language_code: str = Field(
-        default="en-US",
-        description="Language code for recognition"
-    )
-    
-    sample_rate: int = Field(
-        default=8000,
-        description="Audio sample rate in Hz - 8kHz for telephony"
-    )
-    
-    model: str = Field(
-        default="phone_call",
-        description="Recognition model (phone_call, video, default, etc.)"
-    )
-    
-    use_enhanced: bool = Field(
-        default=True,
-        description="Whether to use enhanced model for better accuracy"
-    )
-    
-    enable_automatic_punctuation: bool = Field(
-        default=True,
-        description="Whether to add punctuation to transcriptions"
-    )
-    
-    # Speech contexts for better recognition
-    speech_contexts: list = Field(
-        default=["help", "price", "plan", "cost", "support", "agent", "stop", "repeat"],
-        description="Phrases to boost in recognition"
-    )
-    
-    speech_context_boost: float = Field(
-        default=10.0,
-        description="Boost factor for speech contexts (0.0 to 20.0)"
-    )
-    
-    # Barge-in settings
-    enable_barge_in: bool = Field(
-        default=True,
-        description="Whether to enable barge-in detection"
-    )
-    
-    barge_in_threshold: float = Field(
-        default=0.045,
-        description="Energy threshold for barge-in detection"
-    )
-    
-    barge_in_min_duration_ms: int = Field(
-        default=300,
-        description="Minimum duration of speech for barge-in"
-    )
-    
-    barge_in_cooldown_ms: int = Field(
-        default=1500,
-        description="Cooldown period after agent starts speaking"
-    )
-    
-    # Buffer settings
-    min_buffer_size: int = Field(
-        default=1600,
-        description="Minimum buffer size for processing (bytes)"
-    )
-    
-    max_buffer_size: int = Field(
-        default=8000,
-        description="Maximum buffer size before processing (bytes)"
-    )
-    
-    # Other settings
-    enable_profanity_filter: bool = Field(
-        default=False,
-        description="Whether to filter profanity"
-    )
-    
-    class Config:
-        env_prefix = "STT_"
-        case_sensitive = False
+# Google Cloud credentials
+GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
 
-# Create global config instance
-config = STTConfig()
+# STT settings
+LANGUAGE_CODE = os.getenv("STT_LANGUAGE_CODE", "en-US")
+SAMPLE_RATE = int(os.getenv("STT_SAMPLE_RATE", "8000"))  # 8kHz for telephony
+MODEL = os.getenv("STT_MODEL", "phone_call")
+USE_ENHANCED = os.getenv("STT_USE_ENHANCED", "True").lower() == "true"
+ENABLE_AUTOMATIC_PUNCTUATION = os.getenv("STT_ENABLE_PUNCTUATION", "True").lower() == "true"
+
+# Speech contexts for better recognition
+SPEECH_CONTEXTS = [
+    "help", "agent", "cost", "price", "service", 
+    "support", "information", "question", "connect"
+]
+SPEECH_CONTEXT_BOOST = float(os.getenv("STT_CONTEXT_BOOST", "10.0"))
+
+# Barge-in settings
+ENABLE_BARGE_IN = os.getenv("STT_ENABLE_BARGE_IN", "True").lower() == "true"
+BARGE_IN_THRESHOLD = float(os.getenv("STT_BARGE_IN_THRESHOLD", "0.045"))
+BARGE_IN_MIN_DURATION_MS = int(os.getenv("STT_BARGE_IN_MIN_DURATION", "300"))
+BARGE_IN_COOLDOWN_MS = int(os.getenv("STT_BARGE_IN_COOLDOWN", "1500"))
+
+# Create a config dictionary
+config = {
+    "google_credentials_path": GOOGLE_CREDENTIALS_PATH,
+    "language_code": LANGUAGE_CODE,
+    "sample_rate": SAMPLE_RATE,
+    "model": MODEL,
+    "use_enhanced": USE_ENHANCED,
+    "enable_automatic_punctuation": ENABLE_AUTOMATIC_PUNCTUATION,
+    "speech_contexts": SPEECH_CONTEXTS,
+    "speech_context_boost": SPEECH_CONTEXT_BOOST,
+    "enable_barge_in": ENABLE_BARGE_IN,
+    "barge_in_threshold": BARGE_IN_THRESHOLD,
+    "barge_in_min_duration_ms": BARGE_IN_MIN_DURATION_MS,
+    "barge_in_cooldown_ms": BARGE_IN_COOLDOWN_MS
+}

@@ -5,7 +5,8 @@ import logging
 import time
 import asyncio
 import re
-from typing import Optional, Dict, Any, Callable, Awaitable, List, Tuple, Union, AsyncIterator
+from typing import Optional, Dict, Any, Callable, Awaitable, List, Tuple, Union
+
 import numpy as np
 
 from speech_to_text.google_stt import GoogleCloudSTT, STTStreamer, SpeechDetector
@@ -31,7 +32,7 @@ class STTIntegration:
     def __init__(
         self,
         stt_client: Optional[GoogleCloudSTT] = None,
-        language: str = "en"
+        language: str = "en-US"
     ):
         """
         Initialize the STT integration.
@@ -52,7 +53,7 @@ class STTIntegration:
         self.non_speech_pattern = re.compile('|'.join(NON_SPEECH_PATTERNS))
         
         # Minimum word count for valid queries
-        self.min_words_for_valid_query = 3
+        self.min_words_for_valid_query = 2
     
     async def init(self, credentials_path: Optional[str] = None) -> None:
         """

@@ -73,6 +73,8 @@ class VoiceAIAgentPipeline:
         # Use STT integration's validation
         return self.stt_integration.is_valid_transcription(cleaned_text)
     
+
+    
     async def process_audio_file(
         self,
         audio_file_path: str,
