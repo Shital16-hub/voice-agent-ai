@@ -1,5 +1,5 @@
 """
-Exceptions for the Google Cloud Speech-to-Text integration.
+Exceptions for the Deepgram Speech-to-Text integration.
 """
 
 class STTError(Exception):
@@ -7,7 +7,7 @@ class STTError(Exception):
     pass
 
 class STTAPIError(STTError):
-    """Exception for Google Cloud API-related errors."""
+    """Exception for API-related errors."""
     pass
 
 class STTStreamingError(STTError):

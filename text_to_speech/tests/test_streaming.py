@@ -186,9 +186,7 @@ class RealTimeResponseHandler:
             # Process the buffer if we have a complete sentence or enough words
             if (any(c in self.buffer for c in ['.', '!', '?']) or 
                 self.buffer.count(' ') >= 5):
-                # Process the complete sentence or phrase
-                audio_data = await self.tts_streamer.tts_client.synthesize(self.buffer)
-                await self.audio_queue.put(audio_data)
+                await self.tts_streamer.add_text(self.buffer)
                 self.buffer = ""
     
     async def add_text(self, text: str) -> None:
@@ -206,17 +204,15 @@ class RealTimeResponseHandler:
                 self.buffer += ' '
             self.buffer += text
             
-            # Process the buffer directly
-            audio_data = await self.tts_streamer.tts_client.synthesize(self.buffer)
-            await self.audio_queue.put(audio_data)
+            # Process the buffer
+            await self.tts_streamer.add_text(self.buffer)
             self.buffer = ""
     
     async def flush(self) -> None:
         """Flush any remaining text in the buffer to the TTS stream."""
         async with self.buffer_lock:
             if self.buffer:
-                audio_data = await self.tts_streamer.tts_client.synthesize(self.buffer)
-                await self.audio_queue.put(audio_data)
+                await self.tts_streamer.add_text(self.buffer)
                 self.buffer = ""
     
     async def stop(self) -> None:

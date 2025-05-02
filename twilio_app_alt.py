@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Twilio application using WebSocket streaming with Google Cloud STT
-for improved speech recognition in phone calls.
+Enhanced Twilio application using WebSocket streaming with improved noise handling.
 """
 import os
 import sys
@@ -16,6 +15,7 @@ from flask import Flask, request, Response
 from simple_websocket import Server, ConnectionClosed
 from dotenv import load_dotenv
 from twilio.twiml.voice_response import VoiceResponse, Connect, Stream
+from twilio.rest import Client
 
 # Load environment variables
 load_dotenv()
@@ -25,17 +25,18 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from telephony.twilio_handler import TwilioHandler
 from telephony.websocket_handler import WebSocketHandler
-from telephony.config import (
-    HOST, PORT, DEBUG, LOG_LEVEL, LOG_FORMAT, 
-    GOOGLE_APPLICATION_CREDENTIALS,
-    STT_LANGUAGE_CODE, STT_MODEL, STT_USE_ENHANCED
-)
+from telephony.config import HOST, PORT, DEBUG, LOG_LEVEL, LOG_FORMAT
+from telephony.config import STT_INITIAL_PROMPT, STT_NO_CONTEXT, STT_TEMPERATURE, STT_PRESET
 from voice_ai_agent import VoiceAIAgent
 from integration.tts_integration import TTSIntegration
 from integration.pipeline import VoiceAIAgentPipeline
 
-# Configure logging
-logging.basicConfig(level=getattr(logging, LOG_LEVEL), format=LOG_FORMAT)
+# Get Twilio credentials from environment
+TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
+TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
+
+# Configure logging with more debug info
+logging.basicConfig(level=logging.DEBUG, format=LOG_FORMAT)
 logger = logging.getLogger(__name__)
 
 # Flask app setup
@@ -49,25 +50,32 @@ base_url = None
 # Dictionary to store event loops and state for each call
 call_event_loops = {}
 
-
 async def initialize_system():
-    """Initialize all system components with Google Cloud STT."""
+    """Initialize all system components with knowledge-base agnostic speech enhancements."""
     global twilio_handler, voice_ai_pipeline, base_url
     
-    logger.info("Initializing Voice AI Agent with Google Cloud STT...")
+    logger.info("Initializing Voice AI Agent with telephony speech enhancements...")
     
-    # Check if Google Cloud credentials are available
-    if not GOOGLE_APPLICATION_CREDENTIALS or not os.path.exists(GOOGLE_APPLICATION_CREDENTIALS):
-        raise ValueError(f"Google Cloud credentials not found at: {GOOGLE_APPLICATION_CREDENTIALS}")
+    # Define a generic telephony-optimized prompt that works with any knowledge base
+    telephony_prompt = (
+        "This is a telephone conversation with a customer. "
+        "The customer may ask questions about products, services, pricing, or features. "
+        "Transcribe exactly what is spoken, filtering out noise, static, and line interference. "
+        "Common terms in business conversations include: pricing, plan, cost, features, "
+        "monthly, subscription, support, upgrade, details, information."
+    )
     
-    # Initialize Voice AI Agent with Google Cloud STT
+    # Initialize Voice AI Agent with enhanced parameters that are knowledge-base agnostic
     agent = VoiceAIAgent(
         storage_dir='./storage',
         model_name='mistral:7b-instruct-v0.2-q4_0',
-        credentials_path=GOOGLE_APPLICATION_CREDENTIALS,
+        whisper_model_path='models/base.en',
         llm_temperature=0.7,
-        language=STT_LANGUAGE_CODE,
-        enable_debug=DEBUG
+        # Pass generic telephony-optimized parameters
+        whisper_initial_prompt=telephony_prompt,
+        whisper_temperature=0.0,  # Greedy decoding for more reliable transcription
+        whisper_no_context=True,  # Each utterance is independent
+        whisper_preset="default"
     )
     await agent.init()
     
@@ -95,20 +103,19 @@ async def initialize_system():
     twilio_handler = TwilioHandler(voice_ai_pipeline, base_url)
     await twilio_handler.start()
     
-    logger.info("System initialized successfully with Google Cloud STT")
-
+    logger.info("System initialized successfully with knowledge-base agnostic speech enhancements")
 
 @app.route('/', methods=['GET'])
 def index():
     """Simple test endpoint."""
-    return "Voice AI Agent is running with Google Cloud STT!"
-
+    return "Voice AI Agent is running with improved noise handling!"
 
 @app.route('/voice/incoming', methods=['POST'])
 def handle_incoming_call():
-    """Handle incoming voice calls using Google Cloud STT."""
+    """Handle incoming voice calls using WebSocket stream."""
     logger.info("Received incoming call request")
-    logger.debug(f"Request form data: {request.form}")
+    logger.info(f"Request headers: {request.headers}")
+    logger.info(f"Request form data: {request.form}")
     
     if not twilio_handler:
         logger.error("System not initialized")
@@ -119,17 +126,38 @@ def handle_incoming_call():
         return Response(fallback_twiml, mimetype='text/xml')
     
     # Get call parameters
-    call_sid = request.form.get('CallSid')
     from_number = request.form.get('From')
     to_number = request.form.get('To')
+    call_sid = request.form.get('CallSid')
     
     logger.info(f"Incoming call - From: {from_number}, To: {to_number}, CallSid: {call_sid}")
     
     try:
-        # Generate TwiML response using the Twilio handler
-        twiml_response = twilio_handler.handle_incoming_call(call_sid, from_number, to_number)
-        logger.info(f"Generated TwiML for WebSocket streaming")
-        return Response(twiml_response, mimetype='text/xml')
+        # Add call to manager
+        twilio_handler.call_manager.add_call(call_sid, from_number, to_number)
+        
+        # Create TwiML response
+        response = VoiceResponse()
+        
+        # Add initial greeting
+        response.say("Welcome to the Voice AI Agent. I'm here to help you.", voice='alice')
+        response.pause(length=1)
+        
+        # Use WebSocket streaming for real-time conversation
+        ws_url = f'{base_url.replace("https://", "wss://")}/ws/stream/{call_sid}'
+        logger.info(f"Setting up WebSocket stream at: {ws_url}")
+        
+        # Create the streaming connection
+        connect = Connect()
+        stream = Stream(url=ws_url)
+        connect.append(stream)
+        response.append(connect)
+        
+        # Add TwiML to keep connection alive if needed
+        response.say("The AI assistant is now listening. Please speak clearly.", voice='alice')
+        
+        logger.info(f"Generated TwiML for WebSocket streaming: {response}")
+        return Response(str(response), mimetype='text/xml')
     except Exception as e:
         logger.error(f"Error handling incoming call: {e}", exc_info=True)
         fallback_twiml = '''<?xml version="1.0" encoding="UTF-8"?>
@@ -138,12 +166,11 @@ def handle_incoming_call():
 </Response>'''
         return Response(fallback_twiml, mimetype='text/xml')
 
-
 @app.route('/voice/status', methods=['POST'])
 def handle_status_callback():
     """Handle call status callbacks."""
     logger.info("Received status callback")
-    logger.debug(f"Status data: {request.form}")
+    logger.info(f"Status data: {request.form}")
     
     if not twilio_handler:
         logger.error("System not initialized")
@@ -173,19 +200,15 @@ def handle_status_callback():
                     # Wait for thread to join with timeout
                     thread = loop_info['thread']
                     thread.join(timeout=1.0)
-                
-                try:
-                    # Remove from tracking with better error handling
-                    del call_event_loops[call_sid]
-                    logger.info(f"Cleaned up event loop resources for call {call_sid}")
-                except KeyError:
-                    logger.warning(f"Call {call_sid} already removed from tracking")
+                    
+                # Remove from tracking
+                del call_event_loops[call_sid]
+                logger.info(f"Cleaned up event loop resources for call {call_sid}")
                 
         return Response('', status=204)
     except Exception as e:
         logger.error(f"Error handling status callback: {e}", exc_info=True)
         return Response('', status=204)
-
 
 def run_event_loop_in_thread(loop, ws_handler, ws, call_sid, terminate_flag):
     """Run event loop in a separate thread."""
@@ -223,10 +246,9 @@ def run_event_loop_in_thread(loop, ws_handler, ws, call_sid, terminate_flag):
         if call_sid in call_event_loops:
             del call_event_loops[call_sid]
 
-
 @app.route('/ws/stream/<call_sid>', websocket=True)
 def handle_media_stream(call_sid):
-    """Handle WebSocket media stream with Google Cloud STT."""
+    """Handle WebSocket media stream with improved noise handling."""
     logger.info(f"WebSocket connection attempt for call {call_sid}")
     
     if not twilio_handler or not voice_ai_pipeline:
@@ -238,7 +260,7 @@ def handle_media_stream(call_sid):
         ws = Server.accept(request.environ)
         logger.info(f"WebSocket connection established for call {call_sid}")
         
-        # Create WebSocket handler with Google Cloud STT
+        # Create WebSocket handler with noise handling optimizations
         ws_handler = WebSocketHandler(call_sid, voice_ai_pipeline)
         
         # Create an event loop for this connection
@@ -319,6 +341,75 @@ def handle_media_stream(call_sid):
         # Return empty response
         return ""
 
+@app.route('/ws-test')
+def ws_test():
+    """WebSocket connection test page."""
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>WebSocket Test</title>
+        <script>
+            function startTest() {
+                const wsUrl = document.getElementById('wsUrl').value;
+                const output = document.getElementById('output');
+                
+                output.innerHTML += `<p>Connecting to ${wsUrl}...</p>`;
+                
+                const ws = new WebSocket(wsUrl);
+                
+                ws.onopen = () => {
+                    output.innerHTML += '<p style="color:green">Connection opened!</p>';
+                    ws.send(JSON.stringify({event: 'test', message: 'Hello WebSocket'}));
+                };
+                
+                ws.onmessage = (event) => {
+                    output.innerHTML += `<p>Received: ${event.data}</p>`;
+                };
+                
+                ws.onerror = (error) => {
+                    output.innerHTML += `<p style="color:red">Error: ${error}</p>`;
+                };
+                
+                ws.onclose = () => {
+                    output.innerHTML += '<p>Connection closed</p>';
+                };
+            }
+        </script>
+    </head>
+    <body>
+        <h1>WebSocket Connection Test</h1>
+        <input id="wsUrl" type="text" value="wss://your-runpod-url.proxy.runpod.net/ws/test" style="width:400px" />
+        <button onclick="startTest()">Test Connection</button>
+        <div id="output"></div>
+    </body>
+    </html>
+    """
+
+@app.route('/ws/test', websocket=True)
+def ws_test_endpoint():
+    """WebSocket test endpoint."""
+    try:
+        ws = Server.accept(request.environ)
+        logger.info("WebSocket test connection established")
+        
+        ws.send(json.dumps({"status": "connected", "message": "WebSocket test successful!"}))
+        
+        try:
+            while True:
+                message = ws.receive(timeout=10)
+                if message is None:
+                    break
+                logger.info(f"Received WebSocket test message: {message}")
+                ws.send(json.dumps({"status": "echo", "message": message}))
+        except Exception as e:
+            logger.error(f"Error in WebSocket test: {e}")
+        finally:
+            ws.close()
+    except Exception as e:
+        logger.error(f"Error establishing WebSocket test connection: {e}")
+    
+    return ""
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -330,7 +421,6 @@ def health_check():
     
     return Response(json.dumps({"status": "healthy"}), 
                    mimetype='application/json')
-
 
 if __name__ == '__main__':
     # Initialize the system

@@ -69,7 +69,7 @@ class AudioProcessor:
         Returns:
             WAV audio data as bytes
         """
-        # If we receive MP3 from Google Cloud, we need to convert it
+        # If we receive MP3 from Deepgram, we need to convert it
         # This requires ffmpeg to be installed
         try:
             import subprocess

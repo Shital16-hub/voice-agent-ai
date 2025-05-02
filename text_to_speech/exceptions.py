@@ -1,5 +1,5 @@
 """
-Exceptions for the text-to-speech module with Google Cloud TTS.
+Exceptions for the text-to-speech module.
 """
 
 class TTSError(Exception):
@@ -7,7 +7,7 @@ class TTSError(Exception):
     pass
 
 class TTSAPIError(TTSError):
-    """Exception for Google Cloud API-related errors."""
+    """Exception for API-related errors."""
     pass
 
 class TTSStreamingError(TTSError):

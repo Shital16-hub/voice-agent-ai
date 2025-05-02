@@ -1,0 +1,22 @@
+# Core dependencies
+aiohttp
+python-dotenv
+pydantic
+pydantic-settings
+asyncio
+
+# LangGraph integration
+langgraph
+
+# Audio processing
+numpy
+
+# Testing
+pytest
+pytest-asyncio
+
+# Logging and utilities
+logging
+
+# Environment variable management
+python-dotenv
