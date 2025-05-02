@@ -1,5 +1,5 @@
 """
-Updated Twilio handler for voice calls with improved barge-in detection.
+Twilio handler for voice calls with Google Cloud STT integration.
 """
 import logging
 from typing import Optional, Dict, Any
@@ -13,13 +13,12 @@ from telephony.config import (
     MAX_CALL_DURATION
 )
 from telephony.call_manager import CallManager
-from telephony.websocket_handler import WebSocketHandler
 
 logger = logging.getLogger(__name__)
 
 class TwilioHandler:
     """
-    Handles Twilio voice call operations with improved speech handling.
+    Handles Twilio voice call operations with Google Cloud STT integration.
     """
     
     def __init__(self, pipeline, base_url: str):
@@ -45,14 +44,14 @@ class TwilioHandler:
         await self.call_manager.stop()
         logger.info("Twilio handler stopped")
     
-    def handle_incoming_call(self, from_number: str, to_number: str, call_sid: str) -> str:
+    def handle_incoming_call(self, call_sid: str, from_number: str, to_number: str) -> str:
         """
-        Handle incoming voice call with WebSocket streaming and improved barge-in.
+        Handle incoming voice call with WebSocket streaming.
         
         Args:
+            call_sid: Twilio call SID
             from_number: Caller phone number
             to_number: Called phone number
-            call_sid: Twilio call SID
             
         Returns:
             TwiML response as string
@@ -66,8 +65,7 @@ class TwilioHandler:
         response = VoiceResponse()
         
         # Add initial greeting - shorter and clearer
-        response.say("Welcome to the Voice Assistant. I'm here to help.", voice='alice')
-        response.pause(length=0.5)  # Shorter pause
+        response.say("Hello, I'm your voice assistant. How can I help you today?", voice='alice')
         
         try:
             # Define WebSocket URL for streaming
@@ -80,12 +78,9 @@ class TwilioHandler:
             connect.append(stream)
             response.append(connect)
             
-            # Add simple instruction to user
-            response.say("You can start speaking now.", voice='alice')
-            
             return str(response)
         except Exception as e:
-            logger.error(f"Error setting up streaming: {e}", exc_info=True)
+            logger.error(f"Error setting up streaming: {e}")
             
             # Fallback to basic TwiML if streaming setup fails
             response = VoiceResponse()
@@ -136,7 +131,6 @@ class TwilioHandler:
         twiml = f"""
         <Response>
             <Say voice="alice">Hello! This is a call from the AI Voice Assistant.</Say>
-            <Pause length="0.5"/>
             <Connect>
                 <Stream url="{self.base_url.replace('https://', 'wss://')}/ws/stream/outbound" />
             </Connect>
@@ -167,7 +161,7 @@ class TwilioHandler:
                 "direction": call.direction
             }
         except Exception as e:
-            logger.error(f"Error placing outbound call: {e}", exc_info=True)
+            logger.error(f"Error placing outbound call: {e}")
             return {
                 "error": str(e),
                 "success": False

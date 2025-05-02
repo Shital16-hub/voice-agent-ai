@@ -1,7 +1,6 @@
 """
 Audio utilities for the speech-to-text module.
 """
-
 import numpy as np
 import io
 import wave
@@ -75,31 +74,18 @@ def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarra
         return audio
     
     try:
-        import librosa
-        return librosa.resample(
-            y=audio, 
-            orig_sr=orig_sr, 
-            target_sr=target_sr
-        )
+        from scipy import signal
+        num_samples = int(len(audio) * target_sr / orig_sr)
+        resampled = signal.resample(audio, num_samples)
+        return resampled
     except ImportError:
-        logger.warning(
-            "librosa not installed, using scipy for resampling. "
-            "For better quality, install librosa."
+        raise ImportError(
+            "scipy is not installed. Please install scipy for audio resampling."
         )
-        try:
-            from scipy import signal
-            num_samples = int(len(audio) * target_sr / orig_sr)
-            resampled = signal.resample(audio, num_samples)
-            return resampled
-        except ImportError:
-            raise ImportError(
-                "Neither librosa nor scipy is installed. "
-                "Please install one of them for audio resampling."
-            )
 
 def load_audio_file(
     file_path: str,
-    target_sr: int = 16000,
+    target_sr: int = 8000,
     convert_to_mono: bool = True,
     normalize: bool = True
 ) -> Tuple[np.ndarray, int]:
@@ -116,33 +102,44 @@ def load_audio_file(
         Tuple of (audio_data, sample_rate)
     """
     try:
-        import soundfile as sf
-        audio, orig_sr = sf.read(file_path)
-    except ImportError:
-        logger.warning(
-            "soundfile not installed, using scipy.io.wavfile. "
-            "For better format support, install soundfile."
-        )
-        try:
-            from scipy.io import wavfile
-            orig_sr, audio = wavfile.read(file_path)
-        except ImportError:
-            raise ImportError(
-                "Neither soundfile nor scipy is installed. "
-                "Please install one of them for audio loading."
-            )
+        # Read WAV file
+        with wave.open(file_path, 'rb') as wav_file:
+            channels = wav_file.getnchannels()
+            sample_width = wav_file.getsampwidth()
+            orig_sr = wav_file.getframerate()
+            frames = wav_file.readframes(wav_file.getnframes())
+            
+            # Convert to numpy array
+            if sample_width == 1:
+                audio = np.frombuffer(frames, dtype=np.uint8)
+                audio = audio.astype(np.float32) / 128.0 - 1.0
+            elif sample_width == 2:
+                audio = np.frombuffer(frames, dtype=np.int16)
+                audio = audio.astype(np.float32) / 32768.0
+            elif sample_width == 4:
+                audio = np.frombuffer(frames, dtype=np.int32)
+                audio = audio.astype(np.float32) / 2147483648.0
+            else:
+                raise ValueError(f"Unsupported sample width: {sample_width}")
+            
+            # Reshape for multi-channel audio
+            if channels > 1:
+                audio = audio.reshape(-1, channels)
+    except (wave.Error, IOError, ValueError) as e:
+        logger.error(f"Error loading WAV file: {e}")
+        raise
     
     # Convert to mono if needed
-    if convert_to_mono and len(audio.shape) > 1 and audio.shape[1] > 1:
+    if convert_to_mono and channels > 1:
         audio = np.mean(audio, axis=1)
-    
-    # Normalize if needed
-    if normalize:
-        audio = normalize_audio(audio)
     
     # Resample if needed
     if orig_sr != target_sr:
         audio = resample_audio(audio, orig_sr, target_sr)
+    
+    # Normalize if needed
+    if normalize:
+        audio = normalize_audio(audio)
     
     return audio, target_sr
 
@@ -150,7 +147,7 @@ def audio_bytes_to_array(
     audio_bytes: bytes,
     sample_width: int = 2,
     channels: int = 1,
-    sample_rate: int = 16000,
+    sample_rate: int = 8000,
     normalize: bool = True
 ) -> Tuple[np.ndarray, int]:
     """
@@ -203,32 +200,34 @@ def audio_bytes_to_array(
     
     return audio, sample_rate
 
-def create_sliding_windows(
-    audio: np.ndarray,
-    window_size: int,
-    hop_size: int
-) -> np.ndarray:
+def mulaw_to_linear(mulaw_data: bytes) -> bytes:
     """
-    Create sliding windows from audio data.
+    Convert μ-law audio to 16-bit PCM.
     
     Args:
-        audio: Input audio array (1D)
-        window_size: Window size in samples
-        hop_size: Hop size in samples
+        mulaw_data: μ-law audio data
         
     Returns:
-        Array of windows
+        16-bit PCM audio data
     """
-    # Calculate number of windows
-    num_windows = 1 + (len(audio) - window_size) // hop_size
+    try:
+        import audioop
+        return audioop.ulaw2lin(mulaw_data, 2)
+    except ImportError:
+        raise ImportError("audioop module is required for μ-law conversion")
+
+def linear_to_mulaw(linear_data: bytes) -> bytes:
+    """
+    Convert 16-bit PCM to μ-law audio.
     
-    # Create output array
-    windows = np.zeros((num_windows, window_size), dtype=audio.dtype)
-    
-    # Fill windows
-    for i in range(num_windows):
-        start = i * hop_size
-        end = start + window_size
-        windows[i] = audio[start:end]
-    
-    return windows
+    Args:
+        linear_data: 16-bit PCM audio data
+        
+    Returns:
+        μ-law audio data
+    """
+    try:
+        import audioop
+        return audioop.lin2ulaw(linear_data, 2)
+    except ImportError:
+        raise ImportError("audioop module is required for μ-law conversion")

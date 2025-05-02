@@ -6,8 +6,8 @@ This module provides real-time streaming speech recognition using Deepgram's API
 
 import logging
 from speech_to_text.deepgram_stt import (
-    DeepgramSTT, 
-    DeepgramStreamingSTT,
+     
+    
     StreamingTranscriptionResult,
     TranscriptionResult
 )
@@ -22,8 +22,8 @@ logging.basicConfig(
 )
 
 __all__ = [
-    "DeepgramSTT",
-    "DeepgramStreamingSTT", 
+    
+     
     "StreamingTranscriptionResult",
     "TranscriptionResult",
     "STTIntegration",
