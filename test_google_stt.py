@@ -18,7 +18,7 @@ import io
 from pathlib import Path
 
 # Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from speech_to_text.google_stt import GoogleCloudSTT, STTStreamer
 from speech_to_text.utils.audio_utils import load_audio_file
@@ -112,7 +112,7 @@ async def test_transcribe(credentials_path, audio_path):
 
     # Initialize client
     try:
-        # Get audio info first
+        # Get audio info first - important to detect sample rate
         audio_info = get_audio_info(audio_path)
         sample_rate = audio_info["sample_rate"] if audio_info else None
         
@@ -122,7 +122,7 @@ async def test_transcribe(credentials_path, audio_path):
             language_code="en-US",
             model="phone_call",
             use_enhanced=True,
-            sample_rate=sample_rate  # Use detected sample rate
+            # Don't set sample_rate here - let it be detected from the audio file
         )
         
         # Load audio file
@@ -149,15 +149,15 @@ async def test_streaming(credentials_path, audio_path):
     try:
         # Get audio info first
         audio_info = get_audio_info(audio_path)
-        sample_rate = audio_info["sample_rate"] if audio_info else 8000
+        sample_rate = audio_info["sample_rate"] if audio_info else None
         
-        # Initialize client with the correct sample rate
+        # Initialize client with the detected sample rate
         stt_client = GoogleCloudSTT(
             credentials_path=credentials_path,
             language_code="en-US",
             model="phone_call",
             use_enhanced=True,
-            sample_rate=sample_rate  # Use detected sample rate
+            # Let sample rate be detected from the stream
         )
         
         # Create streamer
@@ -167,28 +167,32 @@ async def test_streaming(credentials_path, audio_path):
         await streamer.start_streaming()
         
         # Load audio file
-        audio, _ = load_audio_file(audio_path, target_sr=sample_rate)
-        
-        # Convert to bytes (16-bit PCM)
-        import numpy as np
-        audio_bytes = (audio * 32767).astype(np.int16).tobytes()
+        with open(audio_path, "rb") as f:
+            audio_data = f.read()
         
         # Process in chunks
         chunk_size = 1600  # 100ms at 16kHz, adjust for other sample rates
-        chunk_size = chunk_size * sample_rate // 16000  # Scale for actual sample rate
+        if sample_rate:
+            chunk_size = chunk_size * sample_rate // 16000  # Scale for actual sample rate
+        
         results = []
         
-        for i in range(0, len(audio_bytes), chunk_size):
-            chunk = audio_bytes[i:i+chunk_size]
+        # Send chunks to streamer
+        for i in range(0, len(audio_data), chunk_size):
+            chunk = audio_data[i:i+chunk_size]
             result = await streamer.process_audio_chunk(chunk)
             if result:
                 logger.info(f"Chunk {i//chunk_size}: {result.get('transcription', '')}")
                 results.append(result)
+            
+            # Brief pause to simulate real-time streaming
+            await asyncio.sleep(0.01)
         
-        # Stop streaming
+        # Stop streaming and get final result
         final_result = await streamer.stop_streaming()
         if final_result:
             logger.info(f"Final result: {final_result.get('transcription', '')}")
+            results.append(final_result)
         
         return len(results) > 0
     except Exception as e:

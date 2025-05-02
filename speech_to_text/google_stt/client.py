@@ -7,6 +7,7 @@ import asyncio
 import json
 from typing import Dict, List, Optional, Any, AsyncGenerator, Union
 import io
+import wave
 
 from google.cloud import speech
 from google.oauth2 import service_account
@@ -90,25 +91,37 @@ class GoogleCloudSTT:
         # Use provided sample rate or default
         sample_rate = audio_sample_rate or self.sample_rate
         
-        # Updated for v2.x of the API - uses direct enum values instead of importing enums
+        # Create configuration parameters
         config_params = {
             "language_code": self.language_code,
-            "sample_rate_hertz": sample_rate,
-            "encoding": speech.RecognitionConfig.AudioEncoding.LINEAR16,
-            "model": self.model,
-            "use_enhanced": self.use_enhanced,
             "enable_automatic_punctuation": self.enable_automatic_punctuation,
         }
         
+        # Add sample rate if provided
+        if sample_rate:
+            config_params["sample_rate_hertz"] = sample_rate
+            
+        # Add encoding
+        config_params["encoding"] = speech.RecognitionConfig.AudioEncoding.LINEAR16
+        
+        # Add model if specified
+        if self.model:
+            config_params["model"] = self.model
+            
+        # Add use_enhanced if specified
+        if self.use_enhanced:
+            config_params["use_enhanced"] = self.use_enhanced
+            
         # Add telephony-specific settings
         if self.model == "phone_call":
-            # Add phone call-specific settings - updated for v2.x
-            config_params["metadata"] = speech.RecognitionMetadata(
+            # Add phone call-specific settings
+            metadata = speech.RecognitionMetadata(
                 interaction_type=speech.RecognitionMetadata.InteractionType.PHONE_CALL,
                 microphone_distance=speech.RecognitionMetadata.MicrophoneDistance.NEARFIELD,
                 original_media_type=speech.RecognitionMetadata.OriginalMediaType.AUDIO,
                 recording_device_type=speech.RecognitionMetadata.RecordingDeviceType.PHONE_LINE,
             )
+            config_params["metadata"] = metadata
         
         # Add speech adaptation for better recognition of keywords
         if hasattr(config, 'speech_contexts') and config.speech_contexts:
@@ -157,7 +170,6 @@ class GoogleCloudSTT:
         if len(audio_data) > 44 and audio_data[:4] == b'RIFF' and audio_data[8:12] == b'WAVE':
             try:
                 with io.BytesIO(audio_data) as wav_io:
-                    import wave
                     with wave.open(wav_io, 'rb') as wav_file:
                         sample_rate = wav_file.getframerate()
                         logger.info(f"Detected WAV sample rate: {sample_rate} Hz")
@@ -245,123 +257,163 @@ class GoogleCloudSTT:
         Yields:
             Transcription results as they become available
         """
-        # Set up the streaming config
-        config_params = self._get_recognition_config(streaming=True)
-        recognition_config = speech.RecognitionConfig(**config_params)
+        # Buffer for first chunk to detect sample rate
+        first_chunk = None
+        audio_chunks = []
         
-        # FIXED: For v2.32.0, we need to use a different approach for streaming features
-        # Check if the API version supports StreamingFeatures class
-        try:
-            # Try to directly create the streaming config with interim_results
-            # This works for older versions (v1.x)
-            streaming_config = speech.StreamingRecognitionConfig(
-                config=recognition_config,
-                interim_results=True
-            )
-        except (TypeError, AttributeError) as e:
-            logger.warning(f"Older API structure not supported: {e}")
-            try:
-                # For v2.x: Create the structure that supports the v2 API
-                streaming_config = speech.StreamingRecognitionConfig(
-                    config=recognition_config,
-                )
-                # Add streaming features dictionary directly
-                streaming_config._pb.streaming_features.interim_results = True
-            except Exception as e2:
-                logger.error(f"Error creating streaming config for v2 API: {e2}")
-                raise STTError(f"Cannot create streaming configuration: {str(e2)}")
-        
-        # Create an async queue for results
-        result_queue = asyncio.Queue()
-        
-        # Function to run in a separate thread
-        def process_stream():
-            requests = []
+        # Gather the first few chunks to detect sample rate if WAV
+        async for chunk in audio_generator:
+            if first_chunk is None:
+                first_chunk = chunk
+            audio_chunks.append(chunk)
             
-            # First request must contain config but no audio
-            requests.append(speech.StreamingRecognizeRequest(
+            # Break after collecting some chunks
+            if len(audio_chunks) >= 5:  # Collect 5 chunks max for initialization
+                break
+        
+        # Detect sample rate from first chunk if it's WAV
+        detected_sample_rate = None
+        if first_chunk and len(first_chunk) > 44:
+            if first_chunk[:4] == b'RIFF' and first_chunk[8:12] == b'WAVE':
+                try:
+                    with io.BytesIO(first_chunk) as wav_io:
+                        with wave.open(wav_io, 'rb') as wav_file:
+                            detected_sample_rate = wav_file.getframerate()
+                            logger.info(f"Detected sample rate from first chunk: {detected_sample_rate} Hz")
+                except Exception as e:
+                    logger.warning(f"Error detecting sample rate from first chunk: {e}")
+        
+        # Get recognition config
+        config_params = self._get_recognition_config(
+            streaming=True, 
+            audio_sample_rate=detected_sample_rate
+        )
+        
+        # Create streaming config
+        streaming_config = speech.StreamingRecognitionConfig(
+            config=speech.RecognitionConfig(**config_params),
+            interim_results=True
+        )
+        
+        # Create a thread-safe queue for passing audio chunks
+        audio_queue = queue.Queue()
+        
+        # Add already collected chunks to the queue
+        for chunk in audio_chunks:
+            audio_queue.put(chunk)
+        
+        # Create a thread for collecting more audio chunks
+        def audio_collector():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            async def collect_audio():
+                nonlocal audio_generator
+                try:
+                    async for chunk in audio_generator:
+                        audio_queue.put(chunk)
+                    # Signal end of stream
+                    audio_queue.put(None)
+                except Exception as e:
+                    logger.error(f"Error collecting audio: {e}")
+                    audio_queue.put(None)  # Signal end on error
+            
+            loop.run_until_complete(collect_audio())
+        
+        # Start audio collection thread
+        collector_thread = threading.Thread(target=audio_collector)
+        collector_thread.daemon = True
+        collector_thread.start()
+        
+        # Create generator for audio requests
+        def request_generator():
+            # First request must contain the config
+            yield speech.StreamingRecognizeRequest(
                 streaming_config=streaming_config
-            ))
+            )
             
-            # Create generator for audio data
-            def audio_request_generator():
-                # Yield the config request first
-                yield requests[0]
-                
-                # Then yield audio data requests
-                while True:
-                    try:
-                        audio_chunk = audio_chunks_queue.get(block=True, timeout=10)
-                        if audio_chunk is None:  # End signal
-                            break
-                        
-                        yield speech.StreamingRecognizeRequest(
-                            audio_content=audio_chunk
-                        )
-                    except Exception as e:
-                        logger.error(f"Error in audio request generator: {e}")
-                        break
-            
-            try:
-                # Start streaming recognition
-                responses = self.client.streaming_recognize(
-                    requests=audio_request_generator()
-                )
-                
-                # Process responses
-                for response in responses:
-                    # Put response in queue for async processing
-                    asyncio.run_coroutine_threadsafe(
-                        result_queue.put(response),
-                        asyncio.get_event_loop()
-                    )
-            except Exception as e:
-                logger.error(f"Error in streaming recognition: {e}")
-                # Put None to signal error
-                asyncio.run_coroutine_threadsafe(
-                    result_queue.put(None),
-                    asyncio.get_event_loop()
-                )
-        
-        # Create queue for audio chunks
-        audio_chunks_queue = asyncio.Queue()
-        
-        # Start processing thread
-        import threading
-        process_thread = threading.Thread(target=process_stream)
-        process_thread.daemon = True
-        process_thread.start()
-        
-        try:
-            # Gather audio chunks
-            async for audio_chunk in audio_generator:
-                await audio_chunks_queue.put(audio_chunk)
-            
-            # Signal end of audio
-            await audio_chunks_queue.put(None)
-            
-            # Process results
+            # Subsequent requests contain audio data
             while True:
                 try:
-                    response = await asyncio.wait_for(result_queue.get(), timeout=10)
-                    if response is None:  # Error signal
+                    chunk = audio_queue.get(block=True, timeout=10)
+                    if chunk is None:  # End signal
                         break
                     
-                    # Process streaming response
-                    for result in response.results:
-                        yield {
-                            "transcription": result.alternatives[0].transcript if result.alternatives else "",
-                            "confidence": result.alternatives[0].confidence if result.alternatives else 0.0,
-                            "stability": result.stability if hasattr(result, 'stability') else 1.0,
-                            "is_final": result.is_final
-                        }
-                except asyncio.TimeoutError:
-                    logger.warning("Timeout waiting for transcription results")
+                    yield speech.StreamingRecognizeRequest(audio_content=chunk)
+                    audio_queue.task_done()
+                except queue.Empty:
+                    # Timeout waiting for audio
+                    logger.warning("Timeout waiting for audio chunk")
                     break
                 except Exception as e:
-                    logger.error(f"Error processing transcription result: {e}")
+                    logger.error(f"Error in request generator: {e}")
                     break
+        
+        # Create a queue for passing recognition results back to the async context
+        result_queue = asyncio.Queue()
+        
+        # Function to process responses in a separate thread
+        def response_processor():
+            try:
+                # Start streaming recognition
+                responses = self.client.streaming_recognize(request_generator())
+                
+                # Process each response
+                for response in responses:
+                    # Skip empty responses
+                    if not response.results:
+                        continue
+                    
+                    # Process each result
+                    for result in response.results:
+                        if not result.alternatives:
+                            continue
+                        
+                        # Get best alternative
+                        alternative = result.alternatives[0]
+                        
+                        # Create result dict
+                        result_dict = {
+                            "transcription": alternative.transcript,
+                            "confidence": alternative.confidence if hasattr(alternative, "confidence") else 0.0,
+                            "stability": result.stability if hasattr(result, "stability") else 1.0,
+                            "is_final": result.is_final
+                        }
+                        
+                        # Use asyncio.run to put the result in the queue from this thread
+                        asyncio.run(result_queue.put(result_dict))
+                
+                # Signal end of results
+                asyncio.run(result_queue.put(None))
+                
+            except Exception as e:
+                logger.error(f"Error in response processor: {e}")
+                # Signal error
+                asyncio.run(result_queue.put({"error": str(e)}))
+                asyncio.run(result_queue.put(None))
+        
+        # Start response processor thread
+        processor_thread = threading.Thread(target=response_processor)
+        processor_thread.daemon = True
+        processor_thread.start()
+        
+        try:
+            # Yield results as they become available
+            while True:
+                result = await result_queue.get()
+                
+                if result is None:  # End signal
+                    break
+                    
+                # Check for error
+                if "error" in result:
+                    logger.error(f"Error in streaming recognition: {result['error']}")
+                    break
+                    
+                yield result
+                result_queue.task_done()
+                
         finally:
-            # Clean up
-            if process_thread.is_alive():
-                process_thread.join(timeout=2)
+            # Wait for threads to complete with timeout
+            collector_thread.join(timeout=2)
+            processor_thread.join(timeout=2)

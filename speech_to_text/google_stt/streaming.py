@@ -5,6 +5,7 @@ import asyncio
 import logging
 import queue
 import threading
+import time
 from typing import AsyncGenerator, Dict, List, Optional, Any, Callable, Awaitable
 
 from .client import GoogleCloudSTT
@@ -61,6 +62,8 @@ class STTStreamer:
         Yields:
             Audio chunks as they become available
         """
+        # This is important - yield an empty chunk to properly start the stream
+        # with Google Cloud STT
         yield b''  # Empty chunk to start the stream
         
         while self.running:
@@ -102,10 +105,11 @@ class STTStreamer:
             callback: Optional callback for results
             
         Returns:
-            The latest transcription result, if available
+            Transcription result or None for interim results
         """
-        if not self.running:
-            raise STTStreamingError("Cannot process audio: streamer is not running")
+        if not self.running or not self.streaming_started.is_set():
+            logger.warning("Cannot process audio: streamer is not running")
+            return None
         
         async with self.buffer_lock:
             # Add to buffer
@@ -121,7 +125,10 @@ class STTStreamer:
                 await self.audio_queue.put(chunk_to_process)
                 
                 # Return latest result if available
-                if hasattr(self, 'latest_result'):
+                if hasattr(self, 'latest_result') and self.latest_result:
+                    # If callback is provided and we have a result, call it
+                    if callback and self.latest_result:
+                        await callback(self.latest_result)
                     return self.latest_result
         
         return None
@@ -137,6 +144,7 @@ class STTStreamer:
             speech_detected_callback: Optional callback when speech is detected
         """
         if self.running:
+            logger.info("Streaming already started")
             return
             
         self.running = True
@@ -215,6 +223,12 @@ class STTStreamer:
                 await asyncio.wait_for(self.stream_task, timeout=5.0)
             except asyncio.TimeoutError:
                 logger.warning("Timeout waiting for stream task to complete")
+                if not self.stream_task.done():
+                    self.stream_task.cancel()
+                    try:
+                        await self.stream_task
+                    except asyncio.CancelledError:
+                        pass
             except Exception as e:
                 logger.error(f"Error waiting for stream task: {e}")
             
@@ -310,7 +324,6 @@ class SpeechDetector:
         Returns:
             True if speech detected
         """
-        import time
         current_time = time.time() * 1000  # Convert to ms
         
         # Check energy level
@@ -364,7 +377,6 @@ class SpeechDetector:
         if not self.agent_speaking:
             return False
             
-        import time
         current_time = time.time() * 1000  # Convert to ms
         
         # Check cooldown period
@@ -409,8 +421,6 @@ class SpeechDetector:
         Args:
             is_speaking: Whether the agent is speaking
         """
-        import time
-        
         # Only update if state changes
         if is_speaking != self.agent_speaking:
             self.agent_speaking = is_speaking
