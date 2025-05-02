@@ -3,10 +3,10 @@ Streaming implementation for Google Cloud Speech-to-Text.
 """
 import asyncio
 import logging
-import queue  # Add the missing import
-import threading  # Add threading module import
+import queue  # Added for the previous error
+import threading
 import time
-from typing import AsyncGenerator, Dict, List, Optional, Any, Callable, Awaitable
+from typing import AsyncGenerator, Dict, List, Optional, Any, Callable, Awaitable  # AsyncGenerator was already here
 
 from .client import GoogleCloudSTT
 from .config import config
@@ -56,9 +56,9 @@ class STTStreamer:
         self.latest_result = None
     
     async def _audio_generator(self) -> AsyncGenerator[bytes, None]:
-        
         """
         Generate audio chunks from the queue for streaming to Google STT.
+        More robust implementation with better error handling.
         
         Yields:
             Audio chunks as they become available
@@ -93,7 +93,7 @@ class STTStreamer:
                 if self.running:
                     raise STTStreamingError(f"Audio streaming error: {str(e)}")
     
-    # [rest of the class implementation remains the same]
+    
     
     async def process_audio_chunk(
         self, 

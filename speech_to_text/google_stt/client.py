@@ -2,12 +2,17 @@
 Google Cloud Speech-to-Text client for Voice AI Agent.
 """
 import os
+import re
 import logging
+import time
 import asyncio
-import json
-from typing import Dict, List, Optional, Any, AsyncGenerator, Union
-import io
-import wave
+import queue  
+import io  
+import threading  
+from typing import Optional, Dict, Any, Callable, Awaitable, List, Tuple, Union, AsyncIterator, AsyncGenerator  # Added AsyncGenerator
+
+import struct
+from scipy import signal
 
 from google.cloud import speech
 from google.oauth2 import service_account

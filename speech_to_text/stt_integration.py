@@ -10,7 +10,7 @@ import time
 import asyncio
 import re
 import numpy as np
-from typing import Optional, Dict, Any, Callable, Awaitable, List, Tuple, Union, AsyncIterator
+from typing import Optional, Dict, Any, Callable, Awaitable, List, Tuple, Union, AsyncIterator, AsyncGenerator  # Added AsyncGenerator
 from scipy import signal
 from collections import deque
 
