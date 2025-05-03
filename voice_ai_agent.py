@@ -154,15 +154,27 @@ class VoiceAIAgent:
         else:
             logger.warning("GOOGLE_APPLICATION_CREDENTIALS not specified, using default credentials")
         
-        # Initialize speech recognizer with Google Cloud Speech
-        self.speech_recognizer = GoogleCloudStreamingSTT(
-            credentials_path=self.credentials_path,
-            language=self.stt_language,
-            sample_rate=16000,
-            interim_results=True,
-            model="phone_call",
-            enhanced=True
-        )
+        try:
+            # Initialize speech recognizer with Google Cloud Speech
+            logger.info("Initializing Google Cloud Speech recognizer")
+            self.speech_recognizer = GoogleCloudStreamingSTT(
+                credentials_path=self.credentials_path,
+                language=self.stt_language,
+                sample_rate=16000,
+                interim_results=True,
+                model="phone_call",
+                enhanced=True
+            )
+            
+            # Test the speech recognizer by starting/stopping a session
+            logger.info("Testing Google Cloud Speech session")
+            await self.speech_recognizer.start_streaming()
+            await self.speech_recognizer.stop_streaming()
+            logger.info("Google Cloud Speech test successful")
+            
+        except Exception as stt_error:
+            logger.error(f"Error initializing Google Cloud Speech: {stt_error}", exc_info=True)
+            raise RuntimeError(f"Failed to initialize Google Cloud Speech: {str(stt_error)}")
         
         # Initialize STT integration 
         self.stt_integration = STTIntegration(

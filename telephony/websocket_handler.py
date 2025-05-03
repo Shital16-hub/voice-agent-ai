@@ -90,6 +90,9 @@ class WebSocketHandler:
         self.processing_lock = asyncio.Lock()
         self.keep_alive_task = None
         
+        # Add this flag to fix the attribute error
+        self.using_deepgram = False
+        
         # Compile the non-speech patterns for efficient use
         self.non_speech_pattern = re.compile('|'.join(NON_SPEECH_PATTERNS))
         
@@ -443,6 +446,7 @@ class WebSocketHandler:
             return audio_data  # Return original audio if preprocessing fails
     
     async def _process_audio(self, ws) -> None:
+        
         """Process accumulated audio data through the pipeline with Google Cloud STT."""
         try:
             # Convert buffer to PCM with enhanced processing
@@ -472,15 +476,9 @@ class WebSocketHandler:
             
             # Define a callback to collect results
             async def transcription_callback(result):
-                if self.using_google_stt:
-                    # For Google Cloud, we care about final results
-                    if result.is_final:
-                        transcription_results.append(result)
-                        logger.debug(f"Received final Google Cloud result: {result.text}")
-                else:
-                    # For other STT, all results are collected
+                if hasattr(result, 'is_final') and result.is_final:
                     transcription_results.append(result)
-                    logger.debug(f"Received other STT result: {result.text}")
+                    logger.debug(f"Received final transcription result: {result.text}")
             
             # Process audio through Google Cloud STT
             try:
@@ -490,33 +488,46 @@ class WebSocketHandler:
                 # Make sure the Google session is active
                 if not self.google_session_active:
                     logger.info("Starting new Google Cloud STT session")
-                    await self.pipeline.speech_recognizer.start_streaming()
-                    self.google_session_active = True
+                    try:
+                        await self.pipeline.speech_recognizer.start_streaming()
+                        self.google_session_active = True
+                        logger.info("Google Cloud STT session started successfully")
+                    except Exception as start_error:
+                        logger.error(f"Error starting Google Cloud STT session: {start_error}", exc_info=True)
+                        self.google_session_active = False
+                        return
                 
                 # Process chunk with Google Cloud
+                logger.debug(f"Processing audio chunk of size {len(audio_bytes)} bytes")
                 result = await self.pipeline.speech_recognizer.process_audio_chunk(
                     audio_chunk=audio_bytes,
                     callback=transcription_callback
                 )
                 
                 # Check if we got a final result directly
-                if result and result.is_final:
+                if result and hasattr(result, 'is_final') and result.is_final:
                     transcription_results.append(result)
                 
                 # Get transcription if we have results
                 if transcription_results:
                     # Use the best result based on confidence
-                    best_result = max(transcription_results, key=lambda r: r.confidence)
+                    best_result = max(transcription_results, key=lambda r: getattr(r, 'confidence', 0))
                     transcription = best_result.text
                 else:
                     # If no results, but we've been collecting audio for a while (more than 3 seconds)
                     if len(self.input_buffer) > 3 * AUDIO_BUFFER_SIZE:
                         # Try stopping and restarting the session to get final results
                         if self.google_session_active:
-                            final_text, _ = await self.pipeline.speech_recognizer.stop_streaming()
-                            await self.pipeline.speech_recognizer.start_streaming()
-                            self.google_session_active = True
-                            transcription = final_text
+                            try:
+                                logger.info("No transcription results - stopping and restarting STT session")
+                                final_text, _ = await self.pipeline.speech_recognizer.stop_streaming()
+                                await self.pipeline.speech_recognizer.start_streaming()
+                                self.google_session_active = True
+                                transcription = final_text
+                                logger.info(f"Final transcription after stop/restart: '{transcription}'")
+                            except Exception as restart_error:
+                                logger.error(f"Error restarting STT session: {restart_error}")
+                                transcription = ""
                         else:
                             transcription = ""
                     else:
@@ -537,8 +548,48 @@ class WebSocketHandler:
                 transcription = self.cleanup_transcription(transcription)
                 logger.info(f"CLEANED TRANSCRIPTION: '{transcription}'")
                 
-                # Process the valid transcription
-                # ...rest of the existing processing logic...
+                # Process valid transcription if we have one
+                if transcription and len(transcription.split()) >= self.min_words_for_valid_query:
+                    # Make sure we don't process the same transcription twice
+                    if transcription != self.last_transcription:
+                        self.last_transcription = transcription
+                        
+                        # Generate response through conversation manager
+                        try:
+                            # Only process if enough time has passed since last response
+                            time_since_last_response = time.time() - self.last_response_time
+                            if time_since_last_response >= self.pause_after_response:
+                                # Process through conversation manager
+                                logger.info(f"Processing transcription through conversation manager: '{transcription}'")
+                                
+                                # Get response from knowledge base
+                                response = await self.pipeline.conversation_manager.handle_user_input(transcription)
+                                response_text = response.get("response", "")
+                                
+                                if response_text:
+                                    # Send response
+                                    logger.info(f"Sending response: '{response_text}'")
+                                    await self.send_text_response(response_text, ws)
+                                    
+                                    # Update last response time
+                                    self.last_response_time = time.time()
+                                    
+                                    # Add to conversation history
+                                    if hasattr(self.pipeline, 'conversation_manager'):
+                                        logger.debug("Adding transcription to conversation history")
+                            else:
+                                logger.debug(f"Skipping processing - too soon after last response ({time_since_last_response:.1f}s < {self.pause_after_response:.1f}s)")
+                        except Exception as response_error:
+                            logger.error(f"Error generating response: {response_error}", exc_info=True)
+                            # Send a fallback response
+                            await self.send_text_response("I'm sorry, I'm having trouble processing your request.", ws)
+                    else:
+                        logger.debug(f"Skipping duplicate transcription: '{transcription}'")
+                else:
+                    logger.debug(f"Transcription not valid for processing: '{transcription}'")
+                
+                # Clear the input buffer for the next chunk of audio
+                self.input_buffer.clear()
                 
             except Exception as e:
                 logger.error(f"Error during STT processing: {e}", exc_info=True)

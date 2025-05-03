@@ -1,4 +1,5 @@
 # speech_to_text/google_cloud_stt/streaming.py
+
 """
 Google Cloud Speech-to-Text client for streaming recognition.
 
@@ -121,7 +122,7 @@ class GoogleCloudStreamingSTT:
         Returns:
             StreamingRecognitionConfig for Google Cloud Speech API
         """
-        # Create recognition config with telephony optimizations
+        # Create recognition config
         recognition_config = speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
             sample_rate_hertz=self.sample_rate,
@@ -157,8 +158,9 @@ class GoogleCloudStreamingSTT:
             Generator for sending streaming requests
         """
         # First request with config
+        streaming_config = self._get_streaming_config()
         yield speech.StreamingRecognizeRequest(
-            streaming_config=self.streaming_config
+            streaming_config=streaming_config
         )
         
         # Process audio chunks from queue
@@ -282,29 +284,61 @@ class GoogleCloudStreamingSTT:
         # Create thread pool executor
         self.stream_executor = ThreadPoolExecutor(max_workers=2)
         
-        # Get streaming config
-        self.streaming_config = self._get_streaming_config()
-        
         # Start streaming in a separate thread
         self.streaming_thread = self.stream_executor.submit(self._run_streaming)
     
     def _run_streaming(self):
         """Run streaming recognition in a separate thread."""
         try:
-            # Create request generator
-            request_generator = self._create_streaming_request_generator()
+            logger.info("Starting streaming recognition with Google Cloud Speech")
             
-            # Start streaming recognition
-            self.streaming_responses = self.client.streaming_recognize(
-                requests=request_generator,
-                timeout=60  # 1 minute timeout
+            # Get the streaming config
+            streaming_config = self._get_streaming_config()
+            
+            # Create a new client for this session
+            client = speech.SpeechClient(credentials=self.credentials)
+            
+            # Use API v2.32.0 style with config as separate parameter
+            # The StreamingRecognize RPC requires a config parameter first, followed by a stream of requests
+            
+            # Set up audio request iterator
+            def audio_requests():
+                while not self.stop_event.is_set():
+                    try:
+                        # Get audio chunk with timeout
+                        chunk = self.audio_queue.get(timeout=0.5)
+                        
+                        # Check for stop signal
+                        if chunk is None:
+                            break
+                        
+                        # Create request with audio content
+                        request = speech.StreamingRecognizeRequest(audio_content=chunk)
+                        yield request
+                        
+                        self.audio_queue.task_done()
+                    except Exception as e:
+                        if "queue.Empty" in str(e.__class__):
+                            # No data available, continue
+                            continue
+                        logger.error(f"Error in audio request generator: {e}")
+                        break
+            
+            # Call streaming_recognize correctly, with config as the first parameter
+            logger.info("Initiating streaming_recognize call")
+            responses = client.streaming_recognize(
+                config=streaming_config,  # Pass config separately as first argument
+                requests=audio_requests()
             )
+            
+            # Store responses for processing
+            self.streaming_responses = responses
             
             # Process responses
             self._process_streaming_responses()
-            
+                
         except Exception as e:
-            logger.error(f"Error in streaming thread: {e}")
+            logger.error(f"Error in streaming thread: {e}", exc_info=True)
             # Signal error
             self.response_queue.put(None)
     
