@@ -1,16 +1,17 @@
 """
-Voice AI Agent main class that coordinates all components with Deepgram STT integration.
+Voice AI Agent main class that coordinates all components with Google Cloud Speech integration.
 Generic version that works with any knowledge base.
 """
 import os
 import logging
 import asyncio
-from typing import Optional, Dict, Any, Union, Callable, Awaitable
+import time
+from typing import Optional, Dict, Any, Union, Callable, Awaitable, List
 import numpy as np
 from scipy import signal
 
-# Deepgram STT imports
-from speech_to_text.deepgram_stt import DeepgramStreamingSTT
+# Google Cloud Speech imports
+from speech_to_text.google_cloud_stt import GoogleCloudStreamingSTT
 from speech_to_text.stt_integration import STTIntegration
 from knowledge_base.conversation_manager import ConversationManager
 from knowledge_base.llama_index.document_store import DocumentStore
@@ -21,34 +22,34 @@ from text_to_speech import DeepgramTTS
 logger = logging.getLogger(__name__)
 
 class VoiceAIAgent:
-    """Main Voice AI Agent class that coordinates all components with Deepgram STT."""
+    """Main Voice AI Agent class that coordinates all components with Google Cloud Speech."""
     
     def __init__(
         self,
         storage_dir: str = './storage',
         model_name: str = 'mistral:7b-instruct-v0.2-q4_0',
-        api_key: Optional[str] = None,
+        credentials_path: Optional[str] = None,
         llm_temperature: float = 0.7,
         **kwargs
     ):
         """
-        Initialize the Voice AI Agent with Deepgram STT.
+        Initialize the Voice AI Agent with Google Cloud Speech.
         
         Args:
             storage_dir: Directory for persistent storage
             model_name: LLM model name for knowledge base
-            api_key: Deepgram API key (defaults to env variable)
+            credentials_path: Path to Google Cloud credentials JSON file
             llm_temperature: LLM temperature for response generation
             **kwargs: Additional parameters for customization
         """
         self.storage_dir = storage_dir
         self.model_name = model_name
-        self.api_key = api_key
+        self.credentials_path = credentials_path or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
         self.llm_temperature = llm_temperature
         
         # STT Parameters
         self.stt_language = kwargs.get('language', 'en-US')
-        self.stt_keywords = kwargs.get('keywords', ['price', 'plan', 'cost', 'subscription', 'service'])
+        self.stt_keywords = kwargs.get('keywords', ['price', 'plan', 'cost', 'subscription', 'service', 'features', 'support'])
         
         # Component placeholders
         self.speech_recognizer = None
@@ -61,6 +62,12 @@ class VoiceAIAgent:
         self.noise_floor = 0.005
         self.noise_samples = []
         self.max_noise_samples = 20
+        
+        # Barge-in settings
+        self.min_barge_in_energy = kwargs.get('min_barge_in_energy', 0.1)
+        self.min_consecutive_chunks = kwargs.get('min_consecutive_chunks', 3)
+        
+        logger.info(f"Initialized VoiceAIAgent with Google Cloud Speech, model: {model_name}")
         
     def _process_audio(self, audio: np.ndarray) -> np.ndarray:
         """
@@ -102,7 +109,12 @@ class VoiceAIAgent:
             return audio  # Return original if processing fails
     
     def _update_noise_floor(self, audio: np.ndarray) -> None:
-        """Update noise floor estimate from quiet sections."""
+        """
+        Update noise floor estimate from quiet sections.
+        
+        Args:
+            audio: Audio data as numpy array
+        """
         # Find quiet sections (bottom 10% of energy)
         frame_size = min(len(audio), int(0.02 * 16000))  # 20ms frames
         if frame_size <= 1:
@@ -132,17 +144,24 @@ class VoiceAIAgent:
                 )
         
     async def init(self):
-        """Initialize all components with Deepgram STT."""
-        logger.info("Initializing Voice AI Agent components with Deepgram STT...")
+        """Initialize all components with Google Cloud Speech."""
+        logger.info("Initializing Voice AI Agent components with Google Cloud Speech...")
         
-        # Initialize speech recognizer with Deepgram
-        self.speech_recognizer = DeepgramStreamingSTT(
-            api_key=self.api_key,
+        # Set up Google credentials
+        if self.credentials_path:
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = self.credentials_path
+            logger.info(f"Set GOOGLE_APPLICATION_CREDENTIALS to {self.credentials_path}")
+        else:
+            logger.warning("GOOGLE_APPLICATION_CREDENTIALS not specified, using default credentials")
+        
+        # Initialize speech recognizer with Google Cloud Speech
+        self.speech_recognizer = GoogleCloudStreamingSTT(
+            credentials_path=self.credentials_path,
             language=self.stt_language,
             sample_rate=16000,
-            encoding="linear16",
-            channels=1,
-            interim_results=True
+            interim_results=True,
+            model="phone_call",
+            enhanced=True
         )
         
         # Initialize STT integration 
@@ -177,7 +196,7 @@ class VoiceAIAgent:
         # Initialize TTS client
         self.tts_client = DeepgramTTS()
         
-        logger.info("Voice AI Agent initialization complete with Deepgram STT")
+        logger.info("Voice AI Agent initialization complete with Google Cloud Speech")
         
     async def process_audio(
         self,
@@ -185,7 +204,7 @@ class VoiceAIAgent:
         callback: Optional[Callable[[Any], Awaitable[None]]] = None
     ) -> Dict[str, Any]:
         """
-        Process audio data with Deepgram STT.
+        Process audio data with Google Cloud Speech.
         
         Args:
             audio_data: Audio data as numpy array or bytes
@@ -201,7 +220,7 @@ class VoiceAIAgent:
         if isinstance(audio_data, np.ndarray):
             audio_data = self._process_audio(audio_data)
         
-        # Use STT integration for processing with Deepgram
+        # Use STT integration for processing with Google Cloud Speech
         result = await self.stt_integration.transcribe_audio_data(audio_data, callback=callback)
         
         # Only process valid transcriptions
@@ -251,6 +270,10 @@ class VoiceAIAgent:
         # Start streaming session
         await self.speech_recognizer.start_streaming()
         
+        # Track barge-in state
+        barge_in_detected = False
+        consecutive_speech_chunks = 0
+        
         try:
             # Process each audio chunk
             async for chunk in audio_stream:
@@ -260,14 +283,28 @@ class VoiceAIAgent:
                 if isinstance(chunk, np.ndarray):
                     chunk = self._process_audio(chunk)
                 
-                # Convert to bytes for Deepgram if needed
+                # Check for potential barge-in based on energy
+                if isinstance(chunk, np.ndarray):
+                    energy = np.mean(np.abs(chunk))
+                    if energy > self.min_barge_in_energy:
+                        consecutive_speech_chunks += 1
+                        if consecutive_speech_chunks >= self.min_consecutive_chunks:
+                            barge_in_detected = True
+                            logger.info("Barge-in detected through energy analysis")
+                    else:
+                        consecutive_speech_chunks = 0
+                
+                # Convert to bytes for Google Cloud Speech if needed
                 if isinstance(chunk, np.ndarray):
                     audio_bytes = (chunk * 32767).astype(np.int16).tobytes()
                 else:
                     audio_bytes = chunk
                     
-                # Process through Deepgram
+                # Process through Google Cloud Speech
                 async def process_result(result):
+                    # Handle barge-in detection from speech recognition
+                    nonlocal barge_in_detected, consecutive_speech_chunks
+                    
                     # Only handle final results
                     if result.is_final:
                         # Clean up transcription
@@ -275,6 +312,11 @@ class VoiceAIAgent:
                         
                         # Process if valid
                         if transcription and self.stt_integration.is_valid_transcription(transcription):
+                            # Check if barge-in also detected through speech recognition
+                            if self.speech_recognizer.is_barge_in_detected():
+                                barge_in_detected = True
+                                logger.info("Barge-in confirmed by speech recognition: " + transcription)
+                            
                             # Get response from conversation manager
                             response = await self.conversation_manager.handle_user_input(transcription)
                             
@@ -283,11 +325,16 @@ class VoiceAIAgent:
                                 "transcription": transcription,
                                 "response": response.get("response", ""),
                                 "confidence": result.confidence,
-                                "is_final": True
+                                "is_final": True,
+                                "barge_in_detected": barge_in_detected
                             }
                             
                             nonlocal results_count
                             results_count += 1
+                            
+                            # Reset barge-in state after processing
+                            barge_in_detected = False
+                            consecutive_speech_chunks = 0
                             
                             # Call callback if provided
                             if result_callback:
@@ -304,7 +351,8 @@ class VoiceAIAgent:
                 "status": "complete",
                 "chunks_processed": chunks_processed,
                 "results_count": results_count,
-                "total_time": time.time() - start_time
+                "total_time": time.time() - start_time,
+                "barge_in_detected": barge_in_detected
             }
             
         except Exception as e:
@@ -318,7 +366,8 @@ class VoiceAIAgent:
                 "error": str(e),
                 "chunks_processed": chunks_processed,
                 "results_count": results_count,
-                "total_time": time.time() - start_time
+                "total_time": time.time() - start_time,
+                "barge_in_detected": barge_in_detected
             }
     
     @property
@@ -332,10 +381,56 @@ class VoiceAIAgent:
         """Shut down all components properly."""
         logger.info("Shutting down Voice AI Agent...")
         
-        # Close Deepgram streaming session if active
-        if self.speech_recognizer and hasattr(self.speech_recognizer, 'is_streaming') and self.speech_recognizer.is_streaming:
+        # Close Google Cloud streaming session if active
+        if self.speech_recognizer:
             await self.speech_recognizer.stop_streaming()
         
         # Reset conversation if active
         if self.conversation_manager:
             self.conversation_manager.reset()
+    
+    async def test_speech_recognition(
+        self, 
+        audio_file_path: str
+    ) -> Dict[str, Any]:
+        """
+        Test speech recognition with an audio file.
+        
+        Args:
+            audio_file_path: Path to audio file
+            
+        Returns:
+            Recognition result
+        """
+        if not self.initialized:
+            raise RuntimeError("Voice AI Agent not initialized")
+            
+        logger.info(f"Testing speech recognition with file: {audio_file_path}")
+        
+        # Use STT integration to transcribe the file
+        result = await self.stt_integration.transcribe_audio_file(audio_file_path)
+        
+        return result
+    
+    async def handle_barge_in(self, force_reset: bool = False) -> None:
+        """
+        Handle barge-in by resetting the conversation flow.
+        
+        Args:
+            force_reset: Whether to force a reset even if no barge-in detected
+        """
+        # Check if barge-in was detected
+        if force_reset or self.speech_recognizer.is_barge_in_detected():
+            logger.info("Handling barge-in: resetting conversation flow")
+            
+            # Reset barge-in detection
+            self.speech_recognizer.reset_barge_in_detection()
+            
+            # Could implement additional actions here like:
+            # - Stopping current TTS output
+            # - Resetting conversation context
+            # - Sending a notification to the telephony system
+            
+            return True
+        
+        return False

@@ -1,5 +1,5 @@
 """
-Exceptions for the Deepgram Speech-to-Text integration.
+Exceptions for the Google Cloud Speech-to-Text integration.
 """
 
 class STTError(Exception):
