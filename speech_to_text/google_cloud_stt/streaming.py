@@ -88,10 +88,6 @@ class GoogleCloudStreamingSTT:
         self.chunk_id_counter = 0
         self.last_result = None
         
-        # Track last activity time for keep-alive mechanism
-        self.last_activity_time = time.time()
-        self.keep_alive_interval = 5.0  # Send keep-alive every 5 seconds
-        
         # Barge-in detection
         self.barge_in_detected = False
         self.last_activity_time = 0
@@ -120,35 +116,36 @@ class GoogleCloudStreamingSTT:
         self.client = speech.SpeechClient(credentials=self.credentials)
     
     def _get_streaming_config(self) -> speech.StreamingRecognitionConfig:
-        """Get streaming recognition configuration optimized for telephony."""
-        # Create recognition config with telephony-specific options
+        """
+        Get streaming recognition configuration.
+        
+        Returns:
+            StreamingRecognitionConfig for Google Cloud Speech API
+        """
+        # Create recognition config
         recognition_config = speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
             sample_rate_hertz=self.sample_rate,
             language_code=self.language,
-            # Telephony specific optimizations
-            model="phone_call",  # Use phone_call model for telephony audio
-            use_enhanced=True,   # Enhanced model for better noise handling
+            model=self.model,
+            use_enhanced=self.enhanced,
             audio_channel_count=1,
             enable_separate_recognition_per_channel=False,
             enable_automatic_punctuation=True,
             enable_word_time_offsets=True,
-            # Telephony context hints - add common telephony phrases
+            # Telephony optimizations
             speech_contexts=[speech.SpeechContext(
-                phrases=["yes", "no", "maybe", "cancel", "help", "agent", "operator", 
-                        "price", "cost", "service", "information", "support"],
+                phrases=config.keywords,
                 boost=10.0
             )],
-            # Add profanity_filter for telephony applications
-            profanity_filter=True,
         )
         
-        # Create streaming config with proper parameters for telephony
+        # Create streaming config
         streaming_config = speech.StreamingRecognitionConfig(
             config=recognition_config,
             interim_results=self.interim_results,
-            # Critical for telephony - don't use single_utterance=True for multi-turn conversations
-            single_utterance=False,  
+            # These settings optimize for real-time telephony
+            single_utterance=False,  # Process multiple utterances
         )
         
         return streaming_config
@@ -188,7 +185,7 @@ class GoogleCloudStreamingSTT:
                 logger.error(f"Error in streaming request generator: {e}")
                 break
     
-    async def _process_streaming_responses(self):
+    def _process_streaming_responses(self):
         """Process streaming responses in a separate thread."""
         try:
             for response in self.streaming_responses:
@@ -257,43 +254,10 @@ class GoogleCloudStreamingSTT:
                     
                     # Add to response queue
                     self.response_queue.put(transcription_result)
-                    
         except Exception as e:
             logger.error(f"Error processing streaming responses: {e}")
-            
-            # Check for timeout error and attempt recovery
-            if "Audio Timeout Error" in str(e) and self.is_streaming:
-                logger.info("Attempting to recover from audio timeout error")
-                # Signal to restart the streaming session
-                self.response_queue.put({"needs_restart": True})
-            else:
-                # Signal other types of errors
-                self.response_queue.put(None)
-    
-    async def maintain_streaming_session(self):
-        """
-        Send periodic keep-alive audio chunks to maintain the streaming connection.
-        This prevents the "Long duration elapsed without audio" timeout.
-        """
-        if not self.is_streaming:
-            return
-            
-        # Only send keep-alive if it's been more than keep_alive_interval since last activity
-        if time.time() - self.last_activity_time < self.keep_alive_interval:
-            return
-            
-        # Generate a very small, non-silence audio chunk (10ms of low-level noise)
-        # This keeps the connection alive without affecting transcription
-        keep_alive_chunk = np.random.normal(0, 0.001, int(0.01 * self.sample_rate)).astype(np.float32)
-        keep_alive_bytes = (keep_alive_chunk * 32767).astype(np.int16).tobytes()
-        
-        # Send the keep-alive chunk through the audio queue
-        if self.audio_queue and not self.audio_queue.full():
-            self.audio_queue.put(keep_alive_bytes)
-            logger.debug("Sent keep-alive audio chunk to maintain streaming session")
-            
-        # Update last activity time
-        self.last_activity_time = time.time()
+            # Signal error
+            self.response_queue.put(None)
     
     async def start_streaming(self) -> None:
         """Start a new streaming session."""
@@ -419,9 +383,6 @@ class GoogleCloudStreamingSTT:
                 else:
                     self.consecutive_speech_chunks = 0
             
-            # Update last activity time
-            self.last_activity_time = time.time()
-            
             # Add to audio queue
             self.audio_queue.put(audio_chunk)
             
@@ -433,15 +394,6 @@ class GoogleCloudStreamingSTT:
                     # Error occurred
                     logger.error("Error in streaming recognition")
                     return None
-                elif isinstance(result, dict) and result.get("needs_restart"):
-                    # Need to restart streaming session
-                    logger.info("Restarting streaming session after timeout")
-                    await self.stop_streaming()
-                    await asyncio.sleep(0.5)  # Brief pause
-                    await self.start_streaming()
-                    logger.info("Streaming session restarted")
-                    self.response_queue.task_done()
-                    continue
                 
                 results.append(result)
                 self.response_queue.task_done()
@@ -493,10 +445,6 @@ class GoogleCloudStreamingSTT:
                     result = self.response_queue.get(timeout=0.1)
                     if result is None:
                         break
-                    elif isinstance(result, dict) and "needs_restart" in result:
-                        # Skip restart signal during shutdown
-                        self.response_queue.task_done()
-                        continue
                     
                     final_results.append(result)
                     self.response_queue.task_done()

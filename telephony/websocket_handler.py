@@ -67,8 +67,6 @@ class WebSocketHandler:
         self.stream_sid = None
         self.pipeline = pipeline
         self.audio_processor = AudioProcessor()
-
-        self.last_response = ""
         
         # Audio buffers
         self.input_buffer = bytearray()
@@ -448,39 +446,19 @@ class WebSocketHandler:
             return audio_data  # Return original audio if preprocessing fails
     
     async def _process_audio(self, ws) -> None:
+        
         """Process accumulated audio data through the pipeline with Google Cloud STT."""
         try:
             # Convert buffer to PCM with enhanced processing
             try:
                 mulaw_bytes = bytes(self.input_buffer)
                 
-                # Check if buffer is too small to process
-                if len(mulaw_bytes) < 1000:
-                    logger.debug(f"Audio buffer too small: {len(mulaw_bytes)} bytes")
-                    return
-                    
                 # Convert using the enhanced audio processing
-                # Make sure we're calling the instance method correctly
                 pcm_audio = self.audio_processor.mulaw_to_pcm(mulaw_bytes)
                 
-                # Check if we have valid audio data
-                if len(pcm_audio) == 0:
-                    logger.warning("Empty audio data after conversion")
-                    half_size = len(self.input_buffer) // 2
-                    self.input_buffer = self.input_buffer[half_size:]
-                    return
-                
                 # Additional processing to improve recognition
-                pcm_audio = self.audio_processor._preprocess_audio(pcm_audio)
+                pcm_audio = self._preprocess_audio(pcm_audio)
                 
-                # Check for silence before proceeding
-                is_silent = self.audio_processor.detect_silence(pcm_audio)
-                if is_silent and len(self.input_buffer) < AUDIO_BUFFER_SIZE * 1.5:
-                    logger.debug("Detected silence, skipping processing")
-                    half_size = len(self.input_buffer) // 2
-                    self.input_buffer = self.input_buffer[half_size:]
-                    return
-                    
             except Exception as e:
                 logger.error(f"Error converting audio: {e}")
                 # Clear part of buffer and try again next time
@@ -502,87 +480,69 @@ class WebSocketHandler:
                     transcription_results.append(result)
                     logger.debug(f"Received final transcription result: {result.text}")
             
-            # Process audio through Google Cloud STT with timeout protection
+            # Process audio through Google Cloud STT
             try:
                 # For Google Cloud, convert to bytes format
                 audio_bytes = (pcm_audio * 32767).astype(np.int16).tobytes()
                 
-                # Ensure Google session is active
+                # Make sure the Google session is active
                 if not self.google_session_active:
                     logger.info("Starting new Google Cloud STT session")
                     try:
-                        # Use asyncio timeout to prevent hanging
                         await self.pipeline.speech_recognizer.start_streaming()
                         self.google_session_active = True
                         logger.info("Google Cloud STT session started successfully")
                     except Exception as start_error:
-                        logger.error(f"Error starting Google Cloud STT session: {start_error}")
+                        logger.error(f"Error starting Google Cloud STT session: {start_error}", exc_info=True)
                         self.google_session_active = False
                         return
                 
                 # Process chunk with Google Cloud
-                result = None
-                try:
-                    result = await self.pipeline.speech_recognizer.process_audio_chunk(
-                        audio_chunk=audio_bytes,
-                        callback=transcription_callback
-                    )
-                except Exception as process_error:
-                    logger.error(f"Error processing audio chunk: {process_error}")
-                    # Continue with available results if any
+                logger.debug(f"Processing audio chunk of size {len(audio_bytes)} bytes")
+                result = await self.pipeline.speech_recognizer.process_audio_chunk(
+                    audio_chunk=audio_bytes,
+                    callback=transcription_callback
+                )
                 
                 # Check if we got a final result directly
                 if result and hasattr(result, 'is_final') and result.is_final:
                     transcription_results.append(result)
                 
                 # Get transcription if we have results
-                transcription = ""
                 if transcription_results:
                     # Use the best result based on confidence
                     best_result = max(transcription_results, key=lambda r: getattr(r, 'confidence', 0))
                     transcription = best_result.text
-                elif len(self.input_buffer) > 3 * AUDIO_BUFFER_SIZE:
-                    # If we've been collecting audio for a while but no results
-                    if self.google_session_active:
-                        try:
-                            logger.info("No transcription results - stopping and restarting STT session")
-                            final_text, _ = await self.pipeline.speech_recognizer.stop_streaming()
-                            await asyncio.sleep(0.5)  # Brief pause before restart
-                            await self.pipeline.speech_recognizer.start_streaming()
-                            self.google_session_active = True
-                            transcription = final_text
-                            logger.info(f"Final transcription after stop/restart: '{transcription}'")
-                        except Exception as restart_error:
-                            logger.error(f"Error restarting STT session: {restart_error}")
+                else:
+                    # If no results, but we've been collecting audio for a while (more than 3 seconds)
+                    if len(self.input_buffer) > 3 * AUDIO_BUFFER_SIZE:
+                        # Try stopping and restarting the session to get final results
+                        if self.google_session_active:
+                            try:
+                                logger.info("No transcription results - stopping and restarting STT session")
+                                final_text, _ = await self.pipeline.speech_recognizer.stop_streaming()
+                                await self.pipeline.speech_recognizer.start_streaming()
+                                self.google_session_active = True
+                                transcription = final_text
+                                logger.info(f"Final transcription after stop/restart: '{transcription}'")
+                            except Exception as restart_error:
+                                logger.error(f"Error restarting STT session: {restart_error}")
+                                transcription = ""
+                        else:
                             transcription = ""
-                            # Reset session state
-                            self.google_session_active = False
+                    else:
+                        # No transcription yet
+                        transcription = ""
                 
                 # Check for barge-in
-                barge_in_detected = False
-                if self.using_google_stt and hasattr(self.pipeline.speech_recognizer, 'is_barge_in_detected'):
-                    barge_in_detected = self.pipeline.speech_recognizer.is_barge_in_detected()
-                    if barge_in_detected:
-                        logger.info("Barge-in detected, interrupting current response")
-                        # Reset barge-in detection
-                        self.pipeline.speech_recognizer.reset_barge_in_detection()
+                if self.using_google_stt and self.pipeline.speech_recognizer.is_barge_in_detected():
+                    logger.info("Barge-in detected, interrupting current response")
+                    # Handle barge-in (could stop current TTS, etc.)
+                    # Reset barge-in detection
+                    self.pipeline.speech_recognizer.reset_barge_in_detection()
             
                 # Log before cleanup for debugging
                 logger.info(f"RAW TRANSCRIPTION: '{transcription}'")
-                
-                # Skip processing if empty transcription
-                if not transcription:
-                    logger.debug("Empty transcription, skipping processing")
-                    # Clear buffer and continue
-                    self.input_buffer.clear()
-                    return
-                    
-                # Check for echo of system's own speech
-                if hasattr(self, 'last_response') and self._is_echo_of_own_speech(transcription):
-                    logger.info(f"Detected echo of system speech, ignoring: '{transcription}'")
-                    # Clear buffer and skip processing
-                    self.input_buffer.clear()
-                    return
                 
                 # Clean up transcription
                 transcription = self.cleanup_transcription(transcription)
@@ -602,32 +562,25 @@ class WebSocketHandler:
                                 # Process through conversation manager
                                 logger.info(f"Processing transcription through conversation manager: '{transcription}'")
                                 
-                                try:
-                                    # Get response from knowledge base
-                                    response = await self.pipeline.conversation_manager.handle_user_input(transcription)
-                                    response_text = response.get("response", "")
+                                # Get response from knowledge base
+                                response = await self.pipeline.conversation_manager.handle_user_input(transcription)
+                                response_text = response.get("response", "")
+                                
+                                if response_text:
+                                    # Send response
+                                    logger.info(f"Sending response: '{response_text}'")
+                                    await self.send_text_response(response_text, ws)
                                     
-                                    if response_text:
-                                        # Store the response for echo detection
-                                        self.last_response = response_text
-                                        
-                                        # Send response
-                                        logger.info(f"Sending response: '{response_text}'")
-                                        await self.send_text_response(response_text, ws)
-                                        
-                                        # Update last response time
-                                        self.last_response_time = time.time()
-                                        
-                                        # Add to conversation history
-                                        if hasattr(self.pipeline, 'conversation_manager'):
-                                            logger.debug("Adding transcription to conversation history")
-                                except Exception as timeout_error:
-                                    logger.error(f"Error generating response: {timeout_error}")
-                                    await self.send_text_response("I'm sorry, it's taking longer than expected to process your request.", ws)
+                                    # Update last response time
+                                    self.last_response_time = time.time()
+                                    
+                                    # Add to conversation history
+                                    if hasattr(self.pipeline, 'conversation_manager'):
+                                        logger.debug("Adding transcription to conversation history")
                             else:
                                 logger.debug(f"Skipping processing - too soon after last response ({time_since_last_response:.1f}s < {self.pause_after_response:.1f}s)")
                         except Exception as response_error:
-                            logger.error(f"Error generating response: {response_error}")
+                            logger.error(f"Error generating response: {response_error}", exc_info=True)
                             # Send a fallback response
                             await self.send_text_response("I'm sorry, I'm having trouble processing your request.", ws)
                     else:
@@ -639,7 +592,7 @@ class WebSocketHandler:
                 self.input_buffer.clear()
                 
             except Exception as e:
-                logger.error(f"Error during STT processing: {e}")
+                logger.error(f"Error during STT processing: {e}", exc_info=True)
                 # If error, clear part of buffer and continue
                 half_size = len(self.input_buffer) // 2
                 self.input_buffer = self.input_buffer[half_size:]
@@ -648,112 +601,15 @@ class WebSocketHandler:
                 if self.using_google_stt:
                     try:
                         logger.info("Resetting Google Cloud STT session after error")
-                        try:
-                            await self.pipeline.speech_recognizer.stop_streaming()
-                            await asyncio.sleep(0.5)  # Brief pause
-                            await self.pipeline.speech_recognizer.start_streaming()
-                            self.google_session_active = True
-                        except Exception as timeout_error:
-                            logger.error(f"Error during session reset: {timeout_error}")
-                            self.google_session_active = False
+                        await self.pipeline.speech_recognizer.stop_streaming()
+                        await self.pipeline.speech_recognizer.start_streaming()
+                        self.google_session_active = True
                     except Exception as session_error:
                         logger.error(f"Error resetting Google Cloud STT session: {session_error}")
                         self.google_session_active = False
                 
         except Exception as e:
-            logger.error(f"Error processing audio: {e}")
-            # Try to continue processing in future calls
-    def _is_echo_of_own_speech(self, transcription: str) -> bool:
-        """
-        Check if transcription is an echo of the system's own speech.
-        
-        Args:
-            transcription: Transcription to check
-            
-        Returns:
-            True if transcription appears to be an echo of own speech
-        """
-        # Convert to lowercase for comparison
-        text = transcription.lower()
-        
-        # Check against recent responses
-        last_response = getattr(self, 'last_response', '').lower()
-        
-        # If last response is empty, check common greeting phrases
-        if not last_response:
-            common_greetings = [
-                "i'm listening", 
-                "how can i help", 
-                "welcome to", 
-                "how may i assist",
-                "i am listening",
-                "is there anything"
-            ]
-            
-            # Check if transcription contains any common greeting
-            for greeting in common_greetings:
-                if greeting in text:
-                    logger.info(f"Detected echo of greeting: '{text}'")
-                    return True
-                    
-            return False
-        
-        # Check if transcription is similar to last response
-        from difflib import SequenceMatcher
-        similarity = SequenceMatcher(None, text, last_response).ratio()
-        
-        # If similarity is high, it's likely an echo
-        if similarity > 0.5:
-            logger.info(f"Detected echo of own speech (similarity: {similarity:.2f})")
-            return True
-            
-        # Check for partial matches (beginning of response)
-        if len(last_response) > 20:
-            # Check if transcription is the beginning of the last response
-            start_of_response = last_response[:min(len(text) * 2, len(last_response))]
-            similarity = SequenceMatcher(None, text, start_of_response).ratio()
-            if similarity > 0.5:
-                logger.info(f"Detected echo of beginning of response (similarity: {similarity:.2f})")
-                return True
-        
-        return False
-
-    def _detect_silence(self, audio_data: np.ndarray) -> bool:
-        """
-        Detect if audio is mostly silence using adaptive threshold.
-        
-        Args:
-            audio_data: Audio data as numpy array
-            
-        Returns:
-            True if audio is considered silence
-        """
-        try:
-            # Calculate energy
-            energy = np.mean(np.abs(audio_data))
-            
-            # Use adaptive threshold based on noise floor
-            threshold = max(0.01, getattr(self, 'ambient_noise_level', 0.01) * 2.0)
-            
-            # If energy is below threshold, it's silence
-            is_silence = energy < threshold
-            
-            # Additional check for very quiet audio with adaptive threshold
-            if not is_silence and energy < threshold * 2:
-                # Check zero-crossing rate (white noise has high ZCR)
-                zcr = np.sum(np.abs(np.diff(np.signbit(audio_data)))) / len(audio_data)
-                
-                # High ZCR with low energy is likely background noise, not speech
-                if zcr > 0.15:
-                    logger.debug(f"Detected background noise: energy={energy:.4f}, zcr={zcr:.4f}")
-                    is_silence = True
-            
-            return is_silence
-        
-        except Exception as e:
-            logger.error(f"Error in silence detection: {e}")
-            # Default to not silence on error
-            return False
+            logger.error(f"Error processing audio: {e}", exc_info=True)
     
     def _contains_speech(self, audio_data: np.ndarray) -> bool:
         """
