@@ -1,8 +1,7 @@
-# speech_to_text/stt_integration.py
 """
-Enhanced Speech-to-Text integration module for Voice AI Agent with Google Cloud Speech.
+Enhanced Speech-to-Text integration module for Voice AI Agent with improved noise handling.
 
-This module provides classes and functions for integrating Google Cloud Speech-to-Text
+This module provides classes and functions for integrating Deepgram speech-to-text
 capabilities with the Voice AI Agent system.
 """
 import logging
@@ -13,12 +12,12 @@ import numpy as np
 from typing import Optional, Dict, Any, Callable, Awaitable, List, Tuple, Union, AsyncIterator
 from scipy import signal
 
-from speech_to_text.google_cloud_stt import GoogleCloudStreamingSTT, StreamingTranscriptionResult
+from speech_to_text.deepgram_stt import DeepgramStreamingSTT, StreamingTranscriptionResult
 from speech_to_text.utils.audio_utils import load_audio_file
 
 logger = logging.getLogger(__name__)
 
-# Define patterns for non-speech annotations
+# Define expanded patterns for non-speech annotations
 NON_SPEECH_PATTERNS = [
     r'\[.*?\]',           # Anything in square brackets
     r'\(.*?\)',           # Anything in parentheses
@@ -31,7 +30,7 @@ NON_SPEECH_PATTERNS = [
 
 class STTIntegration:
     """
-    Enhanced Speech-to-Text integration for Voice AI Agent with Google Cloud Speech.
+    Enhanced Speech-to-Text integration for Voice AI Agent with Deepgram.
     
     Provides an abstraction layer for speech recognition functionality,
     handling audio processing and transcription.
@@ -39,14 +38,14 @@ class STTIntegration:
     
     def __init__(
         self,
-        speech_recognizer: Optional[GoogleCloudStreamingSTT] = None,
-        language: str = "en-US"
+        speech_recognizer: Optional[DeepgramStreamingSTT] = None,
+        language: str = "en"
     ):
         """
         Initialize the STT integration.
         
         Args:
-            speech_recognizer: Initialized GoogleCloudStreamingSTT instance
+            speech_recognizer: Initialized DeepgramStreamingSTT instance
             language: Language code for speech recognition
         """
         self.speech_recognizer = speech_recognizer
@@ -62,27 +61,29 @@ class STTIntegration:
         self.max_samples = 20
         self.ambient_noise_level = 0.01  # Starting threshold
     
-    async def init(self, credentials_path: Optional[str] = None) -> None:
+    async def init(self, api_key: Optional[str] = None) -> None:
         """
         Initialize the STT component if not already initialized.
         
         Args:
-            credentials_path: Path to Google Cloud credentials JSON file
+            api_key: Deepgram API key (optional)
         """
         if self.initialized:
             return
             
         try:
-            # Create a new Google Cloud Speech client
-            self.speech_recognizer = GoogleCloudStreamingSTT(
-                credentials_path=credentials_path,
+            # Create a new Deepgram streaming client optimized for telephony
+            self.speech_recognizer = DeepgramStreamingSTT(
+                api_key=api_key,
                 language=self.language,
                 sample_rate=16000,
+                encoding="linear16",
+                channels=1,
                 interim_results=True
             )
             
             self.initialized = True
-            logger.info(f"Initialized STT with Google Cloud Speech and language: {self.language}")
+            logger.info(f"Initialized STT with Deepgram API and language: {self.language}")
         except Exception as e:
             logger.error(f"Error initializing STT: {e}")
             raise
@@ -128,22 +129,15 @@ class STTIntegration:
             b, a = signal.butter(4, 80/(16000/2), 'highpass')
             filtered_audio = signal.filtfilt(b, a, audio_data)
             
-            # 2. Apply band-pass filter for telephony frequency range (300-3400 Hz)
-            b, a = signal.butter(4, [300/(16000/2), 3400/(16000/2)], 'band')
-            filtered_audio = signal.filtfilt(b, a, filtered_audio)
-            
-            # 3. Simple noise gate (suppress very low amplitudes)
+            # 2. Simple noise gate (suppress very low amplitudes)
             noise_gate_threshold = max(0.015, self.ambient_noise_level)
             noise_gate = np.where(np.abs(filtered_audio) < noise_gate_threshold, 0, filtered_audio)
             
-            # 4. Apply pre-emphasis filter
-            pre_emphasis = np.append(noise_gate[0], noise_gate[1:] - 0.97 * noise_gate[:-1])
-            
-            # 5. Normalize audio to have consistent volume
-            if np.max(np.abs(pre_emphasis)) > 0:
-                normalized = pre_emphasis / np.max(np.abs(pre_emphasis)) * 0.95
+            # 3. Normalize audio to have consistent volume
+            if np.max(np.abs(noise_gate)) > 0:
+                normalized = noise_gate / np.max(np.abs(noise_gate)) * 0.95
             else:
-                normalized = pre_emphasis
+                normalized = noise_gate
                 
             # Log stats about the audio
             orig_energy = np.mean(np.abs(audio_data))
@@ -285,9 +279,9 @@ class STTIntegration:
                 await self.speech_recognizer.process_audio_chunk(chunk, store_result)
             
             # Stop streaming to get final results
-            final_text, duration = await self.speech_recognizer.stop_streaming()
+            await self.speech_recognizer.stop_streaming()
             
-            # Determine if we got valid results
+            # Combine results if we have any
             if final_results:
                 # Use the best final result (with highest confidence)
                 best_result = max(final_results, key=lambda r: r.confidence)
@@ -299,19 +293,6 @@ class STTIntegration:
                     "transcription": cleaned_text,
                     "original_transcription": best_result.text,
                     "confidence": best_result.confidence,
-                    "duration": audio_duration,
-                    "processing_time": time.time() - start_time,
-                    "is_final": True,
-                    "is_valid": self.is_valid_transcription(cleaned_text)
-                }
-            elif final_text:
-                # Use final text from stop_streaming
-                cleaned_text = self.cleanup_transcription(final_text)
-                
-                return {
-                    "transcription": cleaned_text,
-                    "original_transcription": final_text,
-                    "confidence": 0.8,  # Estimated
                     "duration": audio_duration,
                     "processing_time": time.time() - start_time,
                     "is_final": True,
@@ -400,9 +381,9 @@ class STTIntegration:
                 await self.speech_recognizer.process_audio_chunk(chunk, store_result)
             
             # Stop streaming to get final results
-            final_text, duration = await self.speech_recognizer.stop_streaming()
+            await self.speech_recognizer.stop_streaming()
             
-            # Determine if we got valid results
+            # Combine results if we have any
             if final_results:
                 # Use the best final result (with highest confidence)
                 best_result = max(final_results, key=lambda r: r.confidence)
@@ -414,19 +395,6 @@ class STTIntegration:
                     "transcription": cleaned_text,
                     "original_transcription": best_result.text,
                     "confidence": best_result.confidence,
-                    "duration": len(audio) / 16000,  # Assuming 16kHz
-                    "processing_time": time.time() - start_time,
-                    "is_final": True,
-                    "is_valid": self.is_valid_transcription(cleaned_text)
-                }
-            elif final_text:
-                # Use final text from stop_streaming
-                cleaned_text = self.cleanup_transcription(final_text)
-                
-                return {
-                    "transcription": cleaned_text,
-                    "original_transcription": final_text,
-                    "confidence": 0.8,  # Estimated
                     "duration": len(audio) / 16000,  # Assuming 16kHz
                     "processing_time": time.time() - start_time,
                     "is_final": True,
@@ -465,7 +433,7 @@ class STTIntegration:
         callback: Optional[Callable[[StreamingTranscriptionResult], Awaitable[None]]] = None
     ) -> Optional[StreamingTranscriptionResult]:
         """
-        Process a chunk of streaming audio.
+        Process a chunk of streaming audio with improved noise handling.
         
         Args:
             audio_chunk: Audio chunk data
@@ -478,51 +446,46 @@ class STTIntegration:
             logger.error("STT integration not properly initialized")
             return None
         
-        try:
-            # Convert to numpy array if needed
-            if isinstance(audio_chunk, bytes):
-                # Assume 16-bit PCM format
-                audio_data = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32) / 32768.0
-            elif isinstance(audio_chunk, list):
-                audio_data = np.array(audio_chunk, dtype=np.float32)
-            else:
-                audio_data = audio_chunk
-            
-            # Update ambient noise level
-            self._update_ambient_noise_level(audio_data)
-            
-            # Apply audio preprocessing for noise reduction
-            audio_data = self._preprocess_audio(audio_data)
-            
-            # Convert to bytes (16-bit PCM)
-            audio_bytes = (audio_data * 32767).astype(np.int16).tobytes()
-            
-            # Create a custom callback to clean up transcriptions
-            async def clean_callback(result: StreamingTranscriptionResult):
-                if result and hasattr(result, 'text') and result.text:
-                    # Store original for debugging
-                    original_text = result.text
-                    
-                    # Clean up the text
-                    result.text = self.cleanup_transcription(result.text)
-                    
-                    # Log the change if significant
-                    if original_text != result.text:
-                        logger.debug(f"Cleaned interim transcription: '{original_text}' -> '{result.text}'")
-                    
-                    # Only call user callback for valid transcriptions
-                    if result.text and self.is_valid_transcription(result.text) and callback:
-                        await callback(result)
-            
-            # Process the audio chunk
-            return await self.speech_recognizer.process_audio_chunk(
-                audio_chunk=audio_bytes,
-                callback=clean_callback
-            )
-            
-        except Exception as e:
-            logger.error(f"Error processing audio chunk: {e}")
-            return None
+        # Convert to numpy array if needed
+        if isinstance(audio_chunk, bytes):
+            # Assume 16-bit PCM format
+            audio_data = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32) / 32768.0
+        elif isinstance(audio_chunk, list):
+            audio_data = np.array(audio_chunk, dtype=np.float32)
+        else:
+            audio_data = audio_chunk
+        
+        # Update ambient noise level
+        self._update_ambient_noise_level(audio_data)
+        
+        # Apply audio preprocessing for noise reduction
+        audio_data = self._preprocess_audio(audio_data)
+        
+        # Convert to bytes (16-bit PCM)
+        audio_bytes = (audio_data * 32767).astype(np.int16).tobytes()
+        
+        # Create a custom callback to clean up transcriptions
+        async def clean_callback(result: StreamingTranscriptionResult):
+            if result and hasattr(result, 'text') and result.text:
+                # Store original for debugging
+                original_text = result.text
+                
+                # Clean up the text
+                result.text = self.cleanup_transcription(result.text)
+                
+                # Log the change if significant
+                if original_text != result.text:
+                    logger.debug(f"Cleaned interim transcription: '{original_text}' -> '{result.text}'")
+                
+                # Only call user callback for valid transcriptions
+                if result.text and self.is_valid_transcription(result.text) and callback:
+                    await callback(result)
+        
+        # Process the audio chunk
+        return await self.speech_recognizer.process_audio_chunk(
+            audio_chunk=audio_bytes,
+            callback=clean_callback
+        )
     
     async def end_streaming(self) -> Tuple[str, float]:
         """
@@ -536,30 +499,133 @@ class STTIntegration:
             return "", 0.0
         
         # Stop streaming session
-        text, duration = await self.speech_recognizer.stop_streaming()
+        await self.speech_recognizer.stop_streaming()
         
-        # Clean up the transcription
-        cleaned_text = self.cleanup_transcription(text)
-        
-        # Log what was changed if significant
-        if text != cleaned_text:
-            logger.info(f"Cleaned final transcription: '{text}' -> '{cleaned_text}'")
-        
-        return cleaned_text, duration
+        # Check if we have a last result
+        if hasattr(self.speech_recognizer, 'last_result') and self.speech_recognizer.last_result:
+            result = self.speech_recognizer.last_result
+            
+            # Clean up the transcription
+            cleaned_text = self.cleanup_transcription(result.text)
+            
+            # Log what was changed if significant
+            if result.text != cleaned_text:
+                logger.info(f"Cleaned final transcription: '{result.text}' -> '{cleaned_text}'")
+            
+            # Get the duration from the result if available
+            duration = (result.end_time - result.start_time) if result.end_time > 0 else 0
+            
+            return cleaned_text, duration
+        else:
+            return "", 0.0
     
-    async def is_barge_in_detected(self) -> bool:
+    async def process_realtime_audio_stream(
+        self,
+        audio_stream: AsyncIterator[np.ndarray],
+        callback: Optional[Callable[[StreamingTranscriptionResult], Awaitable[None]]] = None,
+        silence_frames_threshold: int = 30
+    ) -> AsyncIterator[Dict[str, Any]]:
         """
-        Check if barge-in has been detected.
+        Process real-time audio stream and detect utterances with improved noise handling.
         
-        Returns:
-            True if barge-in has been detected
+        Args:
+            audio_stream: Async iterator yielding audio chunks
+            callback: Optional callback for interim results
+            silence_frames_threshold: Number of silence frames to consider end of utterance
+            
+        Yields:
+            Transcription results for each detected utterance
         """
         if not self.initialized:
-            return False
+            logger.error("STT integration not properly initialized")
+            yield {"error": "STT integration not initialized"}
+            return
         
-        return self.speech_recognizer.is_barge_in_detected()
-    
-    async def reset_barge_in_detection(self) -> None:
-        """Reset barge-in detection state."""
-        if self.initialized:
-            self.speech_recognizer.reset_barge_in_detection()
+        # Start streaming
+        await self.speech_recognizer.start_streaming()
+        
+        # Track state
+        is_speaking = False
+        silence_frames = 0
+        max_silence_frames = silence_frames_threshold
+        
+        try:
+            async for audio_chunk in audio_stream:
+                # Update ambient noise level
+                self._update_ambient_noise_level(audio_chunk)
+                
+                # Apply audio preprocessing for noise reduction
+                processed_chunk = self._preprocess_audio(audio_chunk)
+                
+                # Convert to bytes (16-bit PCM)
+                audio_bytes = (processed_chunk * 32767).astype(np.int16).tobytes()
+                
+                # Define a result processing callback
+                results = []
+                
+                async def process_result(result: StreamingTranscriptionResult):
+                    # Store the result
+                    results.append(result)
+                    
+                    # Call the original callback if provided
+                    if callback:
+                        await callback(result)
+                
+                # Process the audio chunk
+                await self.speech_recognizer.process_audio_chunk(
+                    audio_chunk=audio_bytes,
+                    callback=process_result
+                )
+                
+                # Check for speech activity
+                if not is_speaking:
+                    # Detect start of speech from any results
+                    has_speech = any(result.text.strip() for result in results)
+                    
+                    if has_speech:
+                        is_speaking = True
+                        silence_frames = 0
+                        logger.info("Speech detected, beginning transcription")
+                else:
+                    # Check for end of utterance (silence after speech)
+                    has_speech = any(result.text.strip() for result in results)
+                    
+                    if not has_speech:
+                        silence_frames += 1
+                    else:
+                        silence_frames = 0
+                
+                # If we've detected enough silence after speech, process the utterance
+                if is_speaking and silence_frames >= max_silence_frames:
+                    is_speaking = False
+                    
+                    # Get final transcription
+                    final_text, duration = await self.end_streaming()
+                    
+                    # Clean up the transcription
+                    cleaned_text = self.cleanup_transcription(final_text)
+                    
+                    # Only yield if it's a valid transcription after cleaning
+                    if cleaned_text and self.is_valid_transcription(cleaned_text):
+                        logger.info(f"Utterance detected: {cleaned_text}")
+                        
+                        # Yield the result
+                        yield {
+                            "transcription": cleaned_text,
+                            "original_transcription": final_text,
+                            "duration": duration,
+                            "is_final": True,
+                            "is_valid": True
+                        }
+                    
+                    # Reset for next utterance
+                    await self.speech_recognizer.start_streaming()
+                    silence_frames = 0
+        
+        except Exception as e:
+            logger.error(f"Error in real-time audio processing: {e}")
+            yield {"error": str(e)}
+        
+        finally:
+            # Clean up
+            await self.speech_recognizer.stop_streaming()

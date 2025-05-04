@@ -14,8 +14,8 @@ from scipy import signal
 from telephony.audio_processor import AudioProcessor
 from telephony.config import CHUNK_SIZE, AUDIO_BUFFER_SIZE, SILENCE_THRESHOLD, SILENCE_DURATION, MAX_BUFFER_SIZE
 
-from speech_to_text.google_cloud_stt import GoogleCloudStreamingSTT, StreamingTranscriptionResult
-from speech_to_text.stt_integration import STTIntegration
+# Import Deepgram STT
+from speech_to_text.deepgram_stt import DeepgramStreamingSTT, StreamingTranscriptionResult
 
 logger = logging.getLogger(__name__)
 
@@ -90,9 +90,6 @@ class WebSocketHandler:
         self.processing_lock = asyncio.Lock()
         self.keep_alive_task = None
         
-        # Add this flag to fix the attribute error
-        self.using_deepgram = False
-        
         # Compile the non-speech patterns for efficient use
         self.non_speech_pattern = re.compile('|'.join(NON_SPEECH_PATTERNS))
         
@@ -108,16 +105,16 @@ class WebSocketHandler:
         self.noise_samples = []
         self.max_noise_samples = 20
         
-        # Determine if we're using GoogleCloudStreamingSTT
-        self.using_google_stt = (
+        # Determine if we're using Deepgram STT
+        self.using_deepgram = (
             hasattr(pipeline, 'speech_recognizer') and 
-            isinstance(pipeline.speech_recognizer, GoogleCloudStreamingSTT)
+            isinstance(pipeline.speech_recognizer, DeepgramStreamingSTT)
         )
         
-        # Ensure we start with a fresh session state
-        self.google_session_active = False
+        # Ensure we start with a fresh deepgram session state
+        self.deepgram_session_active = False
         
-        logger.info(f"WebSocketHandler initialized for call {call_sid} with Google Cloud STT")
+        logger.info(f"WebSocketHandler initialized for call {call_sid} with {'Deepgram' if self.using_deepgram else 'Whisper'} STT")
     
     def _update_ambient_noise_level(self, audio_data: np.ndarray) -> None:
         """
@@ -446,8 +443,12 @@ class WebSocketHandler:
             return audio_data  # Return original audio if preprocessing fails
     
     async def _process_audio(self, ws) -> None:
+        """
+        Process accumulated audio data through the pipeline with Deepgram STT.
         
-        """Process accumulated audio data through the pipeline with Google Cloud STT."""
+        Args:
+            ws: WebSocket connection
+        """
         try:
             # Convert buffer to PCM with enhanced processing
             try:
@@ -476,71 +477,70 @@ class WebSocketHandler:
             
             # Define a callback to collect results
             async def transcription_callback(result):
-                if hasattr(result, 'is_final') and result.is_final:
-                    transcription_results.append(result)
-                    logger.debug(f"Received final transcription result: {result.text}")
-            
-            # Process audio through Google Cloud STT
-            try:
-                # For Google Cloud, convert to bytes format
-                audio_bytes = (pcm_audio * 32767).astype(np.int16).tobytes()
-                
-                # Make sure the Google session is active
-                if not self.google_session_active:
-                    logger.info("Starting new Google Cloud STT session")
-                    try:
-                        await self.pipeline.speech_recognizer.start_streaming()
-                        self.google_session_active = True
-                        logger.info("Google Cloud STT session started successfully")
-                    except Exception as start_error:
-                        logger.error(f"Error starting Google Cloud STT session: {start_error}", exc_info=True)
-                        self.google_session_active = False
-                        return
-                
-                # Process chunk with Google Cloud
-                logger.debug(f"Processing audio chunk of size {len(audio_bytes)} bytes")
-                result = await self.pipeline.speech_recognizer.process_audio_chunk(
-                    audio_chunk=audio_bytes,
-                    callback=transcription_callback
-                )
-                
-                # Check if we got a final result directly
-                if result and hasattr(result, 'is_final') and result.is_final:
-                    transcription_results.append(result)
-                
-                # Get transcription if we have results
-                if transcription_results:
-                    # Use the best result based on confidence
-                    best_result = max(transcription_results, key=lambda r: getattr(r, 'confidence', 0))
-                    transcription = best_result.text
+                if self.using_deepgram:
+                    # For Deepgram, we care about final results
+                    if result.is_final:
+                        transcription_results.append(result)
+                        logger.debug(f"Received final Deepgram result: {result.text}")
                 else:
-                    # If no results, but we've been collecting audio for a while (more than 3 seconds)
-                    if len(self.input_buffer) > 3 * AUDIO_BUFFER_SIZE:
-                        # Try stopping and restarting the session to get final results
-                        if self.google_session_active:
-                            try:
-                                logger.info("No transcription results - stopping and restarting STT session")
-                                final_text, _ = await self.pipeline.speech_recognizer.stop_streaming()
-                                await self.pipeline.speech_recognizer.start_streaming()
-                                self.google_session_active = True
-                                transcription = final_text
-                                logger.info(f"Final transcription after stop/restart: '{transcription}'")
-                            except Exception as restart_error:
-                                logger.error(f"Error restarting STT session: {restart_error}")
-                                transcription = ""
-                        else:
-                            transcription = ""
-                    else:
-                        # No transcription yet
-                        transcription = ""
-                
-                # Check for barge-in
-                if self.using_google_stt and self.pipeline.speech_recognizer.is_barge_in_detected():
-                    logger.info("Barge-in detected, interrupting current response")
-                    # Handle barge-in (could stop current TTS, etc.)
-                    # Reset barge-in detection
-                    self.pipeline.speech_recognizer.reset_barge_in_detection()
+                    # For Whisper, all results are collected
+                    transcription_results.append(result)
+                    logger.debug(f"Received Whisper result: {result.text}")
             
+            # Process audio through the appropriate STT system
+            try:
+                if self.using_deepgram:
+                    # For Deepgram, convert to bytes format
+                    audio_bytes = (pcm_audio * 32767).astype(np.int16).tobytes()
+                    
+                    # Make sure the Deepgram streaming session is active
+                    if not self.deepgram_session_active:
+                        logger.info("Starting new Deepgram streaming session")
+                        await self.pipeline.speech_recognizer.start_streaming()
+                        self.deepgram_session_active = True
+                    
+                    # Process chunk with Deepgram
+                    result = await self.pipeline.speech_recognizer.process_audio_chunk(
+                        audio_chunk=audio_bytes,
+                        callback=transcription_callback
+                    )
+                    
+                    # Check if we got a final result directly
+                    if result and result.is_final:
+                        transcription_results.append(result)
+                    
+                    # Get transcription if we have results
+                    if transcription_results:
+                        # Use the best result based on confidence
+                        best_result = max(transcription_results, key=lambda r: r.confidence)
+                        transcription = best_result.text
+                    else:
+                        # If no results, try stopping and restarting the session to get final results
+                        if self.deepgram_session_active:
+                            await self.pipeline.speech_recognizer.stop_streaming()
+                            await self.pipeline.speech_recognizer.start_streaming()
+                            self.deepgram_session_active = True
+                        
+                        # No transcription
+                        transcription = ""
+                else:
+                    # For Whisper, use the original approach
+                    # Ensure we're starting fresh
+                    if hasattr(self.pipeline.speech_recognizer, 'is_streaming') and self.pipeline.speech_recognizer.is_streaming:
+                        await self.pipeline.speech_recognizer.stop_streaming()
+                    
+                    # Start a new streaming session
+                    self.pipeline.speech_recognizer.start_streaming()
+                    
+                    # Process audio chunk
+                    await self.pipeline.speech_recognizer.process_audio_chunk(
+                        audio_chunk=pcm_audio,
+                        callback=transcription_callback
+                    )
+                    
+                    # Get final transcription
+                    transcription, _ = await self.pipeline.speech_recognizer.stop_streaming()
+                
                 # Log before cleanup for debugging
                 logger.info(f"RAW TRANSCRIPTION: '{transcription}'")
                 
@@ -548,65 +548,74 @@ class WebSocketHandler:
                 transcription = self.cleanup_transcription(transcription)
                 logger.info(f"CLEANED TRANSCRIPTION: '{transcription}'")
                 
-                # Process valid transcription if we have one
-                if transcription and len(transcription.split()) >= self.min_words_for_valid_query:
-                    # Make sure we don't process the same transcription twice
-                    if transcription != self.last_transcription:
-                        self.last_transcription = transcription
+                # Only process if it's a valid transcription
+                if transcription and self.is_valid_transcription(transcription):
+                    logger.info(f"Complete transcription: {transcription}")
+                    
+                    # Now clear the input buffer since we have a valid transcription
+                    self.input_buffer.clear()
+                    
+                    # Don't process duplicate transcriptions
+                    if transcription == self.last_transcription:
+                        logger.info("Duplicate transcription, not processing again")
+                        return
+                    
+                    # Process through knowledge base
+                    try:
+                        if hasattr(self.pipeline, 'query_engine'):
+                            query_result = await self.pipeline.query_engine.query(transcription)
+                            response = query_result.get("response", "")
+                            
+                            logger.info(f"Generated response: {response}")
+                            
+                            # Convert to speech
+                            if response and hasattr(self.pipeline, 'tts_integration'):
+                                speech_audio = await self.pipeline.tts_integration.text_to_speech(response)
+                                
+                                # Convert to mulaw for Twilio
+                                mulaw_audio = self.audio_processor.pcm_to_mulaw(speech_audio)
+                                
+                                # Send back to Twilio
+                                logger.info(f"Sending audio response ({len(mulaw_audio)} bytes)")
+                                await self._send_audio(mulaw_audio, ws)
+                                
+                                # Update state
+                                self.last_transcription = transcription
+                                self.last_response_time = time.time()
+                    except Exception as e:
+                        logger.error(f"Error processing through knowledge base: {e}", exc_info=True)
                         
-                        # Generate response through conversation manager
+                        # Try to send a fallback response
+                        fallback_message = "I'm sorry, I'm having trouble understanding. Could you try again?"
                         try:
-                            # Only process if enough time has passed since last response
-                            time_since_last_response = time.time() - self.last_response_time
-                            if time_since_last_response >= self.pause_after_response:
-                                # Process through conversation manager
-                                logger.info(f"Processing transcription through conversation manager: '{transcription}'")
-                                
-                                # Get response from knowledge base
-                                response = await self.pipeline.conversation_manager.handle_user_input(transcription)
-                                response_text = response.get("response", "")
-                                
-                                if response_text:
-                                    # Send response
-                                    logger.info(f"Sending response: '{response_text}'")
-                                    await self.send_text_response(response_text, ws)
-                                    
-                                    # Update last response time
-                                    self.last_response_time = time.time()
-                                    
-                                    # Add to conversation history
-                                    if hasattr(self.pipeline, 'conversation_manager'):
-                                        logger.debug("Adding transcription to conversation history")
-                            else:
-                                logger.debug(f"Skipping processing - too soon after last response ({time_since_last_response:.1f}s < {self.pause_after_response:.1f}s)")
-                        except Exception as response_error:
-                            logger.error(f"Error generating response: {response_error}", exc_info=True)
-                            # Send a fallback response
-                            await self.send_text_response("I'm sorry, I'm having trouble processing your request.", ws)
-                    else:
-                        logger.debug(f"Skipping duplicate transcription: '{transcription}'")
+                            fallback_audio = await self.pipeline.tts_integration.text_to_speech(fallback_message)
+                            mulaw_fallback = self.audio_processor.pcm_to_mulaw(fallback_audio)
+                            await self._send_audio(mulaw_fallback, ws)
+                            self.last_response_time = time.time()
+                        except Exception as e2:
+                            logger.error(f"Failed to send fallback response: {e2}")
                 else:
-                    logger.debug(f"Transcription not valid for processing: '{transcription}'")
-                
-                # Clear the input buffer for the next chunk of audio
-                self.input_buffer.clear()
-                
+                    # If no valid transcription, reduce buffer size but keep some for context
+                    half_size = len(self.input_buffer) // 2
+                    self.input_buffer = self.input_buffer[half_size:]
+                    logger.debug(f"No valid transcription, reduced buffer to {len(self.input_buffer)} bytes")
+            
             except Exception as e:
                 logger.error(f"Error during STT processing: {e}", exc_info=True)
                 # If error, clear part of buffer and continue
                 half_size = len(self.input_buffer) // 2
                 self.input_buffer = self.input_buffer[half_size:]
                 
-                # If we had a Google session error, reset the session
-                if self.using_google_stt:
+                # If we had a Deepgram session error, reset the session
+                if self.using_deepgram:
                     try:
-                        logger.info("Resetting Google Cloud STT session after error")
+                        logger.info("Resetting Deepgram session after error")
                         await self.pipeline.speech_recognizer.stop_streaming()
                         await self.pipeline.speech_recognizer.start_streaming()
-                        self.google_session_active = True
+                        self.deepgram_session_active = True
                     except Exception as session_error:
-                        logger.error(f"Error resetting Google Cloud STT session: {session_error}")
-                        self.google_session_active = False
+                        logger.error(f"Error resetting Deepgram session: {session_error}")
+                        self.deepgram_session_active = False
                 
         except Exception as e:
             logger.error(f"Error processing audio: {e}", exc_info=True)

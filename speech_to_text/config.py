@@ -1,6 +1,5 @@
-# speech_to_text/config.py
 """
-Configuration settings for the Google Cloud Speech integration module.
+Configuration settings for the speech-to-text module.
 """
 import os
 from dotenv import load_dotenv
@@ -13,16 +12,16 @@ load_dotenv()
 class STTConfig(BaseSettings):
     """Configuration for Speech-to-Text module."""
     
-    # Google Cloud Speech settings
-    google_credentials_path: str = Field(
-        default=os.getenv("GOOGLE_APPLICATION_CREDENTIALS", ""),
-        description="Path to Google Cloud credentials JSON file"
+    # Deepgram API settings
+    deepgram_api_key: str = Field(
+        default=os.getenv("DEEPGRAM_API_KEY", ""),
+        description="Deepgram API Key for STT services"
     )
     
     # STT settings
-    model: str = Field(
-        default="phone_call",
-        description="Google Speech-to-Text model to use"
+    model_name: str = Field(
+        default="general",
+        description="Deepgram STT model to use"
     )
     
     language: str = Field(
@@ -41,43 +40,65 @@ class STTConfig(BaseSettings):
         description="Whether to return interim results"
     )
     
-    enhanced: bool = Field(
+    endpointing: str = Field(
+        default="500",
+        description="Endpointing in ms, or 'default'"
+    )
+    
+    vad_events: bool = Field(
         default=True,
-        description="Whether to use enhanced models"
+        description="Whether to return VAD events"
     )
     
     # Telephony optimizations
+    utterance_end_ms: int = Field(
+        default=500,
+        description="Milliseconds of silence to consider an utterance complete"
+    )
+    
     keywords: list = Field(
         default=["price", "plan", "cost", "subscription", "service", "features", "support"],
         description="Keywords to boost in telephony context"
     )
     
-    # Performance Settings - Optimized for noise handling
-    enable_noise_filtering: bool = Field(
-        default=True,
-        description="Enable enhanced noise filtering"
+    alternatives: int = Field(
+        default=1,
+        description="Number of alternative transcripts to return"
     )
     
-    silence_threshold: float = Field(
-        default=0.008,
-        description="Threshold for silence detection"
-    )
-    
-    silence_duration: float = Field(
-        default=1.2,
-        description="Duration of silence to consider an utterance complete"
-    )
-    
-    # Response Settings
-    min_transcription_length: int = Field(
-        default=3,
-        description="Minimum word count for valid transcription"
-    )
-    
-    # Caching settings
+    # Performance settings
     enable_caching: bool = Field(
         default=True,
         description="Enable caching of STT results"
+    )
+    
+    smart_format: bool = Field(
+        default=True,
+        description="Whether to apply smart formatting to numbers, dates, etc."
+    )
+    
+    profanity_filter: bool = Field(
+        default=False,
+        description="Whether to filter profanity"
+    )
+    
+    # Telephony-specific settings
+    diarize: bool = Field(
+        default=False,
+        description="Whether to perform speaker diarization"
+    )
+    
+    multichannel: bool = Field(
+        default=False,
+        description="Whether to treat audio as multichannel"
+    )
+    
+    model_options: dict = Field(
+        default={
+            "tier": "enhanced",  # Use enhanced model for telephony
+            "filler_words": False,  # Filter out um, uh, etc.
+        },
+        description="Additional model options"
     )
     
     class Config:

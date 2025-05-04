@@ -1,7 +1,5 @@
 """
 Audio utilities for the speech-to-text module.
-
-Enhanced to support Google Cloud Speech-to-Text requirements.
 """
 
 import numpy as np
@@ -9,7 +7,6 @@ import io
 import wave
 import logging
 from typing import Tuple, Optional, Union
-from scipy import signal
 
 logger = logging.getLogger(__name__)
 
@@ -149,112 +146,89 @@ def load_audio_file(
     
     return audio, target_sr
 
-def preprocess_audio_for_google_cloud(audio: np.ndarray) -> np.ndarray:
-    """
-    Preprocess audio specifically for Google Cloud Speech API.
-    
-    Args:
-        audio: Audio data as numpy array
-        
-    Returns:
-        Preprocessed audio data
-    """
-    try:
-        # 1. High-pass filter (remove frequencies below 80Hz)
-        b, a = signal.butter(4, 80/(16000/2), 'highpass')
-        audio = signal.filtfilt(b, a, audio)
-        
-        # 2. Bandpass filter for speech frequencies (300-3400 Hz)
-        b, a = signal.butter(4, [300/(16000/2), 3400/(16000/2)], 'band')
-        audio = signal.filtfilt(b, a, audio)
-        
-        # 3. Apply pre-emphasis filter to boost higher frequencies
-        audio = np.append(audio[0], audio[1:] - 0.97 * audio[:-1])
-        
-        # 4. Normalize audio level
-        max_val = np.max(np.abs(audio))
-        if max_val > 0:
-            audio = audio * 0.9 / max_val
-            
-        return audio
-    except Exception as e:
-        logger.error(f"Error in audio preprocessing: {e}")
-        return audio  # Return original audio if processing fails
-
-def convert_audio_format(
-    audio: np.ndarray,
-    output_format: str = 'LINEAR16'
-) -> bytes:
-    """
-    Convert audio to a format compatible with Google Cloud Speech API.
-    
-    Args:
-        audio: Audio data as numpy array
-        output_format: Output format code ('LINEAR16', 'FLAC', etc.)
-        
-    Returns:
-        Formatted audio data as bytes
-    """
-    if output_format == 'LINEAR16':
-        # Convert to 16-bit PCM
-        audio = np.clip(audio, -1.0, 1.0)
-        audio_int16 = (audio * 32767.0).astype(np.int16)
-        return audio_int16.tobytes()
-    else:
-        raise ValueError(f"Unsupported output format: {output_format}")
-
-def detect_voice_activity(audio: np.ndarray, threshold: float = 0.01) -> bool:
-    """
-    Detect if audio segment contains voice activity.
-    
-    Args:
-        audio: Audio data as numpy array
-        threshold: Energy threshold for voice detection
-        
-    Returns:
-        True if voice activity is detected
-    """
-    # Calculate energy
-    energy = np.mean(np.abs(audio))
-    
-    # Calculate zero-crossing rate (helps distinguish speech from noise)
-    zero_crossings = np.sum(np.abs(np.diff(np.signbit(audio)))) / len(audio)
-    
-    # Detect speech based on energy and ZCR
-    is_speech = (energy > threshold) and (zero_crossings > 0.01) and (zero_crossings < 0.15)
-    
-    return is_speech
-
-def segment_audio(
-    audio: np.ndarray,
+def audio_bytes_to_array(
+    audio_bytes: bytes,
+    sample_width: int = 2,
+    channels: int = 1,
     sample_rate: int = 16000,
-    segment_length_ms: int = 500,
-    overlap_ms: int = 100
-) -> list:
+    normalize: bool = True
+) -> Tuple[np.ndarray, int]:
     """
-    Segment audio into overlapping chunks for streaming processing.
+    Convert raw audio bytes to numpy array.
     
     Args:
-        audio: Audio data as numpy array
-        sample_rate: Sample rate in Hz
-        segment_length_ms: Segment length in milliseconds
-        overlap_ms: Overlap between segments in milliseconds
+        audio_bytes: Raw audio bytes
+        sample_width: Sample width in bytes (1=8bit, 2=16bit, 4=32bit)
+        channels: Number of audio channels
+        sample_rate: Audio sample rate
+        normalize: Whether to normalize audio
         
     Returns:
-        List of audio segments
+        Tuple of (audio_data, sample_rate)
     """
-    # Calculate segment and hop sizes in samples
-    segment_size = int(sample_rate * segment_length_ms / 1000)
-    hop_size = int(sample_rate * (segment_length_ms - overlap_ms) / 1000)
+    # Create a wave file in memory
+    wav_buffer = io.BytesIO()
+    with wave.open(wav_buffer, 'wb') as wav_file:
+        wav_file.setnchannels(channels)
+        wav_file.setsampwidth(sample_width)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(audio_bytes)
     
-    # Create segments
-    segments = []
-    for i in range(0, len(audio) - segment_size + 1, hop_size):
-        segment = audio[i:i+segment_size]
-        segments.append(segment)
+    # Read the wave file
+    wav_buffer.seek(0)
+    with wave.open(wav_buffer, 'rb') as wav_file:
+        # Get audio data as bytes
+        audio_bytes = wav_file.readframes(wav_file.getnframes())
+        
+        # Convert to numpy array
+        if sample_width == 1:
+            audio = np.frombuffer(audio_bytes, dtype=np.uint8)
+            audio = (audio.astype(np.float32) - 128) / 128.0
+        elif sample_width == 2:
+            audio = np.frombuffer(audio_bytes, dtype=np.int16)
+            audio = audio.astype(np.float32) / 32768.0
+        elif sample_width == 4:
+            audio = np.frombuffer(audio_bytes, dtype=np.int32)
+            audio = audio.astype(np.float32) / 2147483648.0
+        else:
+            raise ValueError(f"Unsupported sample width: {sample_width}")
+        
+        # Reshape for multi-channel audio
+        if channels > 1:
+            audio = audio.reshape(-1, channels)
+        
+        # Normalize if needed
+        if normalize and np.max(np.abs(audio)) > 1.0:
+            audio = audio / np.max(np.abs(audio))
     
-    # Add final segment if needed
-    if len(audio) > i + hop_size:
-        segments.append(audio[i+hop_size:])
+    return audio, sample_rate
+
+def create_sliding_windows(
+    audio: np.ndarray,
+    window_size: int,
+    hop_size: int
+) -> np.ndarray:
+    """
+    Create sliding windows from audio data.
     
-    return segments
+    Args:
+        audio: Input audio array (1D)
+        window_size: Window size in samples
+        hop_size: Hop size in samples
+        
+    Returns:
+        Array of windows
+    """
+    # Calculate number of windows
+    num_windows = 1 + (len(audio) - window_size) // hop_size
+    
+    # Create output array
+    windows = np.zeros((num_windows, window_size), dtype=audio.dtype)
+    
+    # Fill windows
+    for i in range(num_windows):
+        start = i * hop_size
+        end = start + window_size
+        windows[i] = audio[start:end]
+    
+    return windows

@@ -62,7 +62,3 @@ pandas
 pytest
 pytest-asyncio
 typing-extensions
-
-google-cloud-speech==2.32.0 
-google-auth==2.27.0 
-grpcio==1.59.3
