@@ -116,36 +116,35 @@ class GoogleCloudStreamingSTT:
         self.client = speech.SpeechClient(credentials=self.credentials)
     
     def _get_streaming_config(self) -> speech.StreamingRecognitionConfig:
-        """
-        Get streaming recognition configuration.
-        
-        Returns:
-            StreamingRecognitionConfig for Google Cloud Speech API
-        """
-        # Create recognition config
+        """Get streaming recognition configuration optimized for telephony."""
+        # Create recognition config with telephony-specific options
         recognition_config = speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
             sample_rate_hertz=self.sample_rate,
             language_code=self.language,
-            model=self.model,
-            use_enhanced=self.enhanced,
+            # Telephony specific optimizations
+            model="phone_call",  # Use phone_call model for telephony audio
+            use_enhanced=True,   # Enhanced model for better noise handling
             audio_channel_count=1,
             enable_separate_recognition_per_channel=False,
             enable_automatic_punctuation=True,
             enable_word_time_offsets=True,
-            # Telephony optimizations
+            # Telephony context hints - add common telephony phrases
             speech_contexts=[speech.SpeechContext(
-                phrases=config.keywords,
+                phrases=["yes", "no", "maybe", "cancel", "help", "agent", "operator", 
+                        "price", "cost", "service", "information", "support"],
                 boost=10.0
             )],
+            # Add profanity_filter for telephony applications
+            profanity_filter=True,
         )
         
-        # Create streaming config
+        # Create streaming config with proper parameters for telephony
         streaming_config = speech.StreamingRecognitionConfig(
             config=recognition_config,
             interim_results=self.interim_results,
-            # These settings optimize for real-time telephony
-            single_utterance=False,  # Process multiple utterances
+            # Critical for telephony - don't use single_utterance=True for multi-turn conversations
+            single_utterance=False,  
         )
         
         return streaming_config

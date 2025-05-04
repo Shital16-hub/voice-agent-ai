@@ -47,8 +47,66 @@ twilio_handler = None
 voice_ai_pipeline = None
 base_url = None
 
-# Dictionary to store event loops and state for each call
+# Improved call event loop management
 call_event_loops = {}
+call_event_loops_lock = threading.Lock()
+
+def get_call_event_loop(call_sid):
+    """Get or create event loop for a call with thread safety."""
+    with call_event_loops_lock:
+        if call_sid not in call_event_loops:
+            # Create new loop and related objects
+            loop = asyncio.new_event_loop()
+            terminate_flag = threading.Event()
+            call_event_loops[call_sid] = {
+                'loop': loop,
+                'terminate_flag': terminate_flag,
+                'handler': None,  # Will be set later
+                'thread': None    # Will be set later
+            }
+        return call_event_loops[call_sid]
+
+def remove_call_event_loop(call_sid):
+    """Safely remove call event loop."""
+    with call_event_loops_lock:
+        if call_sid in call_event_loops:
+            info = call_event_loops[call_sid]
+            # Signal termination
+            if 'terminate_flag' in info:
+                info['terminate_flag'].set()
+            # Remove from dictionary
+            del call_event_loops[call_sid]
+            return True
+        return False
+
+# Add to WebSocketHandler class
+async def _ensure_google_session(self):
+    """Ensure the Google Cloud STT session is active and properly initialized."""
+    try:
+        if hasattr(self.pipeline, 'speech_recognizer'):
+            if not self.google_session_active:
+                # Start a new session
+                await self.pipeline.speech_recognizer.start_streaming()
+                self.google_session_active = True
+                logger.info("Started new Google Cloud STT session")
+            return True
+        else:
+            logger.error("Speech recognizer not available in pipeline")
+            return False
+    except Exception as e:
+        logger.error(f"Error ensuring Google STT session: {e}")
+        # Try to reset session
+        try:
+            await self.pipeline.speech_recognizer.stop_streaming()
+            await asyncio.sleep(0.5)  # Brief pause before restarting
+            await self.pipeline.speech_recognizer.start_streaming()
+            self.google_session_active = True
+            logger.info("Reset Google Cloud STT session after error")
+            return True
+        except Exception as reset_error:
+            logger.error(f"Failed to reset Google STT session: {reset_error}")
+            self.google_session_active = False
+            return False
 
 async def initialize_system():
     """Initialize all system components with Google Cloud Speech integration."""
@@ -162,7 +220,7 @@ def handle_incoming_call():
 
 @app.route('/voice/status', methods=['POST'])
 def handle_status_callback():
-    """Handle call status callbacks."""
+    """Handle call status callbacks with proper cleanup."""
     logger.info("Received status callback")
     logger.info(f"Status data: {request.form}")
     
@@ -189,19 +247,34 @@ def handle_status_callback():
                 if 'terminate_flag' in loop_info:
                     loop_info['terminate_flag'].set()
                     
-                # Remove from dictionary
-                if loop_info.get('thread'):
+                # Get thread if available
+                thread = loop_info.get('thread')
+                if thread:
                     # Wait for thread to join with timeout
-                    thread = loop_info['thread']
                     thread.join(timeout=1.0)
-                    
+                
+                try:
+                    # Clean up Google STT session if active
+                    handler = loop_info.get('handler')
+                    if handler and handler.google_session_active:
+                        # Create a new event loop for cleanup
+                        cleanup_loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(cleanup_loop)
+                        # Close the STT session
+                        cleanup_loop.run_until_complete(handler.pipeline.speech_recognizer.stop_streaming())
+                        cleanup_loop.close()
+                except Exception as cleanup_error:
+                    logger.error(f"Error cleaning up STT session: {cleanup_error}")
+                
                 # Remove from tracking
-                del call_event_loops[call_sid]
+                call_event_loops.pop(call_sid, None)
                 logger.info(f"Cleaned up event loop resources for call {call_sid}")
                 
         return Response('', status=204)
     except Exception as e:
         logger.error(f"Error handling status callback: {e}", exc_info=True)
+        # Safely remove from dictionary
+        call_event_loops.pop(call_sid, None)
         return Response('', status=204)
 
 def run_event_loop_in_thread(loop, ws_handler, ws, call_sid, terminate_flag):
