@@ -191,17 +191,15 @@ def handle_incoming_call():
         # Create TwiML response
         response = VoiceResponse()
         
-        # Add initial greeting
-        response.say("Welcome to the Voice AI Agent. I'm here to help you.", voice='alice')
-        response.pause(length=1)
-        
         # Use WebSocket streaming for real-time conversation
         ws_url = f'{base_url.replace("https://", "wss://")}/ws/stream/{call_sid}'
         logger.info(f"Setting up WebSocket stream at: {ws_url}")
         
-        # Create the streaming connection
+        # Create the streaming connection with longer media timeout
         connect = Connect()
+        connect.add_parameter("timeout", "60") # 60-second media timeout
         stream = Stream(url=ws_url)
+        stream.add_parameter("track", "both") # Send audio in both directions
         connect.append(stream)
         response.append(connect)
         
@@ -315,6 +313,7 @@ def run_event_loop_in_thread(loop, ws_handler, ws, call_sid, terminate_flag):
 
 @app.route('/ws/stream/<call_sid>', websocket=True)
 def handle_media_stream(call_sid):
+    
     """Handle WebSocket media stream with improved noise handling."""
     logger.info(f"WebSocket connection attempt for call {call_sid}")
     
@@ -361,34 +360,39 @@ def handle_media_stream(call_sid):
             "version": "1.0.0"
         })
         
-        # Use asyncio.run_coroutine_threadsafe but without waiting for result
-        asyncio.run_coroutine_threadsafe(
+        # Use asyncio.run_coroutine_threadsafe
+        future = asyncio.run_coroutine_threadsafe(
             ws_handler.handle_message(connected_message, ws),
             loop
         )
+        # Wait for connected processing to complete
+        future.result(timeout=2.0)
         
         # Process messages until connection closed
         while True:
             try:
-                # Use shorter timeout
-                message = ws.receive(timeout=5)
+                # Use longer timeout
+                message = ws.receive(timeout=10)
                 if message is None:
                     logger.warning(f"Received None message for call {call_sid}")
                     break
                 
                 # Process the message in the dedicated event loop
-                # Don't wait for the result to avoid blocking
-                asyncio.run_coroutine_threadsafe(
+                # Wait for processing to complete
+                future = asyncio.run_coroutine_threadsafe(
                     ws_handler.handle_message(message, ws),
                     loop
                 )
+                # Optional: wait with short timeout to ensure message is being processed
+                future.result(timeout=0.1)
                 
             except ConnectionClosed:
                 logger.info(f"WebSocket connection closed for call {call_sid}")
                 break
             except Exception as e:
                 logger.error(f"Error processing WebSocket message: {e}", exc_info=True)
-                # Don't break the loop on message processing errors
+                # Short pause to avoid CPU spinning on errors
+                time.sleep(0.1)
                 
     except Exception as e:
         logger.error(f"Error establishing WebSocket connection: {e}", exc_info=True)
